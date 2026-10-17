@@ -1,0 +1,53 @@
+{
+  "passed": true,
+  "jobs": 12,
+  "kernel": "/home/xrdev/projects/xr1710g/boot-lab/ap33-policy/linux-6.18.54/arch/x86/boot/bzImage",
+  "kernelSHA256": "855f0b1296b0835f3670cafeac388d2760854ac48d14c3cd3c5679e8141797b8",
+  "module": "/home/xrdev/projects/xr1710g/boot-lab/ap33-policy/module/xr_policy_probe.ko",
+  "moduleSHA256": "c7880a40b86bae42ce8edbb9c2e9c0b010acec066c04f58e782680d77b8c8993",
+  "configSHA256": "df6764dfb7667c07fd6026c027060c52043e256cc589ea6606970adda9d1b1d9",
+  "probeSHA256": "1d6a033459264786059e6278bd56ea96f9cebbc05a15ae5e13620a02369b1ece",
+  "APPreexistingChangesToVM": {
+    "net/bridge/br_netlink.c": "--- /home/xrdev/projects/xr1710g/boot-lab/ap32-bridge-transaction/linux-6.18.54/net/bridge/br_netlink.c\t2026-09-25 22:35:54.000000000 +0800\n+++ /home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_netlink.c\t2026-10-11 01:29:16.576418667 +0800\n@@ -190,6 +190,7 @@\n \t\t+ nla_total_size(1)\t/* IFLA_BRPORT_LOCKED */\n \t\t+ nla_total_size(1)\t/* IFLA_BRPORT_MAB */\n \t\t+ nla_total_size(1)\t/* IFLA_BRPORT_NEIGH_VLAN_SUPPRESS */\n+\t\t+ nla_total_size(1)\t/* IFLA_BRPORT_BPDU_FILTER */\n \t\t+ nla_total_size(sizeof(struct ifla_bridge_id))\t/* IFLA_BRPORT_ROOT_ID */\n \t\t+ nla_total_size(sizeof(struct ifla_bridge_id))\t/* IFLA_BRPORT_BRIDGE_ID */\n \t\t+ nla_total_size(sizeof(u16))\t/* IFLA_BRPORT_DESIGNATED_PORT */\n@@ -282,7 +283,8 @@\n \t    nla_put_u8(skb, IFLA_BRPORT_LOCKED, !!(p->flags & BR_PORT_LOCKED)) ||\n \t    nla_put_u8(skb, IFLA_BRPORT_MAB, !!(p->flags & BR_PORT_MAB)) ||\n \t    nla_put_u8(skb, IFLA_BRPORT_NEIGH_VLAN_SUPPRESS,\n-\t\t       !!(p->flags & BR_NEIGH_VLAN_SUPPRESS)))\n+\t\t       !!(p->flags & BR_NEIGH_VLAN_SUPPRESS)) ||\n+\t    nla_put_u8(skb, IFLA_BRPORT_BPDU_FILTER, !!(p->flags & BR_BPDU_FILTER)))\n \t\treturn -EMSGSIZE;\n \n \ttimerval = br_timer_value(&p->message_age_timer);\n@@ -902,6 +904,7 @@\n \t[IFLA_BRPORT_MCAST_MAX_GROUPS] = { .type = NLA_U32 },\n \t[IFLA_BRPORT_NEIGH_VLAN_SUPPRESS] = NLA_POLICY_MAX(NLA_U8, 1),\n \t[IFLA_BRPORT_BACKUP_NHID] = { .type = NLA_U32 },\n+\t[IFLA_BRPORT_BPDU_FILTER] = { .type = NLA_U8 },\n };\n \n /* Change the state of the port and notify spanning tree */\n@@ -970,6 +973,7 @@\n \tbr_set_port_flag(p, tb, IFLA_BRPORT_MAB, BR_PORT_MAB);\n \tbr_set_port_flag(p, tb, IFLA_BRPORT_NEIGH_VLAN_SUPPRESS,\n \t\t\t BR_NEIGH_VLAN_SUPPRESS);\n+\tbr_set_port_flag(p, tb, IFLA_BRPORT_BPDU_FILTER, BR_BPDU_FILTER);\n \n \tif ((p->flags & BR_PORT_MAB) &&\n \t    (!(p->flags & BR_PORT_LOCKED) || !(p->flags & BR_LEARNING))) {\n",
+    "net/bridge/br_sysfs_if.c": "--- /home/xrdev/projects/xr1710g/boot-lab/ap32-bridge-transaction/linux-6.18.54/net/bridge/br_sysfs_if.c\t2026-09-25 22:35:54.000000000 +0800\n+++ /home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_sysfs_if.c\t2026-10-11 01:29:16.576204512 +0800\n@@ -258,6 +258,7 @@\n BRPORT_ATTR_FLAG(broadcast_flood, BR_BCAST_FLOOD);\n BRPORT_ATTR_FLAG(neigh_suppress, BR_NEIGH_SUPPRESS);\n BRPORT_ATTR_FLAG(isolated, BR_ISOLATED);\n+BRPORT_ATTR_FLAG(bpdu_filter, BR_BPDU_FILTER);\n \n #ifdef CONFIG_BRIDGE_IGMP_SNOOPING\n static ssize_t show_multicast_router(struct net_bridge_port *p, char *buf)\n@@ -310,6 +311,7 @@\n \t&brport_attr_group_fwd_mask,\n \t&brport_attr_neigh_suppress,\n \t&brport_attr_isolated,\n+\t&brport_attr_bpdu_filter,\n \t&brport_attr_backup_port,\n \tNULL\n };\n",
+    "include/uapi/linux/if_link.h": "--- /home/xrdev/projects/xr1710g/boot-lab/ap32-bridge-transaction/linux-6.18.54/include/uapi/linux/if_link.h\t2026-09-25 22:35:54.000000000 +0800\n+++ /home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/include/uapi/linux/if_link.h\t2026-10-11 01:29:16.576320078 +0800\n@@ -1098,6 +1098,7 @@\n \tIFLA_BRPORT_MCAST_MAX_GROUPS,\n \tIFLA_BRPORT_NEIGH_VLAN_SUPPRESS,\n \tIFLA_BRPORT_BACKUP_NHID,\n+\tIFLA_BRPORT_BPDU_FILTER,\n \t__IFLA_BRPORT_MAX\n };\n #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)\n",
+    "net/core/rtnetlink.c": "--- /home/xrdev/projects/xr1710g/boot-lab/ap32-bridge-transaction/linux-6.18.54/net/core/rtnetlink.c\t2026-09-25 22:35:54.000000000 +0800\n+++ /home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/core/rtnetlink.c\t2026-10-11 01:29:16.576645657 +0800\n@@ -63,7 +63,7 @@\n #include \"dev.h\"\n \n #define RTNL_MAX_TYPE\t\t50\n-#define RTNL_SLAVE_MAX_TYPE\t44\n+#define RTNL_SLAVE_MAX_TYPE\t45\n \n struct rtnl_link {\n \trtnl_doit_func\t\tdoit;\n@@ -5345,7 +5345,9 @@\n \t    brport_nla_put_flag(skb, flags, mask,\n \t\t\t\tIFLA_BRPORT_MCAST_FLOOD, BR_MCAST_FLOOD) ||\n \t    brport_nla_put_flag(skb, flags, mask,\n-\t\t\t\tIFLA_BRPORT_BCAST_FLOOD, BR_BCAST_FLOOD)) {\n+\t\t\t\tIFLA_BRPORT_BCAST_FLOOD, BR_BCAST_FLOOD) ||\n+\t    brport_nla_put_flag(skb, flags, mask,\n+\t\t\t\tIFLA_BRPORT_BPDU_FILTER, BR_BPDU_FILTER)) {\n \t\tnla_nest_cancel(skb, protinfo);\n \t\tgoto nla_put_failure;\n \t}\n",
+    "net/bridge/br_switchdev.c": "--- /home/xrdev/projects/xr1710g/boot-lab/ap32-bridge-transaction/linux-6.18.54/net/bridge/br_switchdev.c\t2026-09-25 22:35:54.000000000 +0800\n+++ /home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_switchdev.c\t2026-10-11 01:29:16.553314910 +0800\n@@ -70,7 +70,7 @@\n \tstruct br_input_skb_cb *cb = BR_INPUT_SKB_CB(skb);\n \n \treturn !test_bit(p->hwdom, &cb->fwd_hwdoms) &&\n-\t\t(!skb->offload_fwd_mark || cb->src_hwdom != p->hwdom);\n+\t\t(!skb->offload_fwd_mark || !p->hwdom || cb->src_hwdom != p->hwdom);\n }\n \n /* Flags that can be offloaded to hardware */\n@@ -575,10 +575,18 @@\n \t\t\t\t  struct net_bridge_mdb_entry *mp, int type)\n {\n \tstruct net_device *lower_dev;\n+\tstruct net_bridge_port *port;\n \tstruct list_head *iter;\n \n-\tnetdev_for_each_lower_dev(dev, lower_dev, iter)\n+\trcu_read_lock();\n+\tnetdev_for_each_lower_dev(dev, lower_dev, iter) {\n+\t\tport = br_port_get_rcu(lower_dev);\n+\t\tif (!port || !port->offload_count)\n+\t\t\tcontinue;\n+\n \t\tbr_switchdev_host_mdb_one(dev, lower_dev, mp, type);\n+\t}\n+\trcu_read_unlock();\n }\n \n static int\n"
+  },
+  "sources": {
+    "net/bridge/br_vlan.c": {
+      "before": "3a762aacc27093ea736c87fce60c2113d52994e9ad7405ed159a5ed32ba00113",
+      "after": "7a5785d27fc132be43116a810d72328e0a39b2e2d95f0d902ac75f1f6938d095"
+    },
+    "net/bridge/br_vlan_options.c": {
+      "before": "4d712af82720484d8b810573e6aa2b2cffdb09f830f5229995af54bba535372b",
+      "after": "d4ecdf313f9838e8f3fb0770ed49266761396a5af091fe41a7cd5d35e9e2ce5f"
+    },
+    "net/bridge/br_netlink.c": {
+      "before": "9bcc289bb4b546cd9fca3972d2b0a5a9a21b12cf0c4d8466fe849f09c6f7d4ab",
+      "after": "28638d63879769c5f0c544be5158e681def9057376568c3de3869a3bed24fe0e"
+    },
+    "net/bridge/br_sysfs_if.c": {
+      "before": "e7082ee327fa4be9d8c521eb40775cb0a315dbdae9fc8987e5af453b57371977",
+      "after": "e53179da78e8d654f4b1a01fad852d5d7fbcb9110888a56264f9cdc080993fc4"
+    },
+    "net/bridge/br_mst.c": {
+      "before": "8bafd70062382da929ff1b5f9accf753fa93026f7c7a8f5d24bfbeeedb4f3727",
+      "after": "730b252091e663abfe327b6020e13c509adcfe10f89bd1f824e6fd04a4ac0c16"
+    },
+    "net/bridge/br_if.c": {
+      "before": "0e7a5727710bbf1251928b228f4c7723ff40eb4dc5027ffae322ece80a52d11e",
+      "after": "981004240a3cbc867e06a61845335a88095f46901f9a1d58f1c7c3837d6f95a2"
+    },
+    "drivers/net/ethernet/airoha/airoha_ppe.c": {
+      "before": "3b769345430966ea6704c5994a906537cb6e62a8c62634cbfeb4eb81f6dd01e1",
+      "after": "0ad351b9f6642bb379985f796b0fa9f8f1ecd86b0885fa0ed9152ca2edaebdaf"
+    },
+    "include/linux/if_bridge.h": {
+      "before": "7a7ffcdd224e42a52be6488924ce6fae2d6b288d5cd0c349416461b538da1836",
+      "after": "e4cfe6590424e34111a1adb7f7c28eb6a3ecc8222d508638ea5dac6880bb9bc7"
+    }
+  },
+  "baselineVMUnchanged": true,
+  "productionOrDeviceChanged": false
+}

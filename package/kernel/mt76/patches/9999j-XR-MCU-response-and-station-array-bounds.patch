@@ -1,0 +1,202 @@
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -215,6 +215,24 @@
+ 		ht_mcs[nss] = link_sta->ht_cap.mcs.rx_mask[nss] & mask[nss];
+ }
+ 
++static bool
++mt7996_mcu_rx_check(struct mt7996_dev *dev, struct sk_buff *skb,
++		    unsigned int required, bool header)
++{
++	if (skb->len < required) {
++		if (header)
++			atomic64_inc(&dev->mcu_short_headers);
++		else
++			atomic64_inc(&dev->mcu_short_payloads);
++		return false;
++	}
++	if (!pskb_may_pull(skb, required)) {
++		atomic64_inc(&dev->mcu_pull_failures);
++		return false;
++	}
++	return true;
++}
++
+ static int
+ mt7996_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+ 			  struct sk_buff *skb, int seq)
+@@ -239,15 +257,24 @@
+ 		return -ETIMEDOUT;
+ 	}
+ 
++	atomic64_inc(&dev->mcu_responses);
++	/* PATCH_SEM_CONTROL has a 40-byte prefix, not the usual 44. */
++	if (!mt7996_mcu_rx_check(dev, skb,
++				 offsetof(struct mt7996_mcu_rxd, option) + 1, true))
++		return -EPROTO;
+ 	rxd = (struct mt7996_mcu_rxd *)skb->data;
+ 	if (seq != rxd->seq)
+ 		return -EAGAIN;
+ 
+ 	if (cmd == MCU_CMD(PATCH_SEM_CONTROL)) {
++		if (!mt7996_mcu_rx_check(dev, skb, sizeof(*rxd) - 4 + 1, false))
++			return -EPROTO;
+ 		skb_pull(skb, sizeof(*rxd) - 4);
+ 		ret = *skb->data;
+ 	} else if ((rxd->option & MCU_UNI_CMD_EVENT) &&
+ 		    rxd->eid == MCU_UNI_EVENT_RESULT) {
++		if (!mt7996_mcu_rx_check(dev, skb, sizeof(*rxd) + sizeof(*event), false))
++			return -EPROTO;
+ 		skb_pull(skb, sizeof(*rxd));
+ 		event = (struct mt7996_mcu_uni_event *)skb->data;
+ 		ret = le32_to_cpu(event->status);
+@@ -255,7 +282,9 @@
+ 		if (mcu_cmd != le16_to_cpu(event->cid))
+ 			ret = -EAGAIN;
+ 	} else {
+-		skb_pull(skb, sizeof(struct mt7996_mcu_rxd));
++		if (!mt7996_mcu_rx_check(dev, skb, sizeof(*rxd), true))
++			return -EPROTO;
++		skb_pull(skb, sizeof(*rxd));
+ 	}
+ 
+ 	return ret;
+@@ -648,18 +677,54 @@
+ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt7996_mcu_all_sta_info_event *res;
+-	u16 i;
+-
++	unsigned int stride, required;
++	u16 i, count, tag;
++
++	atomic64_inc(&dev->mcu_sta_events);
++	if (!mt7996_mcu_rx_check(dev, skb,
++				 sizeof(struct mt7996_mcu_rxd) + sizeof(*res), false)) {
++		atomic64_inc(&dev->mcu_sta_short_events);
++		return;
++	}
+ 	skb_pull(skb, sizeof(struct mt7996_mcu_rxd));
+-
+ 	res = (struct mt7996_mcu_all_sta_info_event *)skb->data;
+-
+-	for (i = 0; i < le16_to_cpu(res->sta_num); i++) {
++	count = le16_to_cpu(res->sta_num);
++	tag = le16_to_cpu(res->tag);
++
++	switch (tag) {
++	case UNI_ALL_STA_TXRX_RATE:
++		stride = sizeof(res->rate[0]);
++		break;
++	case UNI_ALL_STA_TXRX_ADM_STAT:
++		stride = sizeof(res->adm_stat[0]);
++		break;
++	case UNI_ALL_STA_TXRX_MSDU_COUNT:
++		stride = sizeof(res->msdu_cnt[0]);
++		break;
++	default:
++		atomic64_inc(&dev->mcu_sta_unknown_tags);
++		return;
++	}
++
++	/* Use received bytes, not an undocumented firmware TLV length convention.
++	 * Accept padding and each valid 'more' chunk as before; do not add queries.
++	 */
++	if (count > (skb->len - sizeof(*res)) / stride) {
++		atomic64_inc(&dev->mcu_sta_truncated_arrays);
++		return;
++	}
++	required = sizeof(*res) + count * stride;
++	if (!mt7996_mcu_rx_check(dev, skb, required, false))
++		return;
++	/* pskb_may_pull can relocate skb->data. */
++	res = (struct mt7996_mcu_all_sta_info_event *)skb->data;
++
++	for (i = 0; i < count; i++) {
+ 		u8 ac;
+ 		u16 wlan_idx;
+ 		struct mt76_wcid *wcid;
+ 
+-		switch (le16_to_cpu(res->tag)) {
++		switch (tag) {
+ 		case UNI_ALL_STA_TXRX_RATE:
+ 			wlan_idx = le16_to_cpu(res->rate[i].wlan_idx);
+ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
+@@ -967,21 +1032,34 @@
+ 	dev_kfree_skb(skb);
+ }
+ 
++
+ void mt7996_mcu_rx_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+-	struct mt7996_mcu_rxd *rxd = (struct mt7996_mcu_rxd *)skb->data;
+-
++	struct mt7996_mcu_rxd *rxd;
++
++	atomic64_inc(&dev->mcu_rx_packets);
++	if (!mt7996_mcu_rx_check(dev, skb,
++				 offsetof(struct mt7996_mcu_rxd, ext_eid) + 1, true))
++		goto drop;
++	rxd = (struct mt7996_mcu_rxd *)skb->data;
+ 	if (rxd->option & MCU_UNI_CMD_UNSOLICITED_EVENT) {
++		if (!mt7996_mcu_rx_check(dev, skb, sizeof(*rxd), true))
++			goto drop;
+ 		mt7996_mcu_uni_rx_unsolicited_event(dev, skb);
+ 		return;
+ 	}
+ 
+ 	/* WA still uses legacy event*/
+-	if (rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST ||
+-	    !rxd->seq)
++	if (rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST || !rxd->seq) {
++		if (!mt7996_mcu_rx_check(dev, skb, sizeof(*rxd), true))
++			goto drop;
+ 		mt7996_mcu_rx_unsolicited_event(dev, skb);
+-	else
++	} else {
+ 		mt76_mcu_rx_event(&dev->mt76, skb);
++	}
++	return;
++drop:
++	dev_kfree_skb(skb);
+ }
+ 
+ static struct tlv *
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -462,6 +462,15 @@
+ 	atomic64_t txfree_short_headers;
+ 	atomic64_t txfree_length_mismatches;
+ 	atomic64_t txfree_truncations;
++	atomic64_t mcu_rx_packets;
++	atomic64_t mcu_responses;
++	atomic64_t mcu_short_headers;
++	atomic64_t mcu_short_payloads;
++	atomic64_t mcu_pull_failures;
++	atomic64_t mcu_sta_events;
++	atomic64_t mcu_sta_short_events;
++	atomic64_t mcu_sta_truncated_arrays;
++	atomic64_t mcu_sta_unknown_tags;
+ 
+ 
+ 	struct mt7996_phy *radio_phy[MT7996_MAX_RADIOS];
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -935,6 +935,17 @@
+             atomic64_read(&dev->txfree_short_headers),
+             atomic64_read(&dev->txfree_length_mismatches),
+             atomic64_read(&dev->txfree_truncations));
++ seq_printf(s, "mcu_rx_packets=%lld responses=%lld short_headers=%lld short_payloads=%lld pull_failures=%lld\n",
++            atomic64_read(&dev->mcu_rx_packets),
++            atomic64_read(&dev->mcu_responses),
++            atomic64_read(&dev->mcu_short_headers),
++            atomic64_read(&dev->mcu_short_payloads),
++            atomic64_read(&dev->mcu_pull_failures));
++ seq_printf(s, "mcu_sta_events=%lld short_events=%lld truncated_arrays=%lld unknown_tags=%lld\n",
++            atomic64_read(&dev->mcu_sta_events),
++            atomic64_read(&dev->mcu_sta_short_events),
++            atomic64_read(&dev->mcu_sta_truncated_arrays),
++            atomic64_read(&dev->mcu_sta_unknown_tags));
+  seq_puts(s, "queue_counters=approximate\n");
+  for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++) {
+   struct mt76_queue *q = &mdev->q_rx[i];

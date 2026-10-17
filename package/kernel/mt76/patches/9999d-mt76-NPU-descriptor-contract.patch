@@ -1,0 +1,75 @@
+From: XR1710G AP project
+Subject: [PATCH] mt76: preserve first NPU descriptor identity and assert ABI fields
+
+Packet-chain count and identity are obtained from the leading descriptor;
+do not overwrite PPE metadata with the final fragment's info. Bound fragment
+representation before handing any pages to an skb. Assert nonoverlapping
+ownership/count/id fields at build time. Synchronize the fallback public
+header with the current kernel header's count field and mailbox core layout.
+
+Current AN7581 builds already select the real kernel header (.npu.o.cmd
+confirmed). The fallback mismatch is NOT asserted as the AP7 truncation root
+cause. Hardware/firmware chain behavior and historical truncation acceptance
+remain deferred; NPU/PPE default off is unchanged.
+
+--- a/airoha_offload.h
++++ b/airoha_offload.h
+@@ -76,7 +76,7 @@
+ #define NPU_RX_DMA_DESC_CUR_LEN_MASK	GENMASK(14, 1)
+ #define NPU_RX_DMA_DESC_DONE_MASK	BIT(0)
+ /* INFO */
+-#define NPU_RX_DMA_PKT_COUNT_MASK	GENMASK(31, 28)
++#define NPU_RX_DMA_PKT_COUNT_MASK	GENMASK(31, 29)
+ #define NPU_RX_DMA_PKT_ID_MASK		GENMASK(28, 26)
+ #define NPU_RX_DMA_SRC_PORT_MASK	GENMASK(25, 21)
+ #define NPU_RX_DMA_CRSN_MASK		GENMASK(20, 16)
+@@ -173,6 +173,8 @@
+ 		/* protect concurrent npu memory accesses */
+ 		spinlock_t lock;
+ 		struct work_struct wdt_work;
++		void *buf;
++		dma_addr_t addr;
+ 	} cores[NPU_NUM_CORES];
+ 
+ 	int irqs[NPU_NUM_IRQ];
+--- a/npu.c
++++ b/npu.c
+@@ -24,6 +24,10 @@
+ static bool npu_rx_audit;
+ module_param_named(npu_rx_audit, npu_rx_audit, bool, 0400);
+ MODULE_PARM_DESC(npu_rx_audit, "Rate-limited TXFREE descriptor scalar diagnostics (boot-only)");
++
++/* Guard both kernel-native and compatibility header descriptor contracts. */
++static_assert(!(NPU_RX_DMA_PKT_COUNT_MASK & NPU_RX_DMA_PKT_ID_MASK));
++static_assert(!(NPU_RX_DMA_DESC_CUR_LEN_MASK & NPU_RX_DMA_DESC_DONE_MASK));
+ 
+ #define MT76_NPU_RX_BUF_SIZE	(1800 + \
+ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+@@ -170,7 +174,7 @@
+ 	/* Reject a corrupt/incomplete count without truncating the chain or
+ 	 * changing ring ownership. The poll's refill can replenish free slots.
+ 	 */
+-	if (nframes > q->queued)
++	if (nframes > q->queued || nframes > MAX_SKB_FRAGS + 1)
+ 		return NULL;
+ 
+ 	/* Validate the whole chain before any page is handed to an skb. */
+@@ -185,6 +189,10 @@
+ 	}
+ 	dma_rmb();
+ 
++	/* Packet identity/count/reason belong to the leading descriptor. Tail
++	 * fragment metadata must not replace the packet's PPE/RX classification.
++	 */
++	*info = first_info;
+ 	index = q->tail;
+ 	for (i = 0; i < nframes; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+@@ -214,7 +222,6 @@
+ 						len, q->buf_size);
+ 		}
+ 
+-		*info = READ_ONCE(desc[index].info);
+ 		index = (index + 1) % q->ndesc;
+ 	}
+ 	q->tail = index;

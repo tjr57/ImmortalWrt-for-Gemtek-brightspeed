@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Owner-requested factory login; upgrades preserve an existing root password.
+. /lib/functions/system.sh
+
+[ "$(board_name)" = 'gemtek,xr1710g' ] || exit 0
+[ "$(uci -q get xr1710g_ap.defaults.admin_initialized)" = '1' ] && exit 0
+
+default_hash='$6$rUFvk/8gBxt1iXpg$jU9GOGqkZhxYzH1hz11Gsv9TuPlclaof73APKUQNwwUYF53kY9Gh3zwGPI085273NDMMSrL9p4rsc2A0YaTIN0'
+[ -f /etc/shadow ] && grep -q '^root:' /etc/shadow || exit 1
+root_hash="$(awk -F: '$1 == "root" { print $2; exit }' /etc/shadow)"
+# Empty is the primary image's factory state. Do not unlock an account or
+# overwrite a password selected by the operator on an ordinary upgrade.
+if [ -z "$root_hash" ]; then
+	sed -i "s|^root:[^:]*:|root:$default_hash:|" /etc/shadow || exit 1
+	chmod 600 /etc/shadow || exit 1
+fi
+
+uci set luci.main.lang='zh_cn' || exit 1
+uci commit luci || exit 1
+uci set xr1710g_ap.defaults.admin_initialized='1' || exit 1
+uci commit xr1710g_ap || exit 1
+exit 0

@@ -1,0 +1,12 @@
+Subject: [PATCH] mt7996: avoid STA PP commands on disassociation
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -997,6 +997,7 @@
+ 		link->pp_sta_initialized = false;
+ 
+ 	if (vif->type == NL80211_IFTYPE_STATION && info->eht_support &&
++	    !is_zero_ether_addr(info->bssid) &&
+ 	    (changed & (BSS_CHANGED_BSSID | BSS_CHANGED_BANDWIDTH))) {
+ 		int ret = mt7996_mcu_set_pp_sta_dscb(link, &info->chanreq.oper);
+ 		if (ret)

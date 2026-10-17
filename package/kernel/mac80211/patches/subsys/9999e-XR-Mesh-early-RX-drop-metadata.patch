@@ -1,0 +1,43 @@
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -5704,6 +5704,13 @@
+ 
+ 	status->rx_flags = 0;
+ 
++	/* These frames are consumed before the normal RX handlers. */
++	if (status->flag & (RX_FLAG_ONLY_MONITOR | RX_FLAG_FAILED_FCS_CRC |
++			    RX_FLAG_FAILED_PLCP_CRC))
++		xr_mesh_rx_early_drop(pubsta, skb,
++			status->flag & (RX_FLAG_ONLY_MONITOR | RX_FLAG_FAILED_FCS_CRC |
++					RX_FLAG_FAILED_PLCP_CRC));
++
+ 	kcov_remote_start_common(skb_get_kcov_handle(skb));
+ 
+ 	/*
+--- a/net/mac80211/xr-mesh-rx-audit.h
++++ b/net/mac80211/xr-mesh-rx-audit.h
+@@ -46,6 +46,24 @@
+ 	spin_unlock_irqrestore(&xr_mesh_rx_drop_lock, flags);
+ }
+ 
++/* pubsta is supplied by the driver and protected by the RX caller's RCU
++ * section. Record only known Mesh peers; unknown stations are not attributed.
++ * 0x20000000 is an observer-only namespace, never a kernel drop verdict.
++ */
++static void xr_mesh_rx_early_drop(struct ieee80211_sta *pubsta,
++				  struct sk_buff *skb, u32 flags)
++{
++	struct ieee80211_rx_data rx = {};
++	struct sta_info *sta;
++
++	if (!READ_ONCE(xr_mesh_rx_drop_audit) || !pubsta)
++		return;
++	sta = container_of(pubsta, struct sta_info, sta);
++	rx.sdata = sta->sdata;
++	rx.skb = skb;
++	xr_mesh_rx_drop_record(&rx, 0x20000000 | flags, false);
++}
++
+ static int xr_mesh_rx_drop_get(char *buffer, const struct kernel_param *kp)
+ {
+ 	struct xr_mesh_rx_drop snapshot[XR_MESH_RX_RECORDS];

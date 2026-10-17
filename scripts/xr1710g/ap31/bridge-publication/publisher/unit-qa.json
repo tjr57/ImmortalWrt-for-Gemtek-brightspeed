@@ -1,0 +1,8 @@
+{
+  "passed": true,
+  "checks": 96,
+  "sourceSHA256": "dcac37c4a615d096f37640ddde7161ae3dc5645acb9dd7d7568fa66672c40287",
+  "scope": "pure planner and ownership/reconciliation",
+  "deviceOrNetworkChanged": false,
+  "realKernelOrHardwareQualified": false
+}

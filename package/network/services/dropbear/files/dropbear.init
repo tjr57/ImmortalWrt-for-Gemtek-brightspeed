@@ -314,6 +314,8 @@ dropbear_instance()
 	if [ -n "${iface}" ] ; then
 		# if ${iface} is non-empty then ${ndev} is non-empty too
 		procd_append_param command -l "${ndev}" -p "${Port}"
+		# Rebind after a device is recreated with the same name and a new ifindex.
+		procd_set_param netdev "${ndev}"
 	else
 		if [ -z "${ipaddrs}" ] ; then
 			procd_append_param command -p "${Port}"

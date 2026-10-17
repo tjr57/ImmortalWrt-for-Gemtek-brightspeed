@@ -1,0 +1,17 @@
+Subject: [PATCH] mt7996: avoid initial disconnect STA record breaking DL OFDMA reconnect
+
+Adapt MediaTek pinned 08196fa6, patch0010, Howard Hsu 2026-02-10.
+Leave actual disconnect/removal lifecycle commands intact. Public mt76 VIF
+leading-layout assertions remain required. Feature/RF acceptance is separate.
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1226,8 +1226,6 @@
+ 	rcu_assign_pointer(msta->link[link_id], msta_link);
+ 
+ 	mt7996_mac_wtbl_update(dev, idx, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+-	mt7996_mcu_add_sta(dev, link_conf, link_sta, link, msta_link,
+-			   CONN_STATE_DISCONNECT, true);
+ 
+ 	rcu_assign_pointer(dev->mt76.wcid[idx], &msta_link->wcid);
+ 	mt76_wcid_init(&msta_link->wcid, phy->mt76->band_idx);

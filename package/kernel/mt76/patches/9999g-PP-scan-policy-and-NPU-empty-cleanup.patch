@@ -1,0 +1,60 @@
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -5850,8 +5850,15 @@
+ 		return mt7996_mcu_set_pp_mode(phy, 1, 0);
+ 	if (!bitmap && !phy->punct_bitmap && mode != 1)
+ 		return 0;
+-	/* Clear firmware mode on scan; hostapd beacon restoration explicitly
+-	 * re-enables auto mode. Resend nonzero static bitmaps after recovery.
+-	 */
++	if (mphy->offchannel && mode == 1) {
++		int ret = mt7996_mcu_set_pp_mode(phy, 0, 0);
++		/* Preserve the configured auto policy while hardware is scanning;
++		 * restoring the channel re-enables it even without a beacon rewrite.
++		 */
++		if (!ret)
++			WRITE_ONCE(phy->pp_mode, 1);
++		return ret;
++	}
+ 	return mt7996_mcu_set_pp_mode(phy, bitmap ? 2 : 0, bitmap);
+-}
++
++}
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -440,6 +440,16 @@
+ 	dev->mt76.vif_mask &= ~BIT_ULL(mlink->idx);
+ 	dev->mld_idx_mask &= ~BIT_ULL(link->mld_idx);
+ 	phy->omac_mask &= ~BIT_ULL(mlink->omac_idx);
++	if (!phy->omac_mask && READ_ONCE(phy->pp_mode) == 1) {
++		/* Interface removal must revoke firmware-auto even if userspace
++		 * disappeared before its vendor disable command was delivered.
++		 */
++		int ret = mt7996_mcu_set_pp_mode(phy, 0, 0);
++		if (ret)
++			dev_warn(dev->mt76.dev, "PP auto disable on last VIF removal failed: %d\n", ret);
++		WRITE_ONCE(phy->pp_mode, 0);
++	}
++
+ 	if (!mlink->wcid->offchannel)
+ 		mvif->mt76.valid_links &= ~BIT(link_id);
+ 
+--- a/npu.c
++++ b/npu.c
+@@ -83,11 +83,12 @@
+ 	while (q->queued > 0) {
+ 		struct mt76_queue_entry *e = &q->entry[q->tail];
+ 
+-		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+-					e->dma_len[0],
+-					page_pool_get_dma_dir(q->page_pool));
+-		if (e->buf)
++		if (e->buf) {
++			dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
++						e->dma_len[0],
++						page_pool_get_dma_dir(q->page_pool));
+ 			mt76_put_page_pool_buf(e->buf, false);
++		}
+ 		e->buf = NULL;
+ 		e->dma_addr[0] = 0;
+ 		e->dma_len[0] = 0;

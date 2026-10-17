@@ -1,0 +1,4 @@
+# One desired PPE bridge template per line:
+#   IN_IF OUT_IF VID TAGGED SRC_MAC DST_MAC
+# The kernel validates every line against the live bridge and refuses what
+# the software bridge would not forward the same way.

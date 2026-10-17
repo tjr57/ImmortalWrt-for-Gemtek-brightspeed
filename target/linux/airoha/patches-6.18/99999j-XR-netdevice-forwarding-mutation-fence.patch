@@ -1,0 +1,485 @@
+Subject: [PATCH] XR: fence netdevice forwarding mutations before PPE binding
+
+Move the AP32 bridge forwarding fence to net/core so bridge and netdevice
+writers share one writer count and generation. Cover the full MTU, MAC
+address, upper link/unlink, close (through NETDEV_DOWN), flag change, netns
+move and unregister scopes, including rejection and rollback paths, instead
+of pairing pre/post notifier events. Bridge port removal and every bridge
+MAC/ID change are fenced as well. L2 templates also require egress MTU to
+cover ingress MTU. NPU/PPE opt-ins remain disabled.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -15,6 +15,7 @@
+ #include <net/ipv6.h>
+ #include <linux/if_bridge.h>
+ #include <linux/if_vlan.h>
++#include <linux/netdev_fwd_policy.h>
+ #include <net/pkt_cls.h>
+ #include <net/route.h>
+ #include <net/ip.h>
+@@ -1227,7 +1228,7 @@
+ 				      unsigned long event, void *ptr)
+ {
+ 	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, l2_bridge_nb);
+-	const struct br_fwd_policy_state *state = ptr;
++	const struct netdev_fwd_policy_state *state = ptr;
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->l2_bridge_writers = state->writers;
+@@ -1265,7 +1266,15 @@
+ {
+ 	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, l2_netdev_nb);
+ 
++	/* Core MTU/address/upper/close scopes are fenced by netdev_fwd_change.
++	 * Pre events also revoke for drivers that notify outside those scopes;
++	 * revocation never grants permission, so a missing post event is safe.
++	 */
+ 	switch (event) {
++	case NETDEV_GOING_DOWN:
++	case NETDEV_PRECHANGEMTU:
++	case NETDEV_PRE_CHANGEADDR:
++	case NETDEV_PRECHANGEUPPER:
+ 	case NETDEV_DOWN:
+ 	case NETDEV_UNREGISTER:
+ 	case NETDEV_CHANGEUPPER:
+@@ -2053,6 +2062,13 @@
+      !airoha_ppe_l2_port_eligible(indev) ||
+      !airoha_ppe_l2_port_eligible(odev))
+   goto out;
++ /* The software bridge drops frames above the egress MTU; a bound flow is
++  * not known to enforce that limit. Only accept pairs where every frame
++  * admitted on ingress also fits egress. MTU changes revoke inside
++  * netdev_fwd_change.
++  */
++ if (READ_ONCE(odev->mtu) < READ_ONCE(indev->mtu))
++  goto out;
+  master = airoha_ppe_foe_get_bridge_master_rcu(indev);
+  if (!master || br_mst_enabled(master) ||
+      !net_eq(dev_net(indev), dev_net(odev)) ||
+@@ -2783,7 +2799,7 @@
+ 		goto error_l2_flow_table_destroy;
+ 	}
+ 	ppe->l2_bridge_nb.notifier_call = airoha_ppe_l2_bridge_event;
+-	err = br_fwd_policy_register(&ppe->l2_bridge_nb);
++	err = netdev_fwd_policy_register(&ppe->l2_bridge_nb);
+ 	if (err) {
+ 		nf_bridge_policy_notifier_unregister(&ppe->l2_policy_nb);
+ 		unregister_switchdev_notifier(&ppe->l2_switchdev_atomic_nb);
+@@ -2821,7 +2837,7 @@
+ 	 * packet or TC callback must not republish during observer teardown.
+ 	 */
+ 	airoha_ppe_l2_policy_event(&eth->ppe->l2_policy_nb, 0, NULL);
+-	br_fwd_policy_unregister(&eth->ppe->l2_bridge_nb);
++	netdev_fwd_policy_unregister(&eth->ppe->l2_bridge_nb);
+ 	nf_bridge_policy_notifier_unregister(&eth->ppe->l2_policy_nb);
+ 	unregister_switchdev_notifier(&eth->ppe->l2_switchdev_atomic_nb);
+ 	unregister_switchdev_blocking_notifier(&eth->ppe->l2_switchdev_nb);
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -179,28 +179,9 @@
+ }
+ #endif
+ 
+-/* Synchronous bridge forwarding mutation fence. Callbacks are atomic and
+- * must not acquire RTNL, bridge locks, sleep, or stop notification propagation.
+- * BEGIN has drained dependent caches before the writer may mutate; END makes
+- * the completed change visible. Nested/concurrent writers remain fenced.
+- * INIT is delivered while registration is serialized with BEGIN/END, including
+- * writers already in progress. Receivers must mirror the absolute count.
+- */
+-enum br_fwd_policy_event {
+-	BR_FWD_POLICY_INIT,
+-	BR_FWD_POLICY_BEGIN,
+-	BR_FWD_POLICY_END,
+-};
+-
+-struct br_fwd_policy_state {
+-	u32 writers;
+-};
+-
+-struct notifier_block;
++/* Bridge forwarding mutations use the core fence in linux/netdev_fwd_policy.h. */
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE)
+-int br_fwd_policy_register(struct notifier_block *nb);
+-void br_fwd_policy_unregister(struct notifier_block *nb);
+ bool br_fdb_forward_to_rcu(const struct net_device *br_dev,
+                           const struct net_device *port_dev,
+                           const unsigned char *addr, u16 vid);
+@@ -212,15 +193,6 @@
+ u8 br_port_get_stp_state(const struct net_device *dev);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
+-static inline int br_fwd_policy_register(struct notifier_block *nb)
+-{
+-	return -EOPNOTSUPP;
+-}
+-
+-static inline void br_fwd_policy_unregister(struct notifier_block *nb)
+-{
+-}
+-
+ static inline bool br_fdb_forward_to_rcu(const struct net_device *br_dev,
+                                         const struct net_device *port_dev,
+                                         const unsigned char *addr, u16 vid)
+--- /dev/null
++++ b/include/linux/netdev_fwd_policy.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef _LINUX_NETDEV_FWD_POLICY_H
++#define _LINUX_NETDEV_FWD_POLICY_H
++
++#include <linux/cleanup.h>
++#include <linux/types.h>
++
++/* Synchronous forwarding mutation fence shared by netdevice core and bridge.
++ * A writer scope covers the whole change, including pre-change notifiers,
++ * rejection, rollback and the post-change notification. Callbacks are atomic
++ * and must not acquire RTNL, bridge locks, sleep, or stop propagation.
++ * BEGIN has drained dependent caches before the writer may mutate; END makes
++ * the completed (or rolled back) change visible. Nested/concurrent writers
++ * remain fenced. INIT is delivered while registration is serialized with
++ * BEGIN/END, including writers already in progress. Receivers must mirror the
++ * absolute count. The fence is never held across the mutation, so a scope may
++ * sleep; it must only be entered from process or softirq context.
++ */
++enum netdev_fwd_policy_event {
++	NETDEV_FWD_POLICY_INIT,
++	NETDEV_FWD_POLICY_BEGIN,
++	NETDEV_FWD_POLICY_END,
++};
++
++struct netdev_fwd_policy_state {
++	u32 writers;
++};
++
++struct notifier_block;
++
++int netdev_fwd_policy_register(struct notifier_block *nb);
++void netdev_fwd_policy_unregister(struct notifier_block *nb);
++void netdev_fwd_policy_begin(void);
++void netdev_fwd_policy_end(void);
++
++DEFINE_LOCK_GUARD_0(netdev_fwd_change, netdev_fwd_policy_begin(),
++		    netdev_fwd_policy_end())
++
++#endif /* _LINUX_NETDEV_FWD_POLICY_H */
+--- a/net/bridge/br_fwd_policy.c
++++ /dev/null
+@@ -1,52 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-or-later
+-/* Serialize dependent offload caches with bridge forwarding mutations.
+- * The lock is never held across the mutation. Callbacks only revoke/mirror
+- * state under their own cache lock; publishers never acquire this lock.
+- */
+-#include <linux/export.h>
+-#include <linux/if_bridge.h>
+-#include <linux/notifier.h>
+-#include <linux/spinlock.h>
+-#include "br_private.h"
+-
+-static DEFINE_SPINLOCK(br_fwd_policy_lock);
+-static ATOMIC_NOTIFIER_HEAD(br_fwd_policy_chain);
+-static struct br_fwd_policy_state br_fwd_policy_state;
+-
+-int br_fwd_policy_register(struct notifier_block *nb)
+-{
+-	int err;
+-
+-	spin_lock_bh(&br_fwd_policy_lock);
+-	err = atomic_notifier_chain_register(&br_fwd_policy_chain, nb);
+-	if (!err)
+-		nb->notifier_call(nb, BR_FWD_POLICY_INIT, &br_fwd_policy_state);
+-	spin_unlock_bh(&br_fwd_policy_lock);
+-	return err;
+-}
+-EXPORT_SYMBOL_GPL(br_fwd_policy_register);
+-
+-void br_fwd_policy_unregister(struct notifier_block *nb)
+-{
+-	/* This waits for RCU readers and must run without our spinlock held. */
+-	atomic_notifier_chain_unregister(&br_fwd_policy_chain, nb);
+-}
+-EXPORT_SYMBOL_GPL(br_fwd_policy_unregister);
+-
+-void br_fwd_policy_begin(void)
+-{
+-	spin_lock_bh(&br_fwd_policy_lock);
+-	br_fwd_policy_state.writers++;
+-	atomic_notifier_call_chain(&br_fwd_policy_chain, BR_FWD_POLICY_BEGIN,
+-				  &br_fwd_policy_state);
+-	spin_unlock_bh(&br_fwd_policy_lock);
+-}
+-
+-void br_fwd_policy_end(void)
+-{
+-	spin_lock_bh(&br_fwd_policy_lock);
+-	br_fwd_policy_state.writers--;
+-	atomic_notifier_call_chain(&br_fwd_policy_chain, BR_FWD_POLICY_END,
+-				  &br_fwd_policy_state);
+-	spin_unlock_bh(&br_fwd_policy_lock);
+-}
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -739,6 +739,11 @@
+ 	if (!p || p->br != br)
+ 		return -EINVAL;
+ 
++	/* Like br_add_if: detach, MTU and bridge-ID/MAC recalculation and the
++	 * resulting CHANGEADDR notification form one forwarding mutation.
++	 */
++	guard(br_fwd_change)(br->dev);
++
+ 	/* Since more than one interface can be attached to a bridge,
+ 	 * there still maybe an alternate path for netconsole to use;
+ 	 * therefore there is no reason for a NETDEV_RELEASE event.
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -20,14 +20,14 @@
+ #include <linux/rhashtable.h>
+ #include <linux/refcount.h>
+ #include <linux/cleanup.h>
++#include <linux/netdev_fwd_policy.h>
+ 
+-void br_fwd_policy_begin(void);
+-void br_fwd_policy_end(void);
+ /* A real bridge device makes the guard non-NULL. Its lifetime is protected by
+- * the existing caller's RTNL/RCU/bridge lock, not by this scope guard.
++ * the existing caller's RTNL/RCU/bridge lock, not by this scope guard. Bridge
++ * and netdevice writers share the core count and generation.
+  */
+ DEFINE_GUARD(br_fwd_change, struct net_device *,
+-	     br_fwd_policy_begin(), br_fwd_policy_end());
++	     netdev_fwd_policy_begin(), netdev_fwd_policy_end());
+ 
+ #define BR_HASH_BITS 8
+ #define BR_HASH_SIZE (1 << BR_HASH_BITS)
+--- a/net/bridge/br_stp_if.c
++++ b/net/bridge/br_stp_if.c
+@@ -227,6 +227,11 @@
+ 	struct net_bridge_port *p;
+ 	int wasroot;
+ 
++	/* The bridge MAC decides local delivery. FDB and dev_addr must change
++	 * inside one writer scope for every caller, not only ndo/port events.
++	 */
++	guard(br_fwd_change)(br->dev);
++
+ 	wasroot = br_is_root_bridge(br);
+ 
+ 	br_fdb_change_mac_address(br, addr);
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@ -6,7 +6,7 @@
+ obj-$(CONFIG_BRIDGE) += bridge.o
+ 
+ bridge-y	:= br.o br_device.o br_fdb.o br_forward.o br_if.o br_input.o \
+-			br_ioctl.o br_stp.o br_stp_bpdu.o br_fwd_policy.o \
++			br_ioctl.o br_stp.o br_stp_bpdu.o \
+ 			br_stp_if.o br_stp_timer.o br_netlink.o \
+ 			br_netlink_tunnel.o br_arp_nd_proxy.o
+ 
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -163,6 +163,7 @@
+ #include <net/page_pool/memory_provider.h>
+ #include <net/rps.h>
+ #include <linux/phy_link_topology.h>
++#include <linux/netdev_fwd_policy.h>
+ 
+ #include "dev.h"
+ #include "devmem.h"
+@@ -1741,6 +1742,11 @@
+ 	ASSERT_RTNL();
+ 	might_sleep();
+ 
++	/* Offload caches are drained before GOING_DOWN and may not republish
++	 * until ndo_stop has run; callers extend the scope over NETDEV_DOWN.
++	 */
++	guard(netdev_fwd_change)();
++
+ 	list_for_each_entry(dev, head, close_list) {
+ 		/* Temporarily disable netpoll until the interface is down */
+ 		netpoll_poll_disable(dev);
+@@ -1799,6 +1805,9 @@
+ 		if (!(dev->flags & IFF_UP))
+ 			list_del_init(&dev->close_list);
+ 
++	/* Bridge ports leave forwarding state in the NETDEV_DOWN notifier. */
++	guard(netdev_fwd_change)();
++
+ 	__dev_close_many(head);
+ 
+ 	list_for_each_entry_safe(dev, tmp, head, close_list) {
+@@ -8813,6 +8822,9 @@
+ 			return master_dev == upper_dev ? -EEXIST : -EBUSY;
+ 	}
+ 
++	/* Covers PRECHANGEUPPER rejection, CHANGEUPPER failure and rollback. */
++	guard(netdev_fwd_change)();
++
+ 	ret = call_netdevice_notifiers_info(NETDEV_PRECHANGEUPPER,
+ 					    &changeupper_info.info);
+ 	ret = notifier_to_errno(ret);
+@@ -8913,6 +8925,8 @@
+ 
+ 	ASSERT_RTNL();
+ 
++	guard(netdev_fwd_change)();
++
+ 	changeupper_info.master = netdev_master_upper_dev_get(dev) == upper_dev;
+ 
+ 	call_netdevice_notifiers_info(NETDEV_PRECHANGEUPPER,
+@@ -9757,6 +9771,9 @@
+ 	int ret;
+ 	unsigned int changes, old_flags = dev->flags, old_gflags = dev->gflags;
+ 
++	/* A close in __dev_change_flags is completed by NETDEV_DOWN below. */
++	guard(netdev_fwd_change)();
++
+ 	ret = __dev_change_flags(dev, flags, extack);
+ 	if (ret < 0)
+ 		return ret;
+@@ -9822,6 +9839,9 @@
+ 	if (!netif_device_present(dev))
+ 		return -ENODEV;
+ 
++	/* Covers rejection, the change, CHANGEMTU and its rollback notification. */
++	guard(netdev_fwd_change)();
++
+ 	err = call_netdevice_notifiers(NETDEV_PRECHANGEMTU, dev);
+ 	err = notifier_to_errno(err);
+ 	if (err)
+@@ -9926,6 +9946,8 @@
+ 		return -EINVAL;
+ 	if (!netif_device_present(dev))
+ 		return -ENODEV;
++	/* Bridge FDB/ID updates run in notifiers inside this scope. */
++	guard(netdev_fwd_change)();
+ 	err = netif_pre_changeaddr_notify(dev, ss->__data, extack);
+ 	if (err)
+ 		return err;
+@@ -12303,6 +12325,9 @@
+ 	if (list_empty(head))
+ 		return;
+ 
++	/* Close, NETDEV_UNREGISTER upper/bridge detach and ifindex retirement. */
++	guard(netdev_fwd_change)();
++
+ 	list_for_each_entry_safe(dev, tmp, head, unreg_list) {
+ 		/* Some devices call without registering
+ 		 * for initialization unwind. Remove those
+@@ -12543,6 +12568,10 @@
+ 	 * And now a mini version of register_netdevice unregister_netdevice.
+ 	 */
+ 
++	/* Namespace and ifindex form offload keys. No goto may cross this
++	 * explicit scope; it ends after NETDEV_REGISTER in the new namespace.
++	 */
++	netdev_fwd_policy_begin();
+ 	netdev_lock_ops(dev);
+ 	/* If device is running close it first. */
+ 	netif_close(dev);
+@@ -12628,6 +12657,7 @@
+ 	/* Notify protocols, that a new device appeared. */
+ 	call_netdevice_notifiers(NETDEV_REGISTER, dev);
+ 	netdev_unlock_ops(dev);
++	netdev_fwd_policy_end();
+ 
+ 	/*
+ 	 *	Prevent userspace races by waiting until the network
+--- /dev/null
++++ b/net/core/fwd_policy.c
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/* Serialize dependent offload caches with netdevice and bridge forwarding
++ * mutations. The lock is never held across the mutation. Callbacks only
++ * revoke/mirror state under their own cache lock; publishers never acquire
++ * this lock. Moved from net/bridge so core netdevice scopes share one count.
++ */
++#include <linux/export.h>
++#include <linux/netdev_fwd_policy.h>
++#include <linux/notifier.h>
++#include <linux/spinlock.h>
++
++static DEFINE_SPINLOCK(netdev_fwd_policy_lock);
++static ATOMIC_NOTIFIER_HEAD(netdev_fwd_policy_chain);
++static struct netdev_fwd_policy_state netdev_fwd_policy_state;
++
++int netdev_fwd_policy_register(struct notifier_block *nb)
++{
++	int err;
++
++	spin_lock_bh(&netdev_fwd_policy_lock);
++	err = atomic_notifier_chain_register(&netdev_fwd_policy_chain, nb);
++	if (!err)
++		nb->notifier_call(nb, NETDEV_FWD_POLICY_INIT,
++				  &netdev_fwd_policy_state);
++	spin_unlock_bh(&netdev_fwd_policy_lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(netdev_fwd_policy_register);
++
++void netdev_fwd_policy_unregister(struct notifier_block *nb)
++{
++	/* This waits for RCU readers and must run without our spinlock held. */
++	atomic_notifier_chain_unregister(&netdev_fwd_policy_chain, nb);
++}
++EXPORT_SYMBOL_GPL(netdev_fwd_policy_unregister);
++
++void netdev_fwd_policy_begin(void)
++{
++	spin_lock_bh(&netdev_fwd_policy_lock);
++	if (!WARN_ON_ONCE(netdev_fwd_policy_state.writers == U32_MAX))
++		netdev_fwd_policy_state.writers++;
++	atomic_notifier_call_chain(&netdev_fwd_policy_chain,
++				   NETDEV_FWD_POLICY_BEGIN,
++				   &netdev_fwd_policy_state);
++	spin_unlock_bh(&netdev_fwd_policy_lock);
++}
++EXPORT_SYMBOL_GPL(netdev_fwd_policy_begin);
++
++void netdev_fwd_policy_end(void)
++{
++	spin_lock_bh(&netdev_fwd_policy_lock);
++	/* An unbalanced END would publish while a writer is still active. */
++	if (!WARN_ON_ONCE(!netdev_fwd_policy_state.writers))
++		netdev_fwd_policy_state.writers--;
++	atomic_notifier_call_chain(&netdev_fwd_policy_chain,
++				   NETDEV_FWD_POLICY_END,
++				   &netdev_fwd_policy_state);
++	spin_unlock_bh(&netdev_fwd_policy_lock);
++}
++EXPORT_SYMBOL_GPL(netdev_fwd_policy_end);
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -13,7 +13,7 @@
+ 			neighbour.o rtnetlink.o utils.o link_watch.o filter.o \
+ 			dev_ioctl.o tso.o sock_reuseport.o \
+ 			fib_notifier.o xdp.o flow_offload.o gro.o \
+-			netdev-genl.o netdev-genl-gen.o gso.o
++			netdev-genl.o netdev-genl-gen.o gso.o fwd_policy.o
+ 
+ obj-$(CONFIG_NETDEV_ADDR_LIST_TEST) += dev_addr_lists_test.o
+ 
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -59,6 +59,7 @@
+ #include <net/addrconf.h>
+ #endif
+ #include <linux/dpll.h>
++#include <linux/netdev_fwd_policy.h>
+ 
+ #include "dev.h"
+ 
+@@ -3618,6 +3619,9 @@
+ 	unsigned int old_flags, changed;
+ 	int err;
+ 
++	/* A close in __dev_change_flags is completed by NETDEV_DOWN below. */
++	guard(netdev_fwd_change)();
++
+ 	old_flags = dev->flags;
+ 	if (ifm && (ifm->ifi_flags || ifm->ifi_change)) {
+ 		err = __dev_change_flags(dev, rtnl_dev_combine_flags(dev, ifm),

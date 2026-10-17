@@ -1,0 +1,124 @@
+From: XR1710G AP project
+Subject: [PATCH] airoha: gate automatic bridge binding by packet and VLAN context
+
+Current L2 cache key contains MAC addresses, without bridge/VLAN/firewall
+identity. Guard both native L2B and cached/fallback subflows before commit.
+Keep explicitly declared route/TC offload separate from automatic L2 binding.
+Read-only boot opt-in defaults off; VLAN-filtered bridges never auto-bind.
+This prevents unsafe eligibility; it does not claim hardware throughput.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -17,6 +17,7 @@
+ #include <linux/if_vlan.h>
+ #include <net/pkt_cls.h>
+ #include <net/route.h>
++#include <net/ip.h>
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+@@ -31,6 +31,14 @@
+  * SRAM/DRAM bindings. Do not expose a writable switch that leaves them active.
+  * This controls PPE forwarding, not the NPU WLAN DMA/ring transport.
+  */
++/* Separate explicit opt-in for automatic MAC/FDB bridge cache bindings.
++ * Route/TC flow-table eligibility does not prove bridge firewall eligibility.
++ */
++static bool ppe_bridge_bind_enable;
++module_param_named(ppe_bridge_bind_enable, ppe_bridge_bind_enable, bool, 0400);
++MODULE_PARM_DESC(ppe_bridge_bind_enable,
++		"Allow experimental plain bridge binding; VLAN-filtered bridges remain software-only (boot-only)");
++
+ static bool ppe_bind_enable = IS_ENABLED(CONFIG_NET_AIROHA_PPE_BIND_DEFAULT);
+ module_param_named(ppe_bind_enable, ppe_bind_enable, bool, 0400);
+ MODULE_PARM_DESC(ppe_bind_enable,
+@@ -1367,6 +1375,45 @@
+ 	rcu_read_unlock();
+ 
+ 	return master;
++}
++
++/* MAC-only cached bridge entries cannot distinguish VLAN/bridge policy.
++ * Until a policy-complete cache key/lifecycle is validated, permit only an
++ * explicitly opted-in plain bridge, untagged unicast IPv4 TCP/UDP, no marks
++ * or fragments. Every bridge-cache/fallback call below uses this result.
++ */
++static bool airoha_ppe_bridge_skb_eligible(struct sk_buff *skb)
++{
++	struct net_device *master;
++	const struct ethhdr *eh;
++	const struct iphdr *iph;
++	bool eligible = false;
++
++	if (!ppe_bridge_bind_enable || !skb->dev || skb->mark ||
++	    skb_vlan_tag_present(skb) || is_vlan_dev(skb->dev) ||
++	    !skb_mac_header_was_set(skb))
++		return false;
++	eh = eth_hdr(skb);
++	if ((u8 *)eh < skb->head || (u8 *)(eh + 1) > skb_tail_pointer(skb) ||
++	    eh->h_proto != htons(ETH_P_IP) ||
++	    !is_valid_ether_addr(eh->h_source) || !is_valid_ether_addr(eh->h_dest))
++		return false;
++	iph = (const void *)(eh + 1);
++	if ((u8 *)(iph + 1) > skb_tail_pointer(skb) || iph->version != 4 ||
++	    iph->ihl < 5 || (u8 *)iph + iph->ihl * 4 > skb_tail_pointer(skb) ||
++	    ip_is_fragment(iph) ||
++	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
++		return false;
++	master = airoha_ppe_foe_get_bridge_master(skb->dev);
++	if (!master)
++		return false;
++	/* Even untagged Wi-Fi IoT frames acquire a PVID inside a VLAN bridge.
++	 * Reject the entire filtered bridge, rather than mistaking untagged for
++	 * users traffic and aliasing MAC-only entries across VLAN1/VLAN50.
++	 */
++	eligible = !br_vlan_enabled(master);
++	dev_put(master);
++	return eligible;
+ }
+ 
+ static bool
+@@ -1502,6 +1549,7 @@
+ 	struct airoha_foe_entry *hwe;
+ 	bool commit_done = false;
+ 	bool bridge_ready = false;
++	bool bridge_eligible = airoha_ppe_bridge_skb_eligible(skb);
+ 	bool native_l2b;
+ 	bool local = airoha_ppe_foe_skb_is_local(skb);
+ 	struct hlist_node *n;
+@@ -1511,7 +1559,7 @@
+ 	if (!ppe_bind_enable)
+ 		return;
+ 
+-	if (!local)
++	if (!local && bridge_eligible)
+ 		bridge_ready = airoha_ppe_foe_prepare_bridge_subflow(ppe, skb,
+ 							     &bridge_hwe);
+ 
+@@ -1530,7 +1578,7 @@
+ 		PPE_PKT_TYPE_BRIDGE;
+ 	if (native_l2b) {
+ 		/* Native L2B does not use the software L4 hash bucket. */
+-		if (local)
++		if (local || !bridge_eligible)
+ 			goto unlock;
+ 		goto l2_lookup;
+ 	}
+@@ -1546,7 +1594,7 @@
+ 			continue;
+ 		}
+ 
+-		if ((local && e->type == FLOW_TYPE_L2) ||
++		if (((local || !bridge_eligible) && e->type == FLOW_TYPE_L2) ||
+ 		    !airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
+@@ -1561,6 +1609,8 @@
+ 		goto unlock;
+ 
+ l2_lookup:
++	if (!bridge_eligible)
++		goto unlock;
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);

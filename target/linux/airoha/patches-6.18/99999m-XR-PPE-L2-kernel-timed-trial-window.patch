@@ -1,0 +1,285 @@
+Subject: [PATCH] XR: kernel-timed one-per-boot L2 PPE binding trial window
+
+xr_ppe_l2 gains TRIAL_ARM (10..600 s) and TRIAL_STOP. Arming initializes
+PPE/NPU offload as TC used to and permits only L2 template subflow binding
+while the boot-only ppe_bind_enable stays off (TC REPLACE is still rejected,
+so no L3 entry can bind). The window cannot be re-armed or extended; its
+deadline work, STOP or driver teardown revokes every template and subflow
+and then clears any bound FOE entry left in SRAM/DRAM, reporting the count.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -742,6 +742,11 @@
+ 	/* xr_ppe_l2 owner entries; serialized by the genetlink family lock. */
+ 	struct list_head xr_pub_entries;
+ 	u32 xr_pub_count;
++	/* One kernel-timed L2 binding trial per boot (xr_ppe_l2). */
++	struct delayed_work xr_trial_work;
++	unsigned long xr_trial_deadline;
++	u32 xr_trial_invalidated;
++	u8 xr_trial_state;
+ 	struct notifier_block l2_switchdev_nb;
+ 	struct notifier_block l2_switchdev_atomic_nb;
+ 	u64 l2_invalidations;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -45,6 +45,10 @@
+ 		"Allow explicit context-scoped TC bridge templates only; no automatic FDB binding (boot-only)");
+ 
+ static bool ppe_bind_enable = IS_ENABLED(CONFIG_NET_AIROHA_PPE_BIND_DEFAULT);
++/* xr_ppe_l2 trial window: L2 bridge binding only, kernel-timed, at most once
++ * per boot, ended by its own deadline. Written under ppe_lock.
++ */
++static bool xr_trial_active;
+ module_param_named(ppe_bind_enable, ppe_bind_enable, bool, 0400);
+ MODULE_PARM_DESC(ppe_bind_enable,
+                 "Allow PPE forwarding bindings (boot-only; NPU WLAN DMA remains available)");
+@@ -922,7 +926,7 @@
+ 	/* Final guard covers every bind caller, including direct bridge fallback.
+ 	 * INVALID/unbind writes must remain available for teardown.
+ 	 */
+-	if (!ppe_bind_enable &&
++	if (!ppe_bind_enable && !READ_ONCE(xr_trial_active) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, e->ib1) == AIROHA_FOE_STATE_BIND)
+ 		return -EOPNOTSUPP;
+ 
+@@ -1486,7 +1490,8 @@
+ 	bool valid = false, tagged = false;
+ 
+ 	memset(key, 0, sizeof(*key));
+-	if (!ppe_bridge_bind_enable || !skb->dev || is_vlan_dev(skb->dev) || skb->mark ||
++	if (!(ppe_bridge_bind_enable || READ_ONCE(xr_trial_active)) ||
++	    !skb->dev || is_vlan_dev(skb->dev) || skb->mark ||
+ 	    !skb_mac_header_was_set(skb))
+ 		return false;
+ 	eh = eth_hdr(skb);
+@@ -1624,7 +1629,7 @@
+ 	u32 index, state;
+ 
+ 	/* Also block cache hits and bridge fallback before resolving a path. */
+-	if (!ppe_bind_enable)
++	if (!ppe_bind_enable && !READ_ONCE(xr_trial_active))
+ 		return;
+ 
+ 	spin_lock_bh(&ppe_lock);
+@@ -2497,7 +2502,7 @@
+ 	u32 ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+ 	u16 now, diff;
+ 
+-	if (!ppe_bind_enable)
++	if (!ppe_bind_enable && !READ_ONCE(xr_trial_active))
+ 		return;
+ 
+ 	if (hash > ppe_hash_mask)
+@@ -2605,6 +2610,8 @@
+ 	XR_PPE_L2_CMD_PUBLISH,
+ 	XR_PPE_L2_CMD_REVOKE,
+ 	XR_PPE_L2_CMD_DUMP,
++	XR_PPE_L2_CMD_TRIAL_ARM,
++	XR_PPE_L2_CMD_TRIAL_STOP,
+ };
+ 
+ enum {
+@@ -2628,10 +2635,16 @@
+ 	XR_PPE_L2_A_CACHED,		/* u8 */
+ 	XR_PPE_L2_A_SUBFLOWS,		/* u32 */
+ 	XR_PPE_L2_A_EGRESS_TAGGED,	/* u8 */
++	XR_PPE_L2_A_TRIAL_SECONDS,	/* u32, TRIAL_ARM input */
++	XR_PPE_L2_A_TRIAL_STATE,	/* u8: 0 never, 1 active, 2 ended */
++	XR_PPE_L2_A_TRIAL_REMAINING_MS,	/* u32 */
++	XR_PPE_L2_A_TRIAL_INVALIDATED,	/* u32, bound FOE entries cleared */
+ 	__XR_PPE_L2_A_MAX,
+ };
+ #define XR_PPE_L2_A_MAX (__XR_PPE_L2_A_MAX - 1)
+ #define XR_PPE_L2_MAX_ENTRIES 1024
++#define XR_PPE_L2_TRIAL_MIN 10
++#define XR_PPE_L2_TRIAL_MAX 600
+ 
+ struct airoha_xr_pub {
+ 	struct list_head node;
+@@ -2652,6 +2665,8 @@
+ 	[XR_PPE_L2_A_IN_TAGGED] = NLA_POLICY_MAX(NLA_U8, 1),
+ 	[XR_PPE_L2_A_SRC] = NLA_POLICY_ETH_ADDR,
+ 	[XR_PPE_L2_A_DST] = NLA_POLICY_ETH_ADDR,
++	[XR_PPE_L2_A_TRIAL_SECONDS] = NLA_POLICY_RANGE(NLA_U32, XR_PPE_L2_TRIAL_MIN,
++						       XR_PPE_L2_TRIAL_MAX),
+ };
+ 
+ static struct airoha_xr_pub *airoha_xr_find(struct airoha_ppe *ppe, u64 cookie)
+@@ -2666,8 +2681,9 @@
+ 
+ static int airoha_xr_put_state(struct sk_buff *skb, struct airoha_ppe *ppe)
+ {
++	u32 writers, remaining = 0, invalidated;
+ 	bool nf, netdev;
+-	u32 writers;
++	u8 trial;
+ 	u64 gen;
+ 
+ 	spin_lock_bh(&ppe_lock);
+@@ -2675,6 +2691,10 @@
+ 	writers = ppe->l2_bridge_writers;
+ 	nf = ppe->l2_policy_latched;
+ 	netdev = ppe->l2_netdev_policy_latched;
++	trial = ppe->xr_trial_state;
++	invalidated = ppe->xr_trial_invalidated;
++	if (trial == 1 && time_before(jiffies, ppe->xr_trial_deadline))
++		remaining = jiffies_to_msecs(ppe->xr_trial_deadline - jiffies);
+ 	spin_unlock_bh(&ppe_lock);
+ 
+ 	if (nla_put_u64_64bit(skb, XR_PPE_L2_A_GENERATION, gen, XR_PPE_L2_A_PAD) ||
+@@ -2684,7 +2704,10 @@
+ 	    nla_put_u8(skb, XR_PPE_L2_A_BIND_ENABLED, ppe_bind_enable) ||
+ 	    nla_put_u8(skb, XR_PPE_L2_A_BRIDGE_BIND_ENABLED,
+ 		       ppe_bridge_bind_enable) ||
+-	    nla_put_u32(skb, XR_PPE_L2_A_ENTRIES, ppe->xr_pub_count))
++	    nla_put_u32(skb, XR_PPE_L2_A_ENTRIES, ppe->xr_pub_count) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_TRIAL_STATE, trial) ||
++	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_REMAINING_MS, remaining) ||
++	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_INVALIDATED, invalidated))
+ 		return -EMSGSIZE;
+ 	return 0;
+ }
+@@ -2915,6 +2938,101 @@
+ 	return skb->len;
+ }
+ 
++/* End the trial: no further bind, revoke every L2 template and subflow, then
++ * clear any bound FOE entry left in SRAM/DRAM. With the boot-only
++ * ppe_bind_enable off, every bound entry can only come from this trial.
++ */
++static void airoha_xr_trial_end(struct airoha_ppe *ppe)
++{
++	u32 total = airoha_ppe_get_total_num_entries(ppe), hash, cleared = 0;
++
++	spin_lock_bh(&ppe_lock);
++	if (ppe->xr_trial_state != 1) {
++		spin_unlock_bh(&ppe_lock);
++		return;
++	}
++	WRITE_ONCE(xr_trial_active, false);
++	ppe->xr_trial_state = 2;
++	airoha_ppe_l2_revoke_locked(ppe);
++	if (!ppe_bind_enable) {
++		for (hash = 0; hash < total; hash++) {
++			struct airoha_foe_entry *hwe, tmp;
++
++			hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
++			if (!hwe || FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1) !=
++				    AIROHA_FOE_STATE_BIND)
++				continue;
++			memcpy(&tmp, hwe, sizeof(tmp));
++			tmp.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++			tmp.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
++					      AIROHA_FOE_STATE_INVALID);
++			airoha_ppe_foe_commit_entry(ppe, &tmp, hash, false);
++			cleared++;
++		}
++	}
++	ppe->xr_trial_invalidated = cleared;
++	spin_unlock_bh(&ppe_lock);
++	pr_info("xr_ppe_l2: trial ended, %u bound FOE entries invalidated\n", cleared);
++}
++
++static void airoha_xr_trial_work(struct work_struct *work)
++{
++	struct airoha_ppe *ppe = container_of(to_delayed_work(work),
++					      struct airoha_ppe, xr_trial_work);
++
++	airoha_xr_trial_end(ppe);
++}
++
++/* One window per boot, never extended. PPE/NPU offload is initialized here,
++ * as TC would have done, because TC no longer publishes L2 templates.
++ */
++static int airoha_xr_trial_arm(struct sk_buff *skb, struct genl_info *info)
++{
++	struct airoha_ppe *ppe = xr_pub_ppe;
++	struct airoha_eth *eth = ppe->eth;
++	u32 seconds;
++	int err = 0;
++
++	if (GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_TRIAL_SECONDS))
++		return -EINVAL;
++	if (ppe_bind_enable) {
++		NL_SET_ERR_MSG(info->extack, "boot permission already enables PPE binding");
++		return -EINVAL;
++	}
++	if (ppe->xr_trial_state) {
++		NL_SET_ERR_MSG(info->extack, "one trial window per boot; it cannot be re-armed or extended");
++		return -EALREADY;
++	}
++	seconds = nla_get_u32(info->attrs[XR_PPE_L2_A_TRIAL_SECONDS]);
++	mutex_lock(&flow_offload_mutex);
++	if (!eth->npu)
++		err = airoha_ppe_offload_setup(eth);
++	mutex_unlock(&flow_offload_mutex);
++	if (err) {
++		NL_SET_ERR_MSG(info->extack, "PPE/NPU offload setup failed");
++		return err;
++	}
++	spin_lock_bh(&ppe_lock);
++	ppe->xr_trial_state = 1;
++	ppe->xr_trial_deadline = jiffies + seconds * HZ;
++	WRITE_ONCE(xr_trial_active, true);
++	spin_unlock_bh(&ppe_lock);
++	schedule_delayed_work(&ppe->xr_trial_work, seconds * HZ);
++	pr_info("xr_ppe_l2: L2 binding trial armed for %u s\n", seconds);
++	return airoha_xr_reply_state(info, XR_PPE_L2_CMD_TRIAL_ARM, 0, false);
++}
++
++static int airoha_xr_trial_stop(struct sk_buff *skb, struct genl_info *info)
++{
++	struct airoha_ppe *ppe = xr_pub_ppe;
++
++	if (ppe->xr_trial_state != 1)
++		return -ENOENT;
++	cancel_delayed_work_sync(&ppe->xr_trial_work);
++	airoha_xr_trial_end(ppe);
++	return airoha_xr_reply_state(info, XR_PPE_L2_CMD_TRIAL_STOP, 0, false);
++}
++
+ static const struct genl_small_ops airoha_xr_ops[] = {
+ 	{
+ 		.cmd = XR_PPE_L2_CMD_GET_STATE,
+@@ -2932,6 +3050,14 @@
+ 		.cmd = XR_PPE_L2_CMD_DUMP,
+ 		.dumpit = airoha_xr_dump,
+ 		.flags = GENL_ADMIN_PERM,
++	}, {
++		.cmd = XR_PPE_L2_CMD_TRIAL_ARM,
++		.doit = airoha_xr_trial_arm,
++		.flags = GENL_ADMIN_PERM,
++	}, {
++		.cmd = XR_PPE_L2_CMD_TRIAL_STOP,
++		.doit = airoha_xr_trial_stop,
++		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+ 
+@@ -2946,7 +3072,7 @@
+ 	.module = THIS_MODULE,
+ 	.small_ops = airoha_xr_ops,
+ 	.n_small_ops = ARRAY_SIZE(airoha_xr_ops),
+-	.resv_start_op = XR_PPE_L2_CMD_DUMP + 1,
++	.resv_start_op = XR_PPE_L2_CMD_TRIAL_STOP + 1,
+ };
+ 
+ static void airoha_xr_publisher_init(struct airoha_ppe *ppe)
+@@ -2954,6 +3080,7 @@
+ 	int err;
+ 
+ 	INIT_LIST_HEAD(&ppe->xr_pub_entries);
++	INIT_DELAYED_WORK(&ppe->xr_trial_work, airoha_xr_trial_work);
+ 	if (xr_pub_ppe)
+ 		return;
+ 	xr_pub_ppe = ppe;
+@@ -2972,6 +3099,8 @@
+ 	if (xr_pub_ppe != ppe)
+ 		return;
+ 	genl_unregister_family(&airoha_xr_family);
++	cancel_delayed_work_sync(&ppe->xr_trial_work);
++	airoha_xr_trial_end(ppe);
+ 	list_for_each_entry_safe(pub, tmp, &ppe->xr_pub_entries, node)
+ 		airoha_xr_release(ppe, pub);
+ 	xr_pub_ppe = NULL;

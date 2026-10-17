@@ -1,0 +1,67 @@
+From: XR1710G AP project
+Subject: [PATCH] hostapd: keep automatic puncturing policy in each MLD link
+
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -74,6 +74,7 @@
+ #define NL80211_DRV_LINK_ID_NA (-1)
+ 
+ struct i802_link {
++	u8 xr_pp_mode;
+ 	unsigned int beacon_set:1;
+ 
+ 	int freq;
+@@ -83,7 +84,6 @@
+ };
+ 
+ struct i802_bss {
+-	u8 xr_pp_mode;
+ 	struct wpa_driver_nl80211_data *drv;
+ 	struct i802_bss *next;
+ 
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3679,11 +3679,11 @@
+ 	struct i802_link *link = nl80211_get_link(bss, link_id);
+ 
+ 	/* Stop firmware-auto before discarding the BSS that owns the setting. */
+-	if (bss->xr_pp_mode) {
++	if (link && link->xr_pp_mode) {
+ 		int pp_ret = nl80211_xr_pp_mode(bss, 0, link_id, 0);
+ 		if (pp_ret)
+ 			wpa_printf(MSG_ERROR, "XR PP auto disable before beacon removal failed: %d", pp_ret);
+-		bss->xr_pp_mode = 0;
++		link->xr_pp_mode = 0;
+ 	}
+ 
+ 	if (!link || !link->beacon_set)
+@@ -6242,13 +6242,13 @@
+ 	}
+ #endif /* CONFIG_MESH */
+ 
+-	if (!ret && (params->xr_pp_mode || bss->xr_pp_mode)) {
++	if (!ret && (params->xr_pp_mode || link->xr_pp_mode)) {
+ 		u8 mode = params->xr_pp_mode ? 1 : params->punct_bitmap ? 2 : 0;
+ 		ret = nl80211_xr_pp_mode(bss, mode,
+ 			params->mld_ap ? params->mld_link_id : -1,
+ 			mode == 2 ? params->punct_bitmap : 0);
+ 		if (!ret)
+-			bss->xr_pp_mode = params->xr_pp_mode;
++			link->xr_pp_mode = params->xr_pp_mode;
+ 	}
+ 
+ 	return ret;
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3802,10 +3802,8 @@
+ 		return;
+ 	freq = nla_get_u32(outer[NL80211_ATTR_WIPHY_FREQ]);
+ 	for (bss = drv->first_bss; bss; bss = bss->next) {
+-		if (!bss->xr_pp_mode)
+-			continue;
+ 		for (i = 0; i < MAX_NUM_MLD_LINKS; i++) {
+-			if (bss->links[i].freq != freq ||
++			if (!bss->links[i].xr_pp_mode || bss->links[i].freq != freq ||
+ 			    (bss->valid_links && !(bss->valid_links & BIT(i))))
+ 				continue;
+ 			os_memset(&ev, 0, sizeof(ev));

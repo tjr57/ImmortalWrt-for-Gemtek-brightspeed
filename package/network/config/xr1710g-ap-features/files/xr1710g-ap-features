@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+task_root=${XR_AP_FEATURE_ROOT:-}
+case "$task_root" in ''|/*) ;; *) exit 2 ;; esac
+case "$task_root" in *'/../'*|*/..|/) exit 2 ;; esac
+uci_bin=${XR_AP_FEATURE_UCI:-/sbin/uci}
+profile=xr1710g_ap_configurator
+get() { "$uci_bin" -q get "$1" 2>/dev/null || :; }
+board() { cat "$task_root/tmp/sysinfo/board_name" 2>/dev/null || :; }
+bool() { [ "$(get "$1")" = 1 ] && printf 1 || printf 0; }
+read_parameter() {
+	if [ -r "$task_root/sys/module/$1/parameters/$2" ]; then
+		cat "$task_root/sys/module/$1/parameters/$2"
+	else printf unavailable; fi
+}
+policy() {
+	[ "$(board)" = 'gemtek,xr1710g' ] || return 0
+	[ -n "$task_root" ] || [ "$(id -u)" = 0 ] || return 1
+	local folder="$task_root/etc/modules.d" leaf="$task_root/etc/modules.d/01-xr1710g-puncturing" tmp
+	[ -d "$folder" ] && [ ! -L "$folder" ] && [ ! -L "$leaf" ] || return 1
+	# Never replace or delete an operator-owned module file.
+	if [ -e "$leaf" ] && ! grep -qx '# XR1710G AP13 owned puncturing boot policy' "$leaf"; then
+		printf '%s\n' 'Puncturing boot policy file is not owned by AP13.' >&2
+		return 1
+	fi
+	if [ "$(bool "$profile.puncturing.enabled")" = 1 ]; then
+		tmp=$(mktemp "$folder/.xr-punct-XXXXXX")
+		printf '%s\n' '# XR1710G AP13 owned puncturing boot policy' 'mt7996e puncturing_enable=1' > "$tmp"
+		chmod 0644 "$tmp"
+		mv -f "$tmp" "$leaf"
+	elif [ -e "$leaf" ]; then
+		rm -f "$leaf"
+	fi
+}
+status() {
+	# jshn is designed for shells without nounset. Inputs remain quoted.
+	set +u
+	. "${XR_AP_FEATURE_JSHN:-/usr/share/libubox/jshn.sh}"
+	json_init
+	json_add_string release AP18
+	json_add_string board "$(board)"
+	json_add_string acceptance 'experimental-features;hardware-tests-pending'
+	json_add_boolean roaming_configured "$(bool "$profile.roaming.enabled")"
+	json_add_boolean mlo_configured "$(bool "$profile.mlo.enabled")"
+	json_add_boolean puncturing_configured "$(bool "$profile.puncturing.enabled")"
+	json_add_string mlo_bands '5g+2g'
+	json_add_string backhaul '6g dedicated mesh'
+	json_add_string puncturing_driver "$(read_parameter mt7996e puncturing_enable)"
+	json_add_string cpu_online "$(cat "$task_root/sys/devices/system/cpu/online" 2>/dev/null || :)"
+	json_add_string performance 'manual-plan-apply-restore;default-unchanged'
+	json_dump
+}
+case "${1:-}" in
+	boot-policy) policy ;;
+	status) status ;;
+	*) printf '%s\n' 'Usage: xr1710g-ap-features status|boot-policy' >&2; exit 2 ;;
+esac

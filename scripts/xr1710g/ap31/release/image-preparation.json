@@ -1,0 +1,27 @@
+{
+  "at": "2026-10-11T00:46:29.608001+08:00",
+  "version": "20261011-ap31-d331711d",
+  "baseline": "20261010-ap30-d331711d",
+  "jobs": 12,
+  "status": "prepared",
+  "patchSHA256": "3fac986c536953c2bc66bf0700c6572466ad8b4d1cfd6dacb4f17bb78500fe72",
+  "configBeforeSHA256": {
+    ".config": "b79395a3bc3f3c514bda31878f98a58d8788ebcad6464eab218fbf7ec5804dd2",
+    "xr1710g-ap.config": "adf407a255852c66020f817ea4932383183558844592e97db02979dc39eeb72c"
+  },
+  "dependencies": [
+    "tc-tiny",
+    "kmod-sched-core",
+    "kmod-sched-flower",
+    "kmod-sched-act-vlan"
+  ],
+  "NpuPpeDefaultsChanged": false,
+  "automaticPublisherIncluded": false,
+  "sourceCandidate": "development/ap31/ppe-context/progress.json",
+  "deviceFlashed": false,
+  "configAfterSHA256": {
+    ".config": "4535dca613a66801777a2ce28d223ee67d842c3d0309d8e7e66502361a919183",
+    "xr1710g-ap.config": "611224c1b96df0b351e2265398dcd1b960d6b9670c83b5e0933f2a07985757de"
+  },
+  "exactCandidateSourcesApplied": true
+}

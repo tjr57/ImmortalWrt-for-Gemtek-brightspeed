@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ -f /etc/xr1710g-ap-profile ] || exit 0
+[ "$(board_name)" = 'gemtek,xr1710g' ] || exit 0
+
+# Runs independently on each image installation. Never rewrites /etc/config/fan
+# or depends on the one-time network initialized flag in 95.
+if [ -x /etc/init.d/airoha_fan ]; then
+	/etc/init.d/airoha_fan stop 2>/dev/null
+	/etc/init.d/airoha_fan disable || exit 1
+fi
+[ -x /etc/init.d/fan ] || { logger -t xr1710g-fan 'fan owner package missing; legacy owner remains disabled'; exit 1; }
+/etc/init.d/fan enable || exit 1
+
+# uci-defaults runs before service autostart. START=99 applies the saved curve
+# later; no sysfs access, i2c probing or curve reset is done by this migration.
+exit 0

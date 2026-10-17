@@ -1,0 +1,116 @@
+Subject: [PATCH] mt76: retain scalar NPU TXFREE anomaly metadata without logging
+
+Diagnostic only; historical AP7 truncation rootcause remains unproven.
+Does not change descriptor ownership, skb length, token release or ring publication.
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -240,6 +240,14 @@
+ 	u32 dma_idx;
+ } __packed __aligned(4);
+ 
++/* Metadata only: no packet contents, addresses, tokens or credentials. */
++struct mt76_npu_rx_anomaly {
++ u64 count;
++ u32 announced, actual, frames;
++ u32 first_cur, first_total, first_last, first_frag, first_count;
++ u32 tail_cur, tail_last, next_done, next_cur, next_same;
++};
++
+ struct mt76_queue {
+ 	struct mt76_queue_regs __iomem *regs;
+ 
+@@ -276,6 +284,7 @@
+ 	int npu_irq;
+ 	bool npu_irq_registered;
+ 	bool npu_napi_registered;
++	struct mt76_npu_rx_anomaly npu_rx_anomaly;
+ 	bool npu_napi_enabled;
+ };
+ 
+--- a/npu.c
++++ b/npu.c
+@@ -157,6 +157,53 @@
+ 		next_done[1], next_cur[1], next_last[1], next_frag[1], next_same[1]);
+ }
+ 
++/* Capture only mismatches, without printk/audit timing distortion.
++ * Never extend skb length to the RXD claim or reassemble unrelated packets.
++ */
++static void mt76_npu_rx_anomaly(struct mt76_queue *q, struct sk_buff *skb,
++                              int start, int frames, u32 first_ctrl,
++                              u32 first_info)
++{
++ struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++ struct mt76_npu_rx_anomaly s = {};
++ __le32 header;
++ u32 word, tail_ctrl, next_ctrl = 0, next_info = 0;
++ int last = (start + frames - 1) % q->ndesc;
++
++ if (skb->len < sizeof(header) || skb_copy_bits(skb, 0, &header, sizeof(header)))
++  return;
++ word = le32_to_cpu(header);
++ /* MT7996 RXD: byte count[15:0], packet type[31:27]. */
++ if (FIELD_GET(GENMASK(31, 27), word) != 6 || (word & 0xffff) == skb->len)
++  return;
++ tail_ctrl = READ_ONCE(desc[last].ctrl);
++ if (q->queued) {
++  next_ctrl = READ_ONCE(desc[q->tail].ctrl);
++  if (next_ctrl & NPU_RX_DMA_DESC_DONE_MASK) {
++   dma_rmb();
++   next_info = READ_ONCE(desc[q->tail].info);
++  }
++ }
++ s.announced = word & 0xffff; s.actual = skb->len; s.frames = frames;
++ s.first_cur = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, first_ctrl);
++ s.first_total = FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, first_ctrl);
++ s.first_last = !!(first_ctrl & NPU_RX_DMA_DESC_LAST_MASK);
++ s.first_frag = FIELD_GET(NPU_RX_DMA_FRAG_TYPE_MASK, READ_ONCE(desc[start].data));
++ s.first_count = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, first_info);
++ s.tail_cur = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, tail_ctrl);
++ s.tail_last = !!(tail_ctrl & NPU_RX_DMA_DESC_LAST_MASK);
++ s.next_done = !!(next_ctrl & NPU_RX_DMA_DESC_DONE_MASK);
++ if (s.next_done) {
++  s.next_cur = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, next_ctrl);
++  s.next_same = ((next_info ^ first_info) &
++                 (NPU_RX_DMA_PKT_ID_MASK | NPU_RX_DMA_SRC_PORT_MASK)) == 0;
++ }
++ spin_lock_bh(&q->lock);
++ s.count = q->npu_rx_anomaly.count + 1;
++ q->npu_rx_anomaly = s;
++ spin_unlock_bh(&q->lock);
++}
++
+ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 					struct mt76_queue *q,
+ 					u32 *info)
+@@ -237,6 +284,7 @@
+ 	}
+ 	q->tail = index;
+ 	q->queued -= i;
++	mt76_npu_rx_anomaly(q, skb, start, nframes, first_ctrl, first_info);
+ 	if (unlikely(npu_rx_audit))
+ 		mt76_npu_audit_txfree(dev, q, skb, start, nframes,
+ 							 first_ctrl, first_info);
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -954,6 +954,19 @@
+  seq_puts(s, "queue_counters=approximate\n");
+  for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++) {
+   struct mt76_queue *q = &mdev->q_rx[i];
++  struct mt76_npu_rx_anomaly snapshot = {};
++  if (q->ndesc) {
++   spin_lock_bh(&q->lock);
++   snapshot = q->npu_rx_anomaly;
++   spin_unlock_bh(&q->lock);
++  }
++  seq_printf(s, "npu_rx%d_mismatch count=%llu announced=%u actual=%u frames=%u first_cur=%u first_total=%u first_last=%u first_frag=%u first_count=%u tail_cur=%u tail_last=%u next_done=%u next_cur=%u next_same=%u\n",
++             i - MT_RXQ_NPU0, (unsigned long long)snapshot.count, snapshot.announced,
++             snapshot.actual, snapshot.frames, snapshot.first_cur, snapshot.first_total,
++             snapshot.first_last, snapshot.first_frag, snapshot.first_count,
++             snapshot.tail_cur, snapshot.tail_last, snapshot.next_done,
++             snapshot.next_cur, snapshot.next_same);
++
+   seq_printf(s, "npu_rx%d ndesc=%u queued=%u head=%u tail=%u napi_registered=%u napi_enabled=%u irq_registered=%u\n",
+              i - MT_RXQ_NPU0, READ_ONCE(q->ndesc), READ_ONCE(q->queued),
+              READ_ONCE(q->head), READ_ONCE(q->tail),

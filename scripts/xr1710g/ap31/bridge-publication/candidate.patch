@@ -1,0 +1,389 @@
+Subject: [PATCH] XR: exact bridge actions and revoke in-flight PPE rules
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -450,12 +450,15 @@
+ {
+ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
+ 	u32 pon_tag = 0;
+-	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
++	int wlan_etype = -EINVAL, dsa_port;
+ 	struct airoha_foe_mac_info_common *l2;
+ 	u8 smac_id = 0xf;
+ 
++	*egress_dev = NULL;
++	if (!netdev)
++		return -EOPNOTSUPP;
++	dsa_port = airoha_get_dsa_port(&netdev);
+ 	memset(hwe, 0, sizeof(*hwe));
+-	*egress_dev = NULL;
+ 
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, type) |
+@@ -1206,6 +1209,7 @@
+ 	 * No flow_offload_mutex acquisition under RTNL; the cache has one spinlock.
+ 	 */
+ 	spin_lock_bh(&ppe_lock);
++	ppe->l2_generation++;
+ 	list_for_each_entry_safe(e, tmp, &ppe->l2_templates, l2_gc_node) {
+ 		airoha_ppe_foe_remove_l2_flow(ppe, e);
+ 		ppe->l2_invalidations++;
+@@ -1442,10 +1446,10 @@
+ 	const struct vlan_ethhdr *veh;
+ 	u16 vid = 0, proto = ETH_P_8021Q;
+ 	unsigned int offset = ETH_HLEN;
+-	bool valid = false;
++	bool valid = false, tagged = false;
+ 
+ 	memset(key, 0, sizeof(*key));
+-	if (!ppe_bridge_bind_enable || !skb->dev || skb->mark ||
++	if (!ppe_bridge_bind_enable || !skb->dev || is_vlan_dev(skb->dev) || skb->mark ||
+ 	    !skb_mac_header_was_set(skb))
+ 		return false;
+ 	eh = eth_hdr(skb);
+@@ -1459,6 +1463,7 @@
+ 			return false;
+ 		veh = (const void *)eh;
+ 		vid = ntohs(veh->h_vlan_TCI) & VLAN_VID_MASK;
++		tagged = true;
+ 		if (veh->h_vlan_encapsulated_proto != htons(ETH_P_IP))
+ 			return false;
+ 		offset = VLAN_ETH_HLEN;
+@@ -1468,11 +1473,14 @@
+ 		if (is_vlan_dev(skb->dev) || skb->vlan_proto != htons(ETH_P_8021Q))
+ 			return false;
+ 		vid = skb_vlan_tag_get_id(skb);
++		tagged = true;
+ 	} else if (is_vlan_dev(skb->dev)) {
+ 		if (vlan_dev_vlan_proto(skb->dev) != htons(ETH_P_8021Q))
+ 			return false;
+ 		vid = vlan_dev_vlan_id(skb->dev);
+ 	}
++	if (tagged && (!vid || vid >= VLAN_VID_MASK))
++		return false;
+ 	iph = (const void *)((const u8 *)eh + offset);
+ 	if ((u8 *)(iph + 1) > skb_tail_pointer(skb) || iph->version != 4 ||
+ 	    iph->ihl < 5 || (u8 *)iph + iph->ihl * 4 > skb_tail_pointer(skb) ||
+@@ -1500,6 +1508,7 @@
+ 	key->bridge_ifindex = master->ifindex;
+ 	key->vid = vid;
+ 	key->vlan_proto = htons(proto);
++	key->ingress_tagged = tagged;
+ 	ether_addr_copy(key->dest, eh->h_dest);
+ 	ether_addr_copy(key->source, eh->h_source);
+ 	valid = true;
+@@ -1619,7 +1628,7 @@
+ 	e->type = FLOW_TYPE_L2;
+ 	INIT_LIST_HEAD(&e->l2_gc_node);
+ 	spin_lock_bh(&ppe_lock);
+-	if (ppe->l2_policy_latched) {
++	if (ppe->l2_policy_latched || e->l2_generation != ppe->l2_generation) {
+ 		spin_unlock_bh(&ppe_lock);
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -1781,8 +1790,8 @@
+ 	if (meta.mask->ingress_ifindex != U32_MAX || meta.mask->ingress_iftype ||
+ 	    meta.mask->l2_miss || !is_broadcast_ether_addr(eth.mask->src) ||
+ 	    !is_broadcast_ether_addr(eth.mask->dst) || basic.mask->ip_proto ||
+-	    (basic.mask->n_proto && (basic.mask->n_proto != htons(0xffff) ||
+-	                             basic.key->n_proto != htons(ETH_P_IP))))
++	    basic.mask->n_proto != htons(0xffff) ||
++	    basic.key->n_proto != htons(ETH_P_IP))
+ 		return false;
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
+ 		struct flow_match_control control;
+@@ -1884,6 +1893,155 @@
+  return valid;
+ }
+ 
++/* A hardware entry has exactly one egress. Reject absent/null targets early
++ * and do not collapse multiple redirects into their final target.
++ */
++static bool airoha_ppe_rule_has_single_redirect(const struct flow_rule *rule)
++{
++ const struct flow_action_entry *act;
++ bool found = false;
++ int i;
++
++ flow_action_for_each(i, act, &rule->action) {
++  if (act->id != FLOW_ACTION_REDIRECT)
++   continue;
++  if (found || !act->dev)
++   return false;
++  found = true;
++ }
++ return found;
++}
++
++/* FOE VLAN fields describe the final output stack, not a push counter.
++ * Keeping an input tag needs per-packet PCP/DEI preservation and remains in
++ * software. This helper only validates; it does not touch hardware.
++ */
++static bool airoha_ppe_l2_actions(struct flow_rule *rule, u16 vid,
++                                bool ingress_tagged, bool egress_untagged,
++                                struct airoha_flow_data *data)
++{
++ const struct flow_action_entry *act;
++ bool tagged = ingress_tagged, popped = false, pushed = false;
++ bool redirected = false;
++ int i;
++
++ if (vid >= VLAN_VID_MASK || (!vid && (ingress_tagged || !egress_untagged)))
++  return false;
++ flow_action_for_each(i, act, &rule->action) {
++  if (redirected)
++   return false;
++  switch (act->id) {
++  case FLOW_ACTION_VLAN_POP:
++   if (!tagged || popped || pushed)
++    return false;
++   tagged = false;
++   popped = true;
++   break;
++  case FLOW_ACTION_VLAN_PUSH:
++   if (tagged || pushed || !vid || act->vlan.vid != vid ||
++       act->vlan.proto != htons(ETH_P_8021Q) || act->vlan.prio)
++    return false;
++   tagged = true;
++   pushed = true;
++   break;
++  case FLOW_ACTION_REDIRECT:
++   if (!act->dev)
++    return false;
++   redirected = true;
++   break;
++  default:
++   /* Includes checksum mutation, PPPoE and unrepresented metadata. */
++   return false;
++  }
++ }
++ if (!redirected || (ingress_tagged && !popped) ||
++     tagged == egress_untagged)
++  return false;
++ data->vlan.num = tagged ? 1 : 0;
++ if (tagged) {
++  data->vlan.hdr[0].id = vid;
++  data->vlan.hdr[0].proto = htons(ETH_P_8021Q);
++ }
++ return true;
++}
++
++/* Use actual bridge port membership, PVID and output tag policy. */
++static bool airoha_ppe_l2_context(struct flow_rule *rule,
++                                struct net_device *odev,
++                                struct airoha_flow_data *data,
++                                struct airoha_l2_flow_key *key)
++{
++ struct flow_match_meta meta;
++ struct net_device *indev, *master;
++ struct bridge_vlan_info info;
++ bool tagged = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN);
++ bool untagged = true, valid = false;
++ u16 vid = 0, proto;
++
++ if (!odev || !airoha_ppe_l2_rule_exact(rule))
++  return false;
++ flow_rule_match_meta(rule, &meta);
++ rcu_read_lock();
++ indev = dev_get_by_index_rcu(dev_net(odev), meta.key->ingress_ifindex);
++ if (!indev || indev == odev || is_vlan_dev(indev) || is_vlan_dev(odev) ||
++     !netif_is_bridge_port(indev) || !netif_is_bridge_port(odev))
++  goto out;
++ master = airoha_ppe_foe_get_bridge_master_rcu(indev);
++ if (!master || !net_eq(dev_net(indev), dev_net(odev)) ||
++     airoha_ppe_foe_get_bridge_master_rcu(odev) != master)
++  goto out;
++ if (br_vlan_enabled(master)) {
++  if (br_vlan_get_proto(master, &proto) || proto != ETH_P_8021Q)
++   goto out;
++  if (tagged) {
++   struct flow_match_vlan vlan;
++   flow_rule_match_vlan(rule, &vlan);
++   vid = vlan.key->vlan_id;
++   if (vlan.mask->vlan_id != VLAN_VID_MASK ||
++       vlan.key->vlan_tpid != htons(ETH_P_8021Q) ||
++       vlan.mask->vlan_tpid != htons(0xffff))
++    goto out;
++  } else if (br_vlan_get_pvid_rcu(indev, &vid)) {
++   goto out;
++  }
++  if (!vid || vid >= VLAN_VID_MASK ||
++      br_vlan_get_info_rcu(indev, vid, &info) ||
++      br_vlan_get_info_rcu(odev, vid, &info))
++   goto out;
++  untagged = !!(info.flags & BRIDGE_VLAN_INFO_UNTAGGED);
++ } else if (tagged) {
++  goto out;
++ }
++ if (!airoha_ppe_l2_actions(rule, vid, tagged, untagged, data))
++  goto out;
++ key->net_cookie = dev_net(indev)->net_cookie;
++ key->ingress_ifindex = indev->ifindex;
++ key->bridge_ifindex = master->ifindex;
++ key->vid = vid;
++ key->vlan_proto = htons(ETH_P_8021Q);
++ key->ingress_tagged = tagged;
++ ether_addr_copy(key->source, data->eth.h_source);
++ ether_addr_copy(key->dest, data->eth.h_dest);
++ valid = true;
++out:
++ rcu_read_unlock();
++ return valid;
++}
++
++/* Capture before reading context; commit verifies under the same cache
++ * lock. A VLAN/FDB/netdevice revoke must invalidate in-flight preparation,
++ * even if the template list was empty when the notification arrived.
++ */
++static bool airoha_ppe_l2_snapshot(struct airoha_ppe *ppe, u64 *generation)
++{
++ bool allowed;
++ spin_lock_bh(&ppe_lock);
++ allowed = !ppe->l2_policy_latched;
++ *generation = ppe->l2_generation;
++ spin_unlock_bh(&ppe_lock);
++ return allowed;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1891,12 +2049,20 @@
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct airoha_flow_data data = {};
++	struct airoha_l2_flow_key l2_key = {};
++	u64 l2_generation = 0;
+ 	struct net_device *odev = NULL;
+ 	struct flow_action_entry *act;
+ 	struct airoha_foe_entry hwe;
+ 	u8 dsfield = 0, l4proto = 0;
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
++
++	if (!airoha_ppe_rule_has_single_redirect(rule)) {
++		NL_SET_ERR_MSG_MOD(f->common.extack,
++				   "PPE requires exactly one valid redirect target");
++		return -EOPNOTSUPP;
++	}
+ 
+ 	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+ 			      airoha_flow_table_params))
+@@ -1957,6 +2123,12 @@
+ 	}
+ 
+ 	flow_action_for_each(i, act, &rule->action) {
++		/* Derive bridge output after validating its context. */
++		if (offload_type == PPE_PKT_TYPE_BRIDGE) {
++			if (act->id == FLOW_ACTION_REDIRECT)
++				odev = act->dev;
++			continue;
++		}
+ 		switch (act->id) {
+ 		case FLOW_ACTION_MANGLE:
+ 			if (offload_type == PPE_PKT_TYPE_BRIDGE)
+@@ -1997,6 +2169,14 @@
+ 	    !airoha_ppe_l3_rule_exact(rule, addr_type, odev)) {
+ 		NL_SET_ERR_MSG_MOD(f->common.extack,
+ 		 "PPE cannot represent this exact policy/context; retained in software");
++		return -EOPNOTSUPP;
++	}
++
++	if (offload_type == PPE_PKT_TYPE_BRIDGE &&
++	    (!airoha_ppe_l2_snapshot(eth->ppe, &l2_generation) ||
++	     !airoha_ppe_l2_context(rule, odev, &data, &l2_key))) {
++		NL_SET_ERR_MSG_MOD(f->common.extack,
++			"PPE bridge actions do not match exact VLAN/port context");
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+@@ -2085,59 +2265,10 @@
+ 
+ 	INIT_LIST_HEAD(&e->gc_node);
+ 	if (offload_type == PPE_PKT_TYPE_BRIDGE) {
+-		struct flow_match_meta meta;
+-		struct flow_match_eth_addrs addrs;
+-		struct net_device *indev, *master;
+-		u16 pvid = 0;
+-
+-		if (!airoha_ppe_l2_rule_exact(rule)) {
+-			err = -EOPNOTSUPP;goto free_entry;
+-		}
+-		flow_rule_match_meta(rule, &meta);
+-		flow_rule_match_eth_addrs(rule, &addrs);
+-		if (meta.mask->ingress_ifindex != U32_MAX ||
+-		    !is_broadcast_ether_addr(addrs.mask->src) ||
+-		    !is_broadcast_ether_addr(addrs.mask->dst) || !odev) {
+-			err = -EOPNOTSUPP;
+-			goto free_entry;
+-		}
+-		rcu_read_lock();
+-		indev = dev_get_by_index_rcu(dev_net(odev), meta.key->ingress_ifindex);
+-		master = indev ? airoha_ppe_foe_get_bridge_master_rcu(indev) : NULL;
+-		if (!master || !net_eq(dev_net(indev), dev_net(odev)) ||
+-		    airoha_ppe_foe_get_bridge_master_rcu(odev) != master) {
+-			rcu_read_unlock();
+-			err = -EOPNOTSUPP;
+-			goto free_entry;
+-		}
+-		e->l2_key.net_cookie = dev_net(indev)->net_cookie;
+-		e->l2_key.ingress_ifindex = indev->ifindex;
+-		e->l2_key.bridge_ifindex = master->ifindex;
+-		e->l2_key.vlan_proto = htons(ETH_P_8021Q);
+-		if (br_vlan_enabled(master)) {
+-			struct flow_match_vlan vlan;
+-			struct bridge_vlan_info info;
+-			if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
+-				rcu_read_unlock();err = -EOPNOTSUPP;goto free_entry;
+-			}
+-			flow_rule_match_vlan(rule, &vlan);
+-			pvid = vlan.key->vlan_id;
+-			if (vlan.mask->vlan_id != VLAN_VID_MASK || !pvid ||
+-			    pvid >= VLAN_VID_MASK ||
+-			    vlan.key->vlan_tpid != htons(ETH_P_8021Q) ||
+-			    vlan.mask->vlan_tpid != htons(0xffff) ||
+-			    br_vlan_get_info_rcu(indev, pvid, &info) ||
+-			    br_vlan_get_info_rcu(odev, pvid, &info)) {
+-				rcu_read_unlock();err = -EOPNOTSUPP;goto free_entry;
+-			}
+-		} else if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
+-			rcu_read_unlock();err = -EOPNOTSUPP;goto free_entry;
+-		}
+-		e->l2_key.vid = pvid;
+-		ether_addr_copy(e->l2_key.source, data.eth.h_source);
+-		ether_addr_copy(e->l2_key.dest, data.eth.h_dest);
+-		rcu_read_unlock();
+-	}
++		e->l2_key = l2_key;
++		e->l2_generation = l2_generation;
++	}
++
+ 	e->cookie = f->cookie;
+ 	e->egress_dev = egress_dev;
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -555,6 +555,7 @@
+ 	u32 bridge_ifindex;
+ 	u16 vid;
+ 	__be16 vlan_proto;
++	u16 ingress_tagged;
+ 	u8 dest[ETH_ALEN];
+ 	u8 source[ETH_ALEN];
+ };
+@@ -577,6 +578,7 @@
+ 	struct rhash_head node;
+ 	unsigned long cookie;
+ 	struct airoha_l2_flow_key l2_key;
++	u64 l2_generation;
+ 	struct list_head l2_gc_node;
+ 	bool l2_cached;
+ 	/* Track the final egress GDM netdev for each flow. PON bearer mappings
+@@ -737,6 +739,7 @@
+ 	struct notifier_block l2_switchdev_nb;
+ 	struct notifier_block l2_switchdev_atomic_nb;
+ 	u64 l2_invalidations;
++	u64 l2_generation;
+ 
+ 	struct hlist_head *foe_flow;
+ 	u16 *foe_check_time;

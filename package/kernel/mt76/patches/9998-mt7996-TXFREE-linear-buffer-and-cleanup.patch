@@ -1,0 +1,101 @@
+Subject: [PATCH] wifi: mt76: mt7996: parse linear bounded TXFREE and finish partial cleanup
+SPDX-License-Identifier: ISC
+
+NPU RX may assemble a nonlinear skb, but the TXFREE completion parser takes a
+contiguous data/length pair. Linearize only TXFREE and pass the refreshed skb
+data. Check the two-word header before reading it.
+
+Keep the version and boundary WARN paths. Require a complete word and version7
+pair extension before dereferencing; on a truncated message, complete already
+released tokens' accumulated skb free_list and the existing wake/schedule path.
+Do not clamp the advertised count or change descriptor masks.
+
+Add rate-limited scalar layout diagnostics for original nonlinear skb and
+truncated input: length/head/data_len/frags, header length/type/count/version,
+completed count and offset. Do not log payload, raw headers, MACs, token IDs or
+credentials. This addresses confirmed parser/interface defects; it does not
+assert that nonlinear input caused the observed AP6 18/70 message.
+
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1370,6 +1370,12 @@
+ 	u16 total, count = 0;
+ 	u8 ver;
+ 
++	if (unlikely(len < 2 * sizeof(*tx_free))) {
++		dev_warn_ratelimited(dev->mt76.dev,
++			"TXFREE short header: len=%d\n", len);
++		return;
++	}
++
+ 	/* clean DMA queues and unmap buffers first */
+ 	mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_PSD], false);
+ 	mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_BE], false);
+@@ -1391,8 +1397,15 @@
+ 		u32 msdu, info;
+ 		u8 i;
+ 
+-		if (WARN_ON_ONCE((void *)cur_info >= end))
+-			return;
++		if (WARN_ON_ONCE((void *)(cur_info + 1) > end)) {
++			dev_warn_ratelimited(dev->mt76.dev,
++				"TXFREE truncated: len=%d rx_bytes=%u type=%u ver=%u completed=%u total=%u offset=%zu\n",
++				len, (u32)le32_get_bits(tx_free[0], MT_TXFREE0_RX_BYTE),
++				(u32)le32_get_bits(tx_free[0], MT_TXFREE0_PKT_TYPE),
++				ver, count, total,
++				(size_t)((u8 *)cur_info - (u8 *)data));
++			goto out;
++		}
+ 		/* 1'b1: new wcid pair.
+ 		 * 1'b0: msdu_id with the same 'wcid pair' as above.
+ 		 */
+@@ -1433,7 +1446,7 @@
+ 			}
+ next:
+ 			/* ver 7 has a new DW with pair = 1, skip it */
+-			if (ver == 7 && ((void *)(cur_info + 1) < end) &&
++			if (ver == 7 && ((void *)(cur_info + 2) <= end) &&
+ 			    (le32_to_cpu(*(cur_info + 1)) & MT_TXFREE_INFO_PAIR))
+ 				cur_info++;
+ 			continue;
+@@ -1468,6 +1481,7 @@
+ 		}
+ 	}
+ 
++out:
+ 	mt7996_mac_sta_poll(dev);
+ 
+ 	if (wake)
+@@ -1721,6 +1735,32 @@
+ 			break;
+ 		}
+ 
++		if (unlikely(skb_is_nonlinear(skb))) {
++			u32 word0 = 0, word1 = 0;
++			bool header_valid = skb_headlen(skb) >= 2 * sizeof(__le32);
++
++			if (header_valid) {
++				word0 = le32_to_cpu(((__le32 *)skb->data)[0]);
++				word1 = le32_to_cpu(((__le32 *)skb->data)[1]);
++			}
++			dev_info_ratelimited(dev->mt76.dev,
++				"TXFREE nonlinear skb: q=%u len=%u headlen=%u data_len=%u frags=%u header_valid=%u rx_bytes=%u type=%u total=%u ver=%u\n",
++				q, skb->len, skb_headlen(skb), skb->data_len,
++				skb_shinfo(skb)->nr_frags, header_valid,
++				(u32)FIELD_GET(MT_TXFREE0_RX_BYTE, word0),
++				(u32)FIELD_GET(MT_TXFREE0_PKT_TYPE, word0),
++				(u32)FIELD_GET(MT_TXFREE0_MSDU_CNT, word0),
++				(u32)FIELD_GET(MT_TXFREE1_VER, word1));
++		}
++
++		/* NPU DMA can assemble a control notification from page frags. */
++		if (unlikely(skb_linearize(skb))) {
++			dev_warn_ratelimited(dev->mt76.dev,
++				"TXFREE linearize failed: len=%u headlen=%u data_len=%u\n",
++				skb->len, skb_headlen(skb), skb->data_len);
++			napi_consume_skb(skb, 1);
++			break;
++		}
+ 		mt7996_mac_tx_free(dev, skb->data, skb->len);
+ 		napi_consume_skb(skb, 1);
+ 		break;

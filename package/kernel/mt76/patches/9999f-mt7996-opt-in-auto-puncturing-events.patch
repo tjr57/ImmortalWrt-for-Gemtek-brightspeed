@@ -1,0 +1,306 @@
+From: XR1710G AP project
+Subject: [PATCH] mt7996: opt-in MTK automatic PP vendor command/event bridge
+
+Adapt Allen Ye/Howard Hsu MTK08196fa6 PP command0xcc/event5 and MCU0x38/0x5a
+to current be5ce791. Validate NLA/TLV/bitmap/band, resolve VIF links under the
+driver mutex, use ACK before committing mode, and preserve one-bitmap-per-band.
+No default enablement, no firmware blob replacement, no RF acceptance claim.
+Inherit BSD-3-Clause-Clear. STA/extender PP remains separately unqualified.
+
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1105,6 +1105,7 @@
+ 	MCU_UNI_EVENT_NIC_CAPAB = 0x43,
+ 	MCU_UNI_EVENT_NAN = 0x56,
+ 	MCU_UNI_EVENT_WED_RRO = 0x57,
++	MCU_UNI_EVENT_PP = 0x5a,
+ 	MCU_UNI_EVENT_PER_STA_INFO = 0x6d,
+ 	MCU_UNI_EVENT_ALL_STA_INFO = 0x6e,
+ 	MCU_UNI_EVENT_SDO = 0x83,
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -448,6 +448,7 @@
+ 	bool counter_reset;
+ 	bool rdd_tx_paused;
+ 	u16 punct_bitmap;
++	u8 pp_mode;
+ };
+ 
+ struct mt7996_dev {
+@@ -800,6 +801,9 @@
+ int mt7996_mcu_set_chan_info(struct mt7996_phy *phy, u16 tag);
+ int mt7996_mcu_set_puncturing(struct mt7996_phy *phy);
+ extern bool mt7996_puncturing_enable;
++int mt7996_mcu_set_pp_mode(struct mt7996_phy *phy, u8 mode, u16 bitmap);
++void mt7996_pp_vendor_register(struct wiphy *wiphy);
++void mt7996_pp_bitmap_event(struct mt7996_phy *phy, u16 bitmap);
+ int mt7996_mcu_set_tx(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 		      struct ieee80211_bss_conf *link_conf);
+ int mt7996_mcu_set_fixed_rate_ctrl(struct mt7996_dev *dev,
+--- a/mt7996/Makefile
++++ b/mt7996/Makefile
+@@ -4,7 +4,7 @@
+ obj-$(CONFIG_MT7996E) += mt7996e.o
+ 
+ mt7996e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+-	     debugfs.o mmio.o
++	     debugfs.o mmio.o pp.o
+ 
+ mt7996e-$(CONFIG_MT7996_NPU) += npu.o
+ mt7996e-$(CONFIG_DEV_COREDUMP) += coredump.o
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -528,8 +528,10 @@
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MU_MIMO_AIR_SNIFFER);
+-	if (mt7996_puncturing_enable)
++	if (mt7996_puncturing_enable) {
+ 		wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_PUNCT);
++		mt7996_pp_vendor_register(wiphy);
++	}
+ 
+ 	if (mt7996_eeprom_has_background_radar(dev) &&
+ 	    (!mdev->dev->of_node ||
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -909,6 +909,31 @@
+ 	}
+ }
+ 
++/* MTK UNI_EVENT_PP0x5a: reject truncation before reading TLV/band/bitmap. */
++static void mt7996_mcu_pp_event(struct mt7996_dev *dev, struct sk_buff *skb)
++{
++	struct {
++		struct mt7996_mcu_rxd rxd;
++		u8 reserved[4];
++		__le16 tag, len;
++		u8 band, omac, changed, reserved2;
++		__le16 bitmap;
++		u8 reserved3[2];
++	} __packed *ev = (void *)skb->data;
++	struct mt76_phy *mphy;
++	u16 tag, len;
++
++	if (!mt7996_puncturing_enable || skb->len < sizeof(*ev))
++		return;
++	tag = le16_to_cpu(ev->tag);len = le16_to_cpu(ev->len);
++	if ((tag != 2 && tag != 3) || len < sizeof(*ev) - offsetof(typeof(*ev), tag) ||
++	    len > skb->len - offsetof(typeof(*ev), tag) || !mt7996_band_valid(dev, ev->band))
++		return;
++	mphy = mt76_dev_phy(&dev->mt76, ev->band);
++	if (mphy)
++		mt7996_pp_bitmap_event(mphy->priv, le16_to_cpu(ev->bitmap));
++}
++
+ static void
+ mt7996_mcu_uni_rx_unsolicited_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+@@ -926,6 +951,9 @@
+ 		break;
+ 	case MCU_UNI_EVENT_ALL_STA_INFO:
+ 		mt7996_mcu_rx_all_sta_info_event(dev, skb);
++		break;
++	case MCU_UNI_EVENT_PP:
++		mt7996_mcu_pp_event(dev, skb);
+ 		break;
+ 	case MCU_UNI_EVENT_WED_RRO:
+ 		mt7996_mcu_wed_rro_event(dev, skb);
+@@ -5775,49 +5803,55 @@
+  * Static AP bitmap only: no unsolicited firmware-auto bitmap changes, no
+  * debug/vendor tree dependency. Preserve the existing channel/DFS validation.
+  */
+-int mt7996_mcu_set_puncturing(struct mt7996_phy *phy)
++int mt7996_mcu_set_pp_mode(struct mt7996_phy *phy, u8 mode, u16 bitmap)
+ {
+ 	struct mt76_phy *mphy = phy->mt76;
+-	struct cfg80211_chan_def *chandef = &mphy->chandef;
+-	u16 bitmap = mphy->offchannel ? 0 : chandef->punctured;
++	struct cfg80211_chan_def test = mphy->chandef;
+ 	struct {
+ 		u8 reserved1[4];
+-		__le16 tag;
+-		__le16 len;
+-		u8 mgmt_mode;
+-		u8 band_idx;
+-		u8 force_bitmap_ctrl;
+-		u8 auto_mode;
++		__le16 tag, len;
++		u8 mgmt_mode, band, force, automatic;
+ 		__le16 bitmap;
+-		u8 csa_enable;
+-		u8 reserved2;
++		u8 csa, reserved2;
+ 	} __packed req = {
+-		.tag = cpu_to_le16(0), /* UNI_CMD_PP_EN_CTRL */
+-		.len = cpu_to_le16(sizeof(req) - 4),
+-		.mgmt_mode = 1,
+-		.band_idx = mphy->band_idx,
+-		.force_bitmap_ctrl = bitmap ? 2 : 0,
+-		.bitmap = cpu_to_le16(bitmap),
++		.len = cpu_to_le16(12), .mgmt_mode = mode != 1,
++		.band = mphy->band_idx, .force = mode == 2 ? 2 : 0,
++		.automatic = mode == 1, .bitmap = cpu_to_le16(bitmap),
+ 	};
+ 	int ret;
++
++	if (!mt7996_puncturing_enable)
++		return mode || bitmap ? -EOPNOTSUPP : 0;
++	if (mode > 2 || !test.chan || test.chan->band == NL80211_BAND_2GHZ ||
++	    (mode != 2 && bitmap))
++		return -EINVAL;
++	test.punctured = bitmap;
++	if (!cfg80211_chandef_valid(&test))
++		return -EINVAL;
++	ret = mt76_mcu_send_msg(&phy->dev->mt76, MCU_WM_UNI_CMD(PP), &req, sizeof(req), true);
++	if (!ret) {
++		WRITE_ONCE(phy->pp_mode, mode);
++		phy->punct_bitmap = bitmap;
++	}
++	return ret;
++}
++
++int mt7996_mcu_set_puncturing(struct mt7996_phy *phy)
++{
++	struct mt76_phy *mphy = phy->mt76;
++	u16 bitmap = mphy->offchannel ? 0 : mphy->chandef.punctured;
++	u8 mode = READ_ONCE(phy->pp_mode);
+ 
+ 	if (!mt7996_puncturing_enable)
+ 		return bitmap ? -EOPNOTSUPP : 0;
+-	if (bitmap && (!cfg80211_chandef_valid(chandef) ||
+-		       chandef->chan->band == NL80211_BAND_2GHZ))
+-		return -EINVAL;
+-	/* Untouched zero-bitmap operation makes no experimental firmware calls.
+-	 * Clear a previously active bitmap during off-channel scans or disable.
++	if (!mphy->chandef.chan || mphy->chandef.chan->band == NL80211_BAND_2GHZ)
++		return bitmap ? -EINVAL : 0;
++	if (mode == 1 && !mphy->offchannel)
++		return mt7996_mcu_set_pp_mode(phy, 1, 0);
++	if (!bitmap && !phy->punct_bitmap && mode != 1)
++		return 0;
++	/* Clear firmware mode on scan; hostapd beacon restoration explicitly
++	 * re-enables auto mode. Resend nonzero static bitmaps after recovery.
+ 	 */
+-	if (!bitmap && !phy->punct_bitmap)
+-		return 0;
+-	/* Positive bitmaps are resent on every channel setup, including recovery:
+-	 * deduplicating only on bitmap would lose state after firmware restart.
+-	 * Wait for acknowledgement; do not report an ignored ABI as configured.
+-	 */
+-	ret = mt76_mcu_send_msg(&phy->dev->mt76, MCU_WM_UNI_CMD(PP),
+-			      &req, sizeof(req), true);
+-	if (!ret)
+-		phy->punct_bitmap = bitmap;
+-	return ret;
+-}
++	return mt7996_mcu_set_pp_mode(phy, bitmap ? 2 : 0, bitmap);
++}
+--- /dev/null
++++ b/mt7996/pp.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/* MTK PP vendor ABI from Allen Ye/Howard Hsu; isolated XR1710G adaptation.
++ * Enabled only with the existing read-only boot opt-in. No other vendor API.
++ */
++#include "mt7996.h"
++#include "mcu.h"
++#include <net/netlink.h>
++
++#define XR_MTK_OUI 0x000ce7
++#define XR_PP_COMMAND 0xcc
++#define XR_PP_EVENT 5
++enum { XR_PP_UNSPEC, XR_PP_MODE, XR_PP_LINK_ID, XR_PP_BITMAP, XR_PP_MAX = XR_PP_BITMAP };
++static const struct nla_policy pp_policy[XR_PP_MAX + 1] = {
++	[XR_PP_MODE] = { .type = NLA_U8 },
++	[XR_PP_LINK_ID] = { .type = NLA_U8 },
++	[XR_PP_BITMAP] = { .type = NLA_U16 },
++};
++
++static int mt7996_pp_control(struct wiphy *wiphy, struct wireless_dev *wdev,
++                           const void *data, int len)
++{
++	struct mt7996_dev *dev = mt7996_hw_dev(wiphy_to_ieee80211_hw(wiphy));
++	struct ieee80211_vif *vif = wdev_to_ieee80211_vif(wdev);
++	struct mt7996_vif *mvif;
++	struct mt7996_vif_link *link;
++	struct nlattr *tb[XR_PP_MAX + 1];
++	u8 id = 0, mode;
++	u16 bitmap = 0;
++	int ret;
++
++	if (!mt7996_puncturing_enable || !vif || vif->type != NL80211_IFTYPE_AP)
++		return -EOPNOTSUPP;
++	ret = nla_parse(tb, XR_PP_MAX, data, len, pp_policy, NULL);
++	if (ret || !tb[XR_PP_MODE])
++		return ret ?: -EINVAL;
++	mode = nla_get_u8(tb[XR_PP_MODE]);
++	if (mode > 2)
++		return -EINVAL;
++	if (tb[XR_PP_LINK_ID]) {
++		id = nla_get_u8(tb[XR_PP_LINK_ID]);
++		if (id >= IEEE80211_MLD_MAX_NUM_LINKS ||
++		    (!ieee80211_vif_is_mld(vif) && id))
++			return -EINVAL;
++	}
++	if (tb[XR_PP_BITMAP])
++		bitmap = nla_get_u16(tb[XR_PP_BITMAP]);
++	if (mode != 2 && bitmap)
++		return -EINVAL;
++	mvif = (void *)vif->drv_priv;
++	mutex_lock(&dev->mt76.mutex);
++	link = (void *)rcu_dereference_protected(mvif->mt76.link[id],
++					      lockdep_is_held(&dev->mt76.mutex));
++	ret = link && mt7996_vif_link_phy(link) ? mt7996_mcu_set_pp_mode(mt7996_vif_link_phy(link), mode, bitmap) : -EINVAL;
++	mutex_unlock(&dev->mt76.mutex);
++	return ret;
++}
++
++static const struct wiphy_vendor_command pp_commands[] = {{
++	.info = { .vendor_id = XR_MTK_OUI, .subcmd = XR_PP_COMMAND },
++	.flags = WIPHY_VENDOR_CMD_NEED_WDEV | WIPHY_VENDOR_CMD_NEED_NETDEV | WIPHY_VENDOR_CMD_NEED_RUNNING,
++	.doit = mt7996_pp_control,
++	.policy = pp_policy,
++	.maxattr = XR_PP_MAX,
++}};
++static const struct nl80211_vendor_cmd_info pp_events[] = {{
++	.vendor_id = XR_MTK_OUI, .subcmd = XR_PP_EVENT,
++}};
++void mt7996_pp_vendor_register(struct wiphy *wiphy)
++{
++	wiphy->vendor_commands = pp_commands;
++	wiphy->n_vendor_commands = ARRAY_SIZE(pp_commands);
++	wiphy->vendor_events = pp_events;
++	wiphy->n_vendor_events = ARRAY_SIZE(pp_events);
++}
++
++void mt7996_pp_bitmap_event(struct mt7996_phy *phy, u16 bitmap)
++{
++	struct cfg80211_chan_def chandef = phy->mt76->chandef;
++	struct sk_buff *skb;
++	struct nlattr *nested;
++
++	if (!mt7996_puncturing_enable || READ_ONCE(phy->pp_mode) != 1 ||
++	    phy->mt76->offchannel || !chandef.chan)
++		return;
++	chandef.punctured = bitmap;
++	if (!cfg80211_chandef_valid(&chandef) ||
++	    chandef.chan->band == NL80211_BAND_2GHZ)
++		return;
++	/* Event index is zero in our one-entry array; subcommand remains MTK5.
++	 * Preserve the SDK's nested frequency+bitmap vendor payload format.
++	 */
++	skb = cfg80211_vendor_event_alloc(phy->mt76->hw->wiphy, NULL, 64, 0, GFP_ATOMIC);
++	if (!skb)
++		return;
++	if (nla_put_u32(skb, NL80211_ATTR_WIPHY_FREQ, chandef.chan->center_freq))
++		goto fail;
++	nested = nla_nest_start(skb, NL80211_ATTR_VENDOR_DATA);
++	if (!nested || nla_put_u16(skb, XR_PP_BITMAP, bitmap))
++		goto fail;
++	nla_nest_end(skb, nested);
++	cfg80211_vendor_event(skb, GFP_ATOMIC);
++	return;
++fail:
++	dev_kfree_skb(skb);
++}

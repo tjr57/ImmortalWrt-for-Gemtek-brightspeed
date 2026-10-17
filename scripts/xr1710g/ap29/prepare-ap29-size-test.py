@@ -1,0 +1,10 @@
+from pathlib import Path
+w=Path('D:/ChatGPT/XR1710G')
+s=(w/'environment/run-ap29-rx-origin1.py').read_text().replace('software-rx-origin1','software-rx-origin2')
+s=s.replace("prefix='LD_PRELOAD=", "row['payloadBytes']=56 if index%2==0 else 1400\n        prefix='LD_PRELOAD=")
+s=s.replace("-c 5 -W 1 '\n", "-c 5 -W 1 -s '+str(row['payloadBytes'])+' '\n")
+p=w/'environment/run-ap29-rx-origin2.py';assert not p.exists();p.write_text(s);compile(s,str(p),'exec')
+s=(w/'environment/analyze-ap29-rx-origin1.py').read_text().replace('software-rx-origin1','software-rx-origin2')
+s=s.replace("'round':row['index'],'probe'", "'round':row['index'],'payloadBytes':row['payloadBytes'],'probe'")
+p=w/'environment/analyze-ap29-rx-origin2.py';assert not p.exists();p.write_text(s);compile(s,str(p),'exec')
+print('Prepared fresh bounded alternating56/1400-byte probe test')

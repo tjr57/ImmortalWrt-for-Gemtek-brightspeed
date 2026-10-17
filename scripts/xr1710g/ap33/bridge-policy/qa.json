@@ -1,0 +1,24 @@
+{
+  "passed": true,
+  "candidateSHA256": "0ad351b9f6642bb379985f796b0fa9f8f1ecd86b0885fa0ed9152ca2edaebdaf",
+  "logs": {
+    "context-native": "66758 checks; prior context negatives reproduced; new FDB/STP/policy/tag/chain guards passed",
+    "context-ARM": "66758 checks; prior context negatives reproduced; new FDB/STP/policy/tag/chain guards passed",
+    "packet-native": "78682 checks; 4 canonical programs accepted; packet-stack equivalence and context negatives passed",
+    "packet-ARM": "78682 checks; 4 canonical programs accepted; packet-stack equivalence and context negatives passed"
+  },
+  "nativeASanUBSanAndARM": true,
+  "kernelAPIsModeled": true,
+  "AP32BlockedVLANAcceptedNegativeControl": true,
+  "generationFunctionsUnchanged": {
+    "static bool airoha_ppe_l2_actions(": "be1d604227cacdcb46897be65702b620b0ca5f9525a5c259ff5d53e7642bc2dc",
+    "static bool airoha_ppe_l2_ready_locked(": "d729f689815801851012d157b29daf1bcf62d401d475511f1c7d98ae904da8a5",
+    "static bool airoha_ppe_l2_snapshot(": "8c654a436a5e3e7750f5e29146091dc3e738139a4c52796fbeff4f6be9f6c04e",
+    "static void airoha_ppe_l2_revoke_locked(": "6d23cf0db02b9c7ae44de93f7fd3b1e184ec6359d8344dc41e76fbe5b3abdcbe",
+    "static int airoha_ppe_l2_bridge_event(": "fd96eeed537dc9ca159da57b5c520fdbf7c9a6359feedfdc07acd3b32d4b25f0",
+    "static int\nairoha_ppe_foe_l2_flow_commit_entry(": "ee2cb25830baa43cb40f68a698a1fbd65e69391d31aa84443cb26588d5b43f52"
+  },
+  "generationEvidence": "development/ap32/packet-fence/qa.json",
+  "preUnregisterL2LatchOrderingChecked": true,
+  "fullPolicyOrHardwareQualified": false
+}

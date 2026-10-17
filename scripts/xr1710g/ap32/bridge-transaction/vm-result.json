@@ -1,0 +1,414 @@
+{
+  "passed": true,
+  "exitCode": 0,
+  "log": "development/ap32/bridge-transaction/vm-20261011-012557.log",
+  "kernelSHA256": "05f6a4cd9af0507c9cd4babb4cea83700196d89cf157561cf093a8d61c54d0cd",
+  "moduleSHA256": "905df83d9c5231d42b5cbe270204023d13eb9fabcc1c168769c29a81a94f024b",
+  "checks": {
+    "1_fdb": true,
+    "2_fdb": true,
+    "3_fdb": true,
+    "4_fdb": true,
+    "5_fdb": true,
+    "6_fdb": true,
+    "7_fdb": true,
+    "9_fdb": true,
+    "16_fdb": true,
+    "17_fdb": true,
+    "18_fdb": true,
+    "19_fdb": true,
+    "10_stp": true,
+    "11_stp": true,
+    "13_stp": true,
+    "14_stp": true,
+    "ordinary_same_port_refresh_no_fence": true,
+    "missing_delete_no_fence": true,
+    "coherent_counts": true,
+    "unregister_balanced": true,
+    "active_writer_registration_and_nested_selftest": true,
+    "nested_create": true
+  },
+  "eventCount": 47,
+  "events": [
+    {
+      "phase": 0,
+      "event": 0,
+      "writers": 0,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 1,
+      "event": 1,
+      "writers": 1,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 1,
+      "event": 1,
+      "writers": 2,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 1,
+      "event": 2,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 1,
+      "event": 2,
+      "writers": 0,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 2,
+      "event": 1,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 2,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 3,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 3,
+      "event": 2,
+      "writers": 0,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 4,
+      "event": 1,
+      "writers": 1,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 4,
+      "event": 2,
+      "writers": 0,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 5,
+      "event": 1,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 5,
+      "event": 2,
+      "writers": 0,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 6,
+      "event": 1,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 6,
+      "event": 2,
+      "writers": 0,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 7,
+      "event": 1,
+      "writers": 1,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 7,
+      "event": 2,
+      "writers": 0,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 9,
+      "event": 1,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 9,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 10,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 10,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 0,
+      "bad": 0
+    },
+    {
+      "phase": 11,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 0,
+      "bad": 0
+    },
+    {
+      "phase": 11,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 4,
+      "bad": 0
+    },
+    {
+      "phase": 11,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 4,
+      "bad": 0
+    },
+    {
+      "phase": 11,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 13,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 13,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 0,
+      "bad": 0
+    },
+    {
+      "phase": 14,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 0,
+      "bad": 0
+    },
+    {
+      "phase": 14,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 4,
+      "bad": 0
+    },
+    {
+      "phase": 14,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 4,
+      "bad": 0
+    },
+    {
+      "phase": 14,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 1,
+      "bad": 0
+    },
+    {
+      "phase": 15,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 1,
+      "bad": 0
+    },
+    {
+      "phase": 15,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 0,
+      "bad": 0
+    },
+    {
+      "phase": 15,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 0,
+      "bad": 0
+    },
+    {
+      "phase": 15,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 4,
+      "bad": 0
+    },
+    {
+      "phase": 15,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 4,
+      "bad": 0
+    },
+    {
+      "phase": 15,
+      "event": 2,
+      "writers": 0,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 16,
+      "event": 1,
+      "writers": 1,
+      "fdb": 2,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 16,
+      "event": 2,
+      "writers": 0,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 17,
+      "event": 1,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 17,
+      "event": 2,
+      "writers": 0,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 18,
+      "event": 1,
+      "writers": 1,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 18,
+      "event": 1,
+      "writers": 2,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 18,
+      "event": 2,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 18,
+      "event": 2,
+      "writers": 0,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 19,
+      "event": 1,
+      "writers": 1,
+      "fdb": 1,
+      "stp": 3,
+      "bad": 0
+    },
+    {
+      "phase": 19,
+      "event": 2,
+      "writers": 0,
+      "fdb": 0,
+      "stp": 3,
+      "bad": 0
+    }
+  ],
+  "faults": [],
+  "noExternalNICOrExistingDisk": true,
+  "APOrHostNetworkChanged": false,
+  "PPEHardwareOrFullPolicyQualified": false
+}

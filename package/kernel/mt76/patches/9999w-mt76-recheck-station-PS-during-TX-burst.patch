@@ -1,0 +1,15 @@
+--- a/tx.c
++++ b/tx.c
+@@ -533,6 +533,12 @@
+ 
+ 	do {
+ 		if (test_bit(MT76_RESET, &phy->state) || phy->offchannel)
++			break;
++
++		/* A PS notification can arrive after this burst started. Leave
++		 * the remaining frames queued so the normal PS/AQL gate applies.
++		 */
++		if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+ 			break;
+ 
+ 		if (stop || mt76_txq_stopped(q))

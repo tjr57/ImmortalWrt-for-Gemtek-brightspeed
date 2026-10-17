@@ -131,14 +131,8 @@
 		partition@0 {
 			label = "vendor";
 			reg = <0x00000000 0x00600000>;
-			/*
-			 * Intentionally NOT marked read-only so the factory
-			 * provisioning data at offset 0x400000 (MAC addresses,
-			 * serial number, Wi-Fi defaults, admin credentials, ...)
-			 * can be rewritten from the luan-app-airoha-factory LuCI
-			 * page.  Re-add "read-only;" here if the partition should
-			 * be locked down again.
-			 */
+			/* Preserve original boot and provisioning data in AP builds. */
+			read-only;
 		};
 		partition@600000 {
 			label = "chainloader";
@@ -198,7 +192,6 @@
 	};
 };
 &i2c0 {
-	compatible = "airoha,airoha-i2c";
 	clock-frequency = <400000>;
 	status = "okay";
 	hwmon@2e {

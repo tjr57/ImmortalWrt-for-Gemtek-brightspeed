@@ -1,0 +1,115 @@
+{
+  "at": "2026-10-11T02:01:33.741171+08:00",
+  "sourceVersion": "20261011-ap33-d331711d",
+  "sourceEvidence": {
+    "net/core/dev.c": {
+      "sha256": "21ceb6b1e579b79ca70f691ed66e62efbd3ddeb8ccb40a11f54f95f0e5e08ad6",
+      "locations": {
+        "NETDEV_PRECHANGEUPPER": [
+          8816,
+          8918
+        ],
+        "NETDEV_PRECHANGEMTU": [
+          9825
+        ],
+        "NETDEV_PRE_CHANGEADDR": [
+          9895,
+          9912
+        ],
+        "NETDEV_GOING_DOWN": [
+          1748,
+          1916
+        ]
+      }
+    },
+    "net/core/rtnetlink.c": {
+      "sha256": "2f5c4d3595f8cd1ceacb84fbc780a925fc835ebe28941409afd7b35d581c4457",
+      "locations": {
+        "CAP_NET_ADMIN": [
+          2411,
+          2414,
+          2426,
+          3481,
+          3934,
+          4088,
+          4108,
+          6930,
+          7038
+        ],
+        "rtnetlink_rcv_msg": [
+          6904,
+          7030
+        ]
+      }
+    },
+    "net/sched/cls_api.c": {
+      "sha256": "3765e7260379b94772aee36de46aba7099ae0694852b6bc507c25c531ae1ef9d",
+      "locations": {
+        "RTNL_FLAG_DOIT_UNLOCKED": [
+          4129,
+          4131,
+          4133
+        ],
+        "lockeddevcnt": [
+          1657,
+          1675,
+          1698,
+          3648,
+          3659,
+          3684,
+          3695,
+          3736,
+          3747,
+          3788,
+          3799
+        ]
+      }
+    },
+    "net/sched/act_api.c": {
+      "sha256": "d89730ff6e017c2d13a801c2b131dd2b66c915f08f640cc04ab0436de70da5a3"
+    },
+    "net/sched/sch_api.c": {
+      "sha256": "ff2af940ca3e9f13769e7d7924b34779a2a90ecc07aaffdd47c6c73e673adcd4"
+    },
+    "net/bridge/br_fdb.c": {
+      "sha256": "f383f9fc5fe1ca2825990776ee14b12d0228880afa52ccc46bf2266a9fdb0f4a"
+    },
+    "net/bridge/br_input.c": {
+      "sha256": "30afbfc20e737e78bf64d4f7cb7beaca7fad1f28edbc61edba634632728dd94c"
+    },
+    "drivers/net/ethernet/airoha/airoha_ppe.c": {
+      "sha256": "0ad351b9f6642bb379985f796b0fa9f8f1ecd86b0885fa0ed9152ca2edaebdaf"
+    }
+  },
+  "AP33Solved": [
+    "VLAN and port flags mutation/rollback scope",
+    "per-VLAN state eligibility",
+    "bridge membership/MST enable scope",
+    "L2 revocation before observer unregister"
+  ],
+  "remainingFindings": [
+    {
+      "area": "netdevice mutation",
+      "finding": "PPE currently revokes on post-change notifications. Core provides pre-change events, but failed changes may omit matching post events; a simple begin-on-pre/end-on-post counter can leak or permit republishing during rollback.",
+      "nextImplementation": "Review whole mutation scopes or a policy owner design; test MTU/address/upper-link success, rejection, rollback, and device close. Do not replace with polling."
+    },
+    {
+      "area": "TC policy",
+      "finding": "Generic filters can mutate without RTNL. lockeddevcnt serializes driver callbacks, but skip_hw policy need not call the offload driver at all. Exact own-rule parser/readback is insufficient to prove the entire ingress/egress policy.",
+      "nextImplementation": "Kernel-observed TC policy lifetime/ownership must cover qdisc/filter/chain/actions and preexisting policy before an executor may publish. A dedicated non-TC publisher is a design option, not implemented or approved as a final design."
+    },
+    {
+      "area": "FDB expiry scope",
+      "finding": "The ordinary unicast bridge path calls br_fdb_find_rcu and forwards an existing nonlocal entry until actual deletion; has_expired is an extra conservative check in PPE qualification. AP32 fences actual FDB deletion. An ageing-time assignment alone is not proof of a software/hardware forwarding mismatch.",
+      "nextImplementation": "Keep actual delete/move fence; review aging/refresh performance and hardware lease separately. Do not label an unproven cache-age root cause."
+    }
+  ],
+  "unchangedConstraints": [
+    "No automatic publisher or hardware-binding acceptance",
+    "br_netfilter policy latch stays active",
+    "Mesh header path remains unqualified",
+    "NPU/PPE default off"
+  ],
+  "hardwareFaultReproduced": false,
+  "productionOrDeviceChanged": false
+}

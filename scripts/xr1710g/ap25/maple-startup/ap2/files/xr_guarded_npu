@@ -1,0 +1,6 @@
+#!/bin/sh /etc/rc.common
+# Same padded priority: xr_diag_recovery sorts before xr_guarded_npu.
+START=08
+STOP=01
+boot() { /usr/libexec/xr-npu-guarded-once boot; }
+start() { return 0; }

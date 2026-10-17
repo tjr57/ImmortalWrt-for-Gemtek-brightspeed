@@ -1,0 +1,112 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Explicit, reversible IRQ/RPS experiment. No automatic boot tuning.
+set -eu
+task_root=${XR_AP_PERF_ROOT:-}
+case "$task_root" in ''|/*) ;; *) exit 2 ;; esac
+case "$task_root" in *'/../'*|*/..|/) exit 2 ;; esac
+state_dir="$task_root/var/run/xr1710g-ap-perf"
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+valid_path() {
+	printf '%s\n' "$1" | grep -Eq '^(/proc/irq/[0-9]+/smp_affinity_list|/sys/class/net/(lan[234]|wan|mesh6g|phy[0-9]+\.[0-9]+-ap[0-9]+|ap-mld[0-9]+)/queues/rx-[0-9]+/rps_cpus)$'
+}
+value_ok() { printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F,-]+$'; }
+value_equal() {
+	local a=$2 b=$3
+	case "$1" in */rps_cpus)
+		a=$(printf '%s' "$a" | tr -d ',' | tr 'A-F' 'a-f' | sed 's/^0*//')
+		b=$(printf '%s' "$b" | tr -d ',' | tr 'A-F' 'a-f' | sed 's/^0*//')
+		a=${a:-0}; b=${b:-0} ;;
+	esac
+	[ "$a" = "$b" ]
+}
+
+require_board() {
+	[ "$(cat "$task_root/tmp/sysinfo/board_name" 2>/dev/null)" = 'gemtek,xr1710g' ] || fail 'Unsupported board.'
+}
+plan() {
+	local online cpus='' chunk first last cpu mask=0 count=0 index=0 irq labels leaf item
+	online=$(cat "$task_root/sys/devices/system/cpu/online")
+	printf '%s' "$online" | grep -Eq '^[0-7](-[0-7])?(,[0-7](-[0-7])?)*$' || fail 'Unsupported CPU topology.'
+	for chunk in $(printf '%s' "$online" | tr ',' ' '); do
+		first=${chunk%-*}; last=${chunk#*-}
+		[ "$first" -le "$last" ] || fail 'Invalid CPU range.'
+		cpu=$first
+		while [ "$cpu" -le "$last" ]; do
+			cpus="$cpus $cpu"; mask=$((mask | (1 << cpu))); count=$((count + 1)); cpu=$((cpu + 1))
+		done
+	done
+	for irq in "$task_root"/proc/irq/[0-9]*; do
+		[ -d "$irq" ] || continue
+		labels=$(awk -v id="${irq##*/}:" '$1 == id {print}' "$task_root/proc/interrupts")
+		# Exact driver names observed on AN7581/MT7996; exclude other devices.
+		printf '%s' "$labels" | grep -Eiq '(^|[ ,])(mt7996e|mt7996|airoha-eth|airoha_eth|airoha-npu|airoha_npu|pdma)([ ,_-]|$)' || continue
+		leaf="/proc/irq/${irq##*/}/smp_affinity_list"
+		[ -f "$task_root$leaf" ] && [ ! -L "$task_root$leaf" ] || continue
+		item=$((index % count + 1)); cpu=$(printf '%s\n' "$cpus" | awk -v n="$item" '{print $n}')
+		printf '%s	%s\n' "$leaf" "$cpu"; index=$((index + 1))
+	done
+	for leaf in "$task_root"/sys/class/net/*/queues/rx-*/rps_cpus; do
+		[ -f "$leaf" ] && [ ! -L "$leaf" ] || continue
+		leaf=${leaf#"$task_root"}; valid_path "$leaf" || continue
+		printf '%s	%x\n' "$leaf" "$mask"
+	done
+}
+restore_file() {
+	local file=$1 strict=$2 path before after current conflict=0 tab
+	tab=$(printf '	')
+	while IFS="$tab" read -r path before after; do
+		valid_path "$path" && value_ok "$before" && value_ok "$after" || return 1
+		[ -f "$task_root$path" ] && [ ! -L "$task_root$path" ] || { conflict=1; continue; }
+		current=$(cat "$task_root$path")
+		if value_equal "$path" "$current" "$after"; then printf '%s\n' "$before" > "$task_root$path" || conflict=1
+		elif ! value_equal "$path" "$current" "$before"; then
+			printf 'Changed externally; retained: %s\n' "$path" >&2; conflict=1
+		fi
+	done < "$file"
+	[ "$conflict" = 0 ] || [ "$strict" = 0 ]
+}
+mutate() {
+	local action=$1 tab path after before
+	[ -n "$task_root" ] || [ "$(id -u)" = 0 ] || fail 'Root required.'
+	[ ! -L "$state_dir" ] || fail 'State directory is a symlink.'
+	umask 077; mkdir -p "$state_dir"
+	mkdir "$state_dir/lock" 2>/dev/null || fail 'Another tuning operation is running.'
+	pending=''
+	cleanup() {
+		if [ -n "$pending" ] && [ -f "$pending" ]; then
+			if restore_file "$pending" 1; then rm -f "$pending"
+			else mv "$pending" "$state_dir/state"; printf '%s\n' 'Rollback conflict; recovery state retained.' >&2; fi
+		fi
+		rmdir "$state_dir/lock" 2>/dev/null || :
+	}
+	trap cleanup EXIT
+	trap 'exit 1' HUP INT TERM
+	[ ! -L "$state_dir/state" ] || fail 'State file is a symlink.'
+	if [ "$action" = restore ]; then
+		[ -f "$state_dir/state" ] || return 0
+		restore_file "$state_dir/state" 1 || fail 'Restore conflict; saved state retained for review.'
+		rm -f "$state_dir/state"; return 0
+	fi
+	[ ! -e "$state_dir/state" ] || fail 'Restore the previous experiment before applying again.'
+	pending=$(mktemp "$state_dir/.pending-XXXXXX")
+	# Save a complete read-only plan first; no process-substitution failures.
+	if ! plan > "$state_dir/plan"; then rm -f "$pending"; fail 'Cannot produce tuning plan.'; fi
+	tab=$(printf '	')
+	while IFS="$tab" read -r path after; do
+		valid_path "$path" && value_ok "$after" || { fail 'Invalid planned path/value.'; }
+		before=$(cat "$task_root$path")
+		value_ok "$before" || { fail 'Invalid current value.'; }
+		printf '%s	%s	%s\n' "$path" "$before" "$after" >> "$pending"
+		if ! printf '%s\n' "$after" > "$task_root$path" || ! value_equal "$path" "$(cat "$task_root$path")" "$after"; then
+			fail 'Tuning rejected; previous writes restored.'
+		fi
+	done < "$state_dir/plan"
+	mv "$pending" "$state_dir/state"; pending=''
+}
+require_board
+case "${1:-}" in
+	plan) plan ;;
+	apply|restore) mutate "$1" ;;
+	*) printf '%s\n' 'Usage: xr1710g-ap-perf plan|apply|restore' >&2; exit 2 ;;
+esac

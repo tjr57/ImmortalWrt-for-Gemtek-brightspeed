@@ -1,0 +1,22 @@
+--- a/npu.c
++++ b/npu.c
+@@ -37,7 +37,7 @@
+  * then delivers REPEAT/OLDPKT through the CPU queue with PPE reason/FOE zero.
+  * This is not the generic SID/fragment layout and not 802.11 Retry.
+  */
+-static bool npu_rro_drop;
++static bool npu_rro_drop = true;
+ module_param_named(npu_rro_drop, npu_rro_drop, bool, 0600);
+ MODULE_PARM_DESC(npu_rro_drop, "MT7996 NPU explicit RRO duplicate/old exception discard");
+ static bool npu_rro_audit;
+@@ -82,8 +82,8 @@
+       atomic_inc_return(&npu_rro_logs) <= 512)
+    dev_info(dev->dev, "NPU RRO q=%u data=%08x info=%08x rxd0=%08x rxd1=%08x g4fc=%08x g4sq=%08x discard=%u\n",
+     qid, data, info, rxd0, get_unaligned_le32(skb->data+4),
+-    (skb_headlen(skb) >= 44 && (get_unaligned_le32(skb->data+4) & BIT(19))) ? get_unaligned_le32(skb->data+32) : 0,
+-    (skb_headlen(skb) >= 44 && (get_unaligned_le32(skb->data+4) & BIT(19))) ? get_unaligned_le32(skb->data+40) : 0, drop);
++    (FIELD_GET(GENMASK(31, 27), rxd0) == 2 && skb_headlen(skb) >= 44 && (get_unaligned_le32(skb->data+4) & BIT(19))) ? get_unaligned_le32(skb->data+32) : 0,
++    (FIELD_GET(GENMASK(31, 27), rxd0) == 2 && skb_headlen(skb) >= 44 && (get_unaligned_le32(skb->data+4) & BIT(19))) ? get_unaligned_le32(skb->data+40) : 0, drop);
+  }
+  return drop;
+ }

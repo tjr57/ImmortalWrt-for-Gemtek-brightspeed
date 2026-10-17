@@ -17,6 +17,13 @@ case "$board" in
 gemtek,xr1710g|\
 gemtek,xr1710g-ubi|\
 gemtek,w1700k-ubi)
+	# The AP image uses the operator's AU region and no shared key.
+	# Other images retain their defaults.
+	if [ -e /etc/xr1710g-ap-profile ]; then
+		ucidef_set_country 'AU'
+		board_config_flush
+		exit 0
+	fi
 	ucidef_set_country 'US'
 	ucidef_set_wireless 2g 'ImmortalWrt-2G' 'psk2' '12345678'
 	ucidef_set_wireless 5g 'ImmortalWrt-5G' 'sae-mixed' '12345678'

@@ -1,0 +1,221 @@
+Subject: [PATCH] XR: fence VLAN and bridge-port policy changes before PPE binding
+
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -778,6 +778,7 @@
+ 	struct net_bridge_vlan *vlan;
+ 	int ret;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	ASSERT_RTNL();
+ 
+ 	*changed = false;
+@@ -821,6 +822,7 @@
+ 	struct net_bridge_vlan_group *vg;
+ 	struct net_bridge_vlan *v;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	ASSERT_RTNL();
+ 
+ 	vg = br_vlan_group(br);
+@@ -840,6 +842,7 @@
+ {
+ 	struct net_bridge_vlan_group *vg;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	ASSERT_RTNL();
+ 
+ 	vg = br_vlan_group(br);
+@@ -900,6 +903,7 @@
+ 	if (br_opt_get(br, BROPT_VLAN_ENABLED) == !!val)
+ 		return 0;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	br_opt_toggle(br, BROPT_VLAN_ENABLED, !!val);
+ 
+ 	err = switchdev_port_attr_set(br->dev, &attr, extack);
+@@ -955,6 +959,7 @@
+ 	if (br->vlan_proto == proto)
+ 		return 0;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	err = switchdev_port_attr_set(br->dev, &attr, extack);
+ 	if (err && err != -EOPNOTSUPP)
+ 		return err;
+@@ -1105,6 +1110,7 @@
+ 	u16 old_pvid;
+ 	int err = 0;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	if (!pvid) {
+ 		br_vlan_disable_default_pvid(br);
+ 		return 0;
+@@ -1313,6 +1319,7 @@
+ 	struct net_bridge_vlan *vlan;
+ 	int ret;
+ 
++	guard(br_fwd_change)(port->br->dev);
+ 	ASSERT_RTNL();
+ 
+ 	*changed = false;
+@@ -1356,6 +1363,7 @@
+ {
+ 	struct net_bridge_vlan *v;
+ 
++	guard(br_fwd_change)(port->br->dev);
+ 	ASSERT_RTNL();
+ 
+ 	v = br_vlan_find(nbp_vlan_group(port), vid);
+@@ -1371,6 +1379,7 @@
+ {
+ 	struct net_bridge_vlan_group *vg;
+ 
++	guard(br_fwd_change)(port->br->dev);
+ 	ASSERT_RTNL();
+ 
+ 	vg = nbp_vlan_group(port);
+@@ -1553,6 +1562,30 @@
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(br_vlan_get_info_rcu);
++
++/* Membership alone is insufficient: a VLAN can be blocked while its
++ * port remains forwarding (including without MST). Caller holds RCU.
++ */
++bool br_vlan_forwarding_rcu(const struct net_device *dev, u16 vid)
++{
++	struct net_bridge_vlan_group *vg;
++	struct net_bridge_vlan *v;
++	struct net_bridge_port *p;
++
++	p = br_port_get_check_rcu(dev);
++	if (p)
++		vg = nbp_vlan_group_rcu(p);
++	else if (netif_is_bridge_master(dev))
++		vg = br_vlan_group_rcu(netdev_priv(dev));
++	else
++		return false;
++
++	v = br_vlan_find(vg, vid);
++	return v && br_vlan_should_use(v) &&
++	       READ_ONCE(v->state) == BR_STATE_FORWARDING;
++}
++EXPORT_SYMBOL_GPL(br_vlan_forwarding_rcu);
++
+ 
+ static int br_vlan_is_bind_vlan_dev(const struct net_device *dev)
+ {
+--- a/net/bridge/br_vlan_options.c
++++ b/net/bridge/br_vlan_options.c
+@@ -119,6 +119,7 @@
+ 	if (v->state == state)
+ 		return 0;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	if (v->vid == br_get_pvid(vg))
+ 		br_vlan_set_pvid_state(vg, state);
+ 
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -950,6 +950,7 @@
+ 	bool br_vlan_tunnel_old;
+ 	int err;
+ 
++	guard(br_fwd_change)(p->br->dev);
+ 	old_flags = p->flags;
+ 	br_vlan_tunnel_old = (old_flags & BR_VLAN_TUNNEL) ? true : false;
+ 
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@ -69,6 +69,7 @@
+ 		flags &= ~mask;
+ 
+ 	if (flags != p->flags) {
++		guard(br_fwd_change)(p->br->dev);
+ 		err = br_switchdev_set_port_flag(p, flags, mask, &extack);
+ 		if (err) {
+ 			netdev_err(p->dev, "%s\n", extack._msg);
+--- a/net/bridge/br_mst.c
++++ b/net/bridge/br_mst.c
+@@ -230,6 +230,7 @@
+ 	if (br_opt_get(br, BROPT_MST_ENABLED) == on)
+ 		return 0;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	err = switchdev_port_attr_set(br->dev, &attr, extack);
+ 	if (err && err != -EOPNOTSUPP)
+ 		return err;
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -335,6 +335,7 @@
+ 	struct net_bridge *br = p->br;
+ 	struct net_device *dev = p->dev;
+ 
++	guard(br_fwd_change)(br->dev);
+ 	sysfs_remove_link(br->ifobj, p->dev->name);
+ 
+ 	nbp_delete_promisc(p);
+@@ -600,6 +601,7 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	guard(br_fwd_change)(br->dev);
+ 	p = new_nbp(br, dev);
+ 	if (IS_ERR(p))
+ 		return PTR_ERR(p);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1519,7 +1519,8 @@
+ 		    br_vlan_get_pvid_rcu(skb->dev, &vid)))
+ 			goto out;
+ 		if (!vid || br_vlan_get_proto(master, &proto) || proto != ETH_P_8021Q ||
+-		    br_vlan_get_info_rcu(skb->dev, vid, &vinfo))
++		    br_vlan_get_info_rcu(skb->dev, vid, &vinfo) ||
++		    !br_vlan_forwarding_rcu(skb->dev, vid))
+ 			goto out;
+ 	} else if (vid) {
+ 		/* Tagged packets on a nonfiltering bridge have no isolated VID. */
+@@ -2073,7 +2074,9 @@
+   }
+   if (!vid || vid >= VLAN_VID_MASK ||
+       br_vlan_get_info_rcu(indev, vid, &info) ||
+-      br_vlan_get_info_rcu(odev, vid, &info))
++      br_vlan_get_info_rcu(odev, vid, &info) ||
++      !br_vlan_forwarding_rcu(indev, vid) ||
++      !br_vlan_forwarding_rcu(odev, vid))
+    goto out;
+   untagged = !!(info.flags & BRIDGE_VLAN_INFO_UNTAGGED);
+  } else if (tagged) {
+@@ -2814,6 +2817,10 @@
+ {
+ 	struct airoha_npu *npu;
+ 
++	/* Quiesce L2 binding before detaching its policy notifiers. A racing
++	 * packet or TC callback must not republish during observer teardown.
++	 */
++	airoha_ppe_l2_policy_event(&eth->ppe->l2_policy_nb, 0, NULL);
+ 	br_fwd_policy_unregister(&eth->ppe->l2_bridge_nb);
+ 	nf_bridge_policy_notifier_unregister(&eth->ppe->l2_policy_nb);
+ 	unregister_switchdev_notifier(&eth->ppe->l2_switchdev_atomic_nb);
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -120,6 +120,7 @@
+ 		     struct bridge_vlan_info *p_vinfo);
+ int br_vlan_get_info_rcu(const struct net_device *dev, u16 vid,
+ 			 struct bridge_vlan_info *p_vinfo);
++bool br_vlan_forwarding_rcu(const struct net_device *dev, u16 vid);
+ bool br_mst_enabled(const struct net_device *dev);
+ int br_mst_get_info(const struct net_device *dev, u16 msti, unsigned long *vids);
+ int br_mst_get_state(const struct net_device *dev, u16 msti, u8 *state);
+@@ -154,6 +155,11 @@
+ 				       struct bridge_vlan_info *p_vinfo)
+ {
+ 	return -EINVAL;
++}
++
++static inline bool br_vlan_forwarding_rcu(const struct net_device *dev, u16 vid)
++{
++	return false;
+ }
+ 
+ static inline bool br_mst_enabled(const struct net_device *dev)

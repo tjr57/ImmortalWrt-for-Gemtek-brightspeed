@@ -1,0 +1,142 @@
+Subject: [PATCH] mt76: opt-in complete TXFREE fragment-chain preflight
+
+Candidate ABI1/2/3 and LAST; do not claim historical NPU rootcause proven.
+Default off; no skb length extension, packet concatenation by RXD alone,
+or token count rewriting. All descriptor pages remain owned while incomplete.
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -285,6 +285,8 @@
+ 	bool npu_irq_registered;
+ 	bool npu_napi_registered;
+ 	struct mt76_npu_rx_anomaly npu_rx_anomaly;
++	u64 npu_chain_preflights, npu_chain_pending, npu_chain_invalid;
++	u32 npu_chain_announced, npu_chain_first_cur, npu_chain_encoded, npu_chain_frames;
+ 	bool npu_napi_enabled;
+ };
+ 
+--- a/npu.c
++++ b/npu.c
+@@ -20,6 +20,13 @@
+ static bool npu_enable = MT76_NPU_ENABLE_DEFAULT;
+ module_param_named(npu_enable, npu_enable, bool, 0400);
+ MODULE_PARM_DESC(npu_enable, "Attach WLAN NPU at probe (read-only, boot policy)");
++
++/* A candidate transport ABI: qualifies LAST/fragment chains only for
++ * TXFREE notifications. Ordinary RX and the production boot stay unchanged.
++ */
++static bool npu_txfree_chain_verify;
++module_param_named(npu_txfree_chain_verify, npu_txfree_chain_verify, bool, 0400);
++MODULE_PARM_DESC(npu_txfree_chain_verify, "Opt-in TXFREE fragment-boundary preflight; default off");
+ 
+ static bool npu_rx_audit;
+ module_param_named(npu_rx_audit, npu_rx_audit, bool, 0400);
+@@ -204,6 +211,74 @@
+  spin_unlock_bh(&q->lock);
+ }
+ 
++/* A zero PKT_COUNT must not turn a marked first fragment into a complete
++ * notification. Verify before transferring any page or releasing any token.
++ * This is opt-in because the shipped NPU fragment ABI is not yet qualified.
++ * Type0 is a complete fragment;1/2/3 are candidate first/middle/last roles.
++ */
++static int mt76_npu_txfree_chain(struct mt76_dev *dev, struct mt76_queue *q,
++                               u32 first_ctrl, u32 first_info, int encoded)
++{
++ struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++ struct mt76_queue_entry *first = &q->entry[q->tail];
++ u32 first_len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, first_ctrl);
++ u32 identity, ctrl, info, data, total = 0, word, announced;
++ int i, index = q->tail, result = encoded ?: 1;
++
++ if (!npu_txfree_chain_verify || !first->buf || first_len < 4 ||
++     first_len > first->dma_len[0]) return result;
++ dma_sync_single_for_cpu(dev->dma_dev, first->dma_addr[0], first->dma_len[0],
++                         page_pool_get_dma_dir(q->page_pool));
++ word = get_unaligned_le32(first->buf);
++ announced = word & 0xffff;
++ if (FIELD_GET(GENMASK(31, 27), word) != 6 || announced <= first_len)
++  return result;
++ data = READ_ONCE(desc[index].data);
++ /* A short, explicitly complete frame is a different anomaly; retain the
++  * normal mismatch diagnostics rather than consuming an unrelated packet.
++  */
++ if ((first_ctrl & NPU_RX_DMA_DESC_LAST_MASK) ||
++     FIELD_GET(NPU_RX_DMA_FRAG_TYPE_MASK, data) != 1) return result;
++ identity = data & (NPU_RX_DMA_SID_MASK | NPU_RX_DMA_RADIO_ID_MASK |
++                    NPU_RX_DMA_VAP_ID_MASK | NPU_RX_DMA_FRAME_TYPE_MASK);
++ for (i = 0; i < min_t(int, q->queued, 7); i++) {
++  struct mt76_queue_entry *entry = &q->entry[index];
++  unsigned int length, frag;
++  ctrl = READ_ONCE(desc[index].ctrl);
++  if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK)) { result = -EAGAIN; goto record; }
++  dma_rmb();
++  info = READ_ONCE(desc[index].info); data = READ_ONCE(desc[index].data);
++  length = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl);
++  frag = FIELD_GET(NPU_RX_DMA_FRAG_TYPE_MASK, data);
++  if (!entry->buf || !length || length > entry->dma_len[0] ||
++      ((info ^ first_info) & (NPU_RX_DMA_PKT_ID_MASK | NPU_RX_DMA_SRC_PORT_MASK)) ||
++      (data & (NPU_RX_DMA_SID_MASK | NPU_RX_DMA_RADIO_ID_MASK |
++                NPU_RX_DMA_VAP_ID_MASK | NPU_RX_DMA_FRAME_TYPE_MASK)) != identity ||
++      (i == 0 ? frag != 1 : frag != 2 && frag != 3)) {
++   result = -EPROTO; goto record;
++  }
++  total += length;
++  if (ctrl & NPU_RX_DMA_DESC_LAST_MASK) {
++   if (frag != 3 || total != announced || (encoded > 1 && encoded != i + 1)) {
++    result = -EPROTO; goto record;
++   }
++   result = i + 1; goto record;
++  }
++  if (frag == 3 || total >= announced) { result = -EPROTO; goto record; }
++  index = (index + 1) % q->ndesc;
++ }
++ result = q->queued < 7 ? -EAGAIN : -EPROTO;
++record:
++ spin_lock_bh(&q->lock);
++ q->npu_chain_announced = announced; q->npu_chain_first_cur = first_len;
++ q->npu_chain_encoded = encoded; q->npu_chain_frames = result > 0 ? result : 0;
++ if (result > 0) q->npu_chain_preflights++;
++ else if (result == -EAGAIN) q->npu_chain_pending++;
++ else q->npu_chain_invalid++;
++ spin_unlock_bh(&q->lock);
++ return result;
++}
++
+ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 					struct mt76_queue *q,
+ 					u32 *info)
+@@ -225,7 +300,9 @@
+ 	first_info = READ_ONCE(desc[index].info);
+ 
+ 	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, first_info);
+-	nframes = max_t(int, nframes, 1);
++	nframes = mt76_npu_txfree_chain(dev, q, first_ctrl, first_info, nframes);
++	if (nframes < 0)
++		return NULL;
+ 	/* Reject a corrupt/incomplete count without truncating the chain or
+ 	 * changing ring ownership. The poll's refill can replenish free slots.
+ 	 */
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -955,11 +955,20 @@
+  for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++) {
+   struct mt76_queue *q = &mdev->q_rx[i];
+   struct mt76_npu_rx_anomaly snapshot = {};
++  u64 chain_ok = 0, chain_wait = 0, chain_invalid = 0;
++  u32 chain_announced = 0, chain_first = 0, chain_encoded = 0, chain_frames = 0;
+   if (q->ndesc) {
+    spin_lock_bh(&q->lock);
+    snapshot = q->npu_rx_anomaly;
++   chain_ok = q->npu_chain_preflights; chain_wait = q->npu_chain_pending;
++   chain_invalid = q->npu_chain_invalid; chain_announced = q->npu_chain_announced;
++   chain_first = q->npu_chain_first_cur; chain_encoded = q->npu_chain_encoded;
++   chain_frames = q->npu_chain_frames;
+    spin_unlock_bh(&q->lock);
+   }
++  seq_printf(s, "npu_rx%d_chain preflights=%llu pending=%llu invalid=%llu announced=%u first_cur=%u encoded=%u frames=%u\n",
++             i - MT_RXQ_NPU0, (unsigned long long)chain_ok, (unsigned long long)chain_wait,
++             (unsigned long long)chain_invalid, chain_announced, chain_first, chain_encoded, chain_frames);
+   seq_printf(s, "npu_rx%d_mismatch count=%llu announced=%u actual=%u frames=%u first_cur=%u first_total=%u first_last=%u first_frag=%u first_count=%u tail_cur=%u tail_last=%u next_done=%u next_cur=%u next_same=%u\n",
+              i - MT_RXQ_NPU0, (unsigned long long)snapshot.count, snapshot.announced,
+              snapshot.actual, snapshot.frames, snapshot.first_cur, snapshot.first_total,

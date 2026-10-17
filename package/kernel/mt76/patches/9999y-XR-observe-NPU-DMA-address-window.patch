@@ -1,0 +1,60 @@
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -983,11 +983,30 @@
+             (long long)atomic64_read(&dev->mcu_stats_errors),
+             (long long)atomic64_read(&dev->mcu_stats_bad_records), READ_ONCE(dev->mcu_stats_faulted));
+ 
++ /* mdev->mutex pins the published NPU attachment; each core lock
++  * protects its mailbox metadata. No mailbox operation is performed. */
++ if (npu) {
++  struct airoha_npu *attached = rcu_dereference_protected(mdev->mmio.npu,
++                                  lockdep_is_held(&mdev->mutex));
++  unsigned int core;
++  for (core = 0; core < NPU_NUM_CORES; core++) {
++   dma_addr_t addr;
++   bool broken;
++   spin_lock_bh(&attached->cores[core].lock);
++   addr = attached->cores[core].addr;
++   broken = attached->cores[core].mbox_broken;
++   spin_unlock_bh(&attached->cores[core].lock);
++   seq_printf(s, "npu_core%u_mailbox dma=%016llx broken=%u\n",
++              core, (unsigned long long)addr, broken);
++  }
++ }
+  seq_puts(s, "queue_counters=approximate\n");
+  for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++) {
+   struct mt76_queue *q = &mdev->q_rx[i];
+   struct mt76_npu_rx_anomaly snapshot = {};
+   u64 chain_ok = 0, chain_wait = 0, chain_invalid = 0;
++  u64 dma_min = U64_MAX, dma_max = 0;
++  unsigned int dma_owned = 0, dma_high = 0, desc_mismatch = 0, slot;
+   u32 chain_announced = 0, chain_first = 0, chain_encoded = 0, chain_frames = 0;
+   if (q->ndesc) {
+    spin_lock_bh(&q->lock);
+@@ -996,8 +1015,26 @@
+    chain_invalid = q->npu_chain_invalid; chain_announced = q->npu_chain_announced;
+    chain_first = q->npu_chain_first_cur; chain_encoded = q->npu_chain_encoded;
+    chain_frames = q->npu_chain_frames;
++   if (q->entry && q->desc) {
++    struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++    for (slot = 0; slot < q->ndesc; slot++) {
++     struct mt76_queue_entry *e = &q->entry[slot];
++     u64 addr;
++     if (!e->buf)
++      continue;
++     addr = e->dma_addr[0];
++     dma_owned++;
++     dma_min = min(dma_min, addr); dma_max = max(dma_max, addr);
++     dma_high += addr >= 0xc0000000ULL;
++     desc_mismatch += READ_ONCE(desc[slot].addr) != (u32)addr;
++    }
++   }
+    spin_unlock_bh(&q->lock);
+   }
++  seq_printf(s, "npu_rx%d_dma owned=%u above_1g_window=%u min=%016llx max=%016llx desc_addr_mismatch=%u ring=%016llx\n",
++             i - MT_RXQ_NPU0, dma_owned, dma_high,
++             (unsigned long long)(dma_owned ? dma_min : 0),
++             (unsigned long long)dma_max, desc_mismatch, (unsigned long long)q->desc_dma);
+   seq_printf(s, "npu_rx%d_chain preflights=%llu pending=%llu invalid=%llu announced=%u first_cur=%u encoded=%u frames=%u\n",
+              i - MT_RXQ_NPU0, (unsigned long long)chain_ok, (unsigned long long)chain_wait,
+              (unsigned long long)chain_invalid, chain_announced, chain_first, chain_encoded, chain_frames);

@@ -1,0 +1,43 @@
+Subject: [PATCH] mt76: publish NPU TX ownership after descriptor and accounting stores
+
+Coherent DMA descriptors require ordered ownership publication. Keep all
+TXWI/address/software entry stores before dma_wmb and the single DONE-ready
+store. No ABI or data-path length changes; not a proven fix for the observed
+Maple Tree Oops or historical TXFREE truncation. NPU remains default off.
+
+--- a/npu.c
++++ b/npu.c
+@@ -481,16 +481,16 @@
+ {
+ 	u16 txwi_len = min_t(u16, phy->dev->drv->txwi_size, NPU_TXWI_LEN);
+ 	struct airoha_npu_tx_dma_desc *desc = (void *)q->desc;
+-	int ret;
++	int ret = q->head;
++	u32 ctrl;
+ 
+ 	/* TODO: Take into account unlinear skbs */
+ 	memcpy(desc[q->head].txwi, txwi_ptr, txwi_len);
+ 	desc[q->head].addr = buf->addr;
+-	desc[q->head].ctrl = FIELD_PREP(NPU_TX_DMA_DESC_VEND_LEN_MASK, txwi_len) |
++	ctrl = FIELD_PREP(NPU_TX_DMA_DESC_VEND_LEN_MASK, txwi_len) |
+ 			     FIELD_PREP(NPU_TX_DMA_DESC_LEN_MASK, skb->len) |
+ 			     NPU_TX_DMA_DESC_DONE_MASK;
+ 
+-	ret = q->head;
+ 	q->entry[q->head].skip_buf0 = true;
+ 	q->entry[q->head].skip_buf1 = true;
+ 	q->entry[q->head].txwi = NULL;
+@@ -499,6 +499,13 @@
+ 
+ 	q->head = (q->head + 1) % q->ndesc;
+ 	q->queued++;
++
++	/* Coherent memory still needs ordering: hardware must never observe
++	 * DONE-ready before TXWI/address and CPU ownership accounting exist.
++	 * Doorbell ordering does not replace publication ordering of this bit.
++	 */
++	dma_wmb();
++	WRITE_ONCE(desc[ret].ctrl, ctrl);
+ 
+ 	return ret;
+ }

@@ -1,0 +1,97 @@
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -6,6 +6,8 @@
+ 
+ #include <linux/devcoredump.h>
+ #include <linux/firmware.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
+ #include <linux/platform_device.h>
+ #include <linux/of_net.h>
+ #include <linux/of_platform.h>
+@@ -130,6 +132,53 @@
+ #define MBOX_MSG_DONE		BIT(1)
+ #define MBOX_MSG_WAIT_RSP	BIT(0)
+ 
++/* The shipped EN7581/MT7996 firmware has a mode1 branch selecting flow
++ * configuration 0x8000 instead of the IPv4/IPv6 parser enables. Its native
++ * L2 packet semantics need hardware qualification. This diagnostic selector
++ * does not grant any binding capability: AP39 DS-field containment remains.
++ * Built-in driver: select at runtime before first PPE init, then lock until
++ * reboot. No register changes occur in the parameter setter.
++ */
++static bool ppe_mode1_probe;
++static bool ppe_mode_locked;
++static DEFINE_MUTEX(ppe_mode_mutex);
++
++static int airoha_ppe_mode_set(const char *val, const struct kernel_param *kp)
++{
++	bool mode;
++	int err = kstrtobool(val, &mode);
++
++	if (err)
++		return err;
++	mutex_lock(&ppe_mode_mutex);
++	if (ppe_mode_locked)
++		err = -EBUSY;
++	else
++		*(bool *)kp->arg = mode;
++	mutex_unlock(&ppe_mode_mutex);
++	return err;
++}
++
++static bool airoha_ppe_mode_latch(void)
++{
++	bool mode;
++
++	mutex_lock(&ppe_mode_mutex);
++	ppe_mode_locked = true;
++	mode = ppe_mode1_probe;
++	mutex_unlock(&ppe_mode_mutex);
++	return mode;
++}
++
++static const struct kernel_param_ops ppe_mode_ops = {
++	.set = airoha_ppe_mode_set,
++	.get = param_get_bool,
++};
++module_param_cb(ppe_mode1_probe, &ppe_mode_ops, &ppe_mode1_probe, 0600);
++MODULE_PARM_DESC(ppe_mode1_probe,
++                "EN7581/MT7996 diagnostic firmware mode1; binding capability unchanged");
++
++#define PPE_TYPE_MODE1_PROBE	1
+ #define PPE_TYPE_L2B_IPV4	2
+ #define PPE_TYPE_L2B_IPV4_IPV6	3
+ 
+@@ -363,8 +412,21 @@
+ 
+ static int airoha_npu_ppe_init(struct airoha_npu *npu)
+ {
++	bool mode1 = airoha_ppe_mode_latch();
+ 	struct ppe_mbox_data *ppe_data;
+ 	int err;
++
++	if (mode1) {
++		const char *names[2];
++
++		if (!of_device_is_compatible(npu->dev->of_node,
++					     "airoha,en7581-npu") ||
++		    of_property_read_string_array(npu->dev->of_node,
++					  "firmware-name", names, 2) != 2 ||
++		    strcmp(names[0], NPU_EN7581_7996_FIRMWARE_RV32) ||
++		    strcmp(names[1], NPU_EN7581_7996_FIRMWARE_DATA))
++			return -EOPNOTSUPP;
++	}
+ 
+ 	ppe_data = kzalloc(sizeof(*ppe_data), GFP_KERNEL);
+ 	if (!ppe_data)
+@@ -372,7 +434,8 @@
+ 
+ 	ppe_data->func_type = NPU_OP_SET;
+ 	ppe_data->func_id = PPE_FUNC_SET_WAIT_HWNAT_INIT;
+-	ppe_data->init_info.ppe_type = PPE_TYPE_L2B_IPV4_IPV6;
++	ppe_data->init_info.ppe_type = mode1 ?
++		PPE_TYPE_MODE1_PROBE : PPE_TYPE_L2B_IPV4_IPV6;
+ 	ppe_data->init_info.wan_mode = QDMA_WAN_ETHER;
+ 
+ 	err = airoha_npu_send_msg(npu, NPU_FUNC_PPE, ppe_data,

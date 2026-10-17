@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "checks": 57,
+  "sourceSHA256": "dcac37c4a615d096f37640ddde7161ae3dc5645acb9dd7d7568fa66672c40287",
+  "actualTCReadbackEvidence": "development/ap31/publisher/vm-result.json",
+  "actualSoftwareRulesRejected": true,
+  "positiveHardwareFlagsModeledOnly": true,
+  "actualPPEBindingOrPolicyLeaseQualified": false
+}

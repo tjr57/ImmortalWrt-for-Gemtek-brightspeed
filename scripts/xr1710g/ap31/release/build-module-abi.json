@@ -1,0 +1,36 @@
+{
+  "passed": true,
+  "checks": [
+    "actual target compiler kernel and backports header layouts agree",
+    "two independent packaged mac80211 callback tables match kernel offsets"
+  ],
+  "kernelLayout": {
+    "netDeviceBytes": 2496,
+    "netDeviceName": 280,
+    "netDeviceNapiList": 352,
+    "netDeviceOpsBytes": 680,
+    "ndoOpen": 16,
+    "ndoSetupTc": 336,
+    "napiBytes": 496,
+    "napiDev": 48,
+    "napiPoll": 32
+  },
+  "wirelessHeaderLayout": {
+    "netDeviceBytes": 2496,
+    "netDeviceName": 280,
+    "netDeviceNapiList": 352,
+    "netDeviceOpsBytes": 680,
+    "ndoOpen": 16,
+    "ndoSetupTc": 336,
+    "napiBytes": 496,
+    "napiDev": 48,
+    "napiPoll": 32
+  },
+  "packedCallbackOffsets": [
+    336,
+    336
+  ],
+  "packedMac80211SHA256": "3a8a7fd22a254b4199dbea397ea8cac252d63c9e7cd72413c33489190074908b",
+  "kernelConfigSHA256": "73930c453230570d5e305e45c782e9b99299d7acf205940f206a4d97f9934a5b",
+  "physicalBootAccepted": false
+}

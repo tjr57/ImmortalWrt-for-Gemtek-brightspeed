@@ -1,0 +1,127 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -49,6 +49,8 @@
+  * per boot, ended by its own deadline. Written under ppe_lock.
+  */
+ static bool xr_trial_active;
++/* Classification window never grants data-plane binding permission. */
++static bool xr_trial_classify_only;
+ module_param_named(ppe_bind_enable, ppe_bind_enable, bool, 0400);
+ MODULE_PARM_DESC(ppe_bind_enable,
+                 "Allow PPE forwarding bindings (boot-only; NPU WLAN DMA remains available)");
+@@ -2635,6 +2637,7 @@
+ 	XR_PPE_L2_CMD_DUMP,
+ 	XR_PPE_L2_CMD_TRIAL_ARM,
+ 	XR_PPE_L2_CMD_TRIAL_STOP,
++	XR_PPE_L2_CMD_CLASSIFY_ARM,
+ };
+ 
+ enum {
+@@ -2663,6 +2666,7 @@
+ 	XR_PPE_L2_A_TRIAL_REMAINING_MS,	/* u32 */
+ 	XR_PPE_L2_A_TRIAL_INVALIDATED,	/* u32, bound FOE entries cleared */
+ 	XR_PPE_L2_A_DSFIELD_PRESERVED,	/* u8: verified bridge capability */
++	XR_PPE_L2_A_CLASSIFY_ONLY,	/* u8: diagnostic window, binding stays off */
+ 	__XR_PPE_L2_A_MAX,
+ };
+ #define XR_PPE_L2_A_MAX (__XR_PPE_L2_A_MAX - 1)
+@@ -2706,7 +2710,7 @@
+ static int airoha_xr_put_state(struct sk_buff *skb, struct airoha_ppe *ppe)
+ {
+ 	u32 writers, remaining = 0, invalidated;
+-	bool nf, netdev;
++	bool nf, netdev, classify;
+ 	u8 trial;
+ 	u64 gen;
+ 
+@@ -2716,6 +2720,7 @@
+ 	nf = ppe->l2_policy_latched;
+ 	netdev = ppe->l2_netdev_policy_latched;
+ 	trial = ppe->xr_trial_state;
++	classify = xr_trial_classify_only;
+ 	invalidated = ppe->xr_trial_invalidated;
+ 	if (trial == 1 && time_before(jiffies, ppe->xr_trial_deadline))
+ 		remaining = jiffies_to_msecs(ppe->xr_trial_deadline - jiffies);
+@@ -2730,6 +2735,7 @@
+ 		       ppe_bridge_bind_enable) ||
+ 	    nla_put_u32(skb, XR_PPE_L2_A_ENTRIES, ppe->xr_pub_count) ||
+ 	    nla_put_u8(skb, XR_PPE_L2_A_TRIAL_STATE, trial) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_CLASSIFY_ONLY, classify) ||
+ 	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_REMAINING_MS, remaining) ||
+ 	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_INVALIDATED, invalidated) ||
+ 	    nla_put_u8(skb, XR_PPE_L2_A_DSFIELD_PRESERVED,
+@@ -3012,7 +3018,7 @@
+ /* One window per boot, never extended. PPE/NPU offload is initialized here,
+  * as TC would have done, because TC no longer publishes L2 templates.
+  */
+-static int airoha_xr_trial_arm(struct sk_buff *skb, struct genl_info *info)
++static int airoha_xr_window_arm(struct genl_info *info, bool classify)
+ {
+ 	struct airoha_ppe *ppe = xr_pub_ppe;
+ 	struct airoha_eth *eth = ppe->eth;
+@@ -3021,11 +3027,11 @@
+ 
+ 	if (GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_TRIAL_SECONDS))
+ 		return -EINVAL;
+-	if (!airoha_ppe_l2_dsfield_preserved()) {
++	if (!classify && !airoha_ppe_l2_dsfield_preserved()) {
+ 		NL_SET_ERR_MSG(info->extack, "bridge PPE cannot preserve per-packet DSCP/ECN; software forwarding required");
+ 		return -EOPNOTSUPP;
+ 	}
+-	if (ppe_bind_enable) {
++	if (ppe_bind_enable || ppe_bridge_bind_enable) {
+ 		NL_SET_ERR_MSG(info->extack, "boot permission already enables PPE binding");
+ 		return -EINVAL;
+ 	}
+@@ -3045,11 +3051,28 @@
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->xr_trial_state = 1;
+ 	ppe->xr_trial_deadline = jiffies + seconds * HZ;
+-	WRITE_ONCE(xr_trial_active, true);
++	xr_trial_classify_only = classify;
++	WRITE_ONCE(xr_trial_active, !classify);
+ 	spin_unlock_bh(&ppe_lock);
+ 	schedule_delayed_work(&ppe->xr_trial_work, seconds * HZ);
+-	pr_info("xr_ppe_l2: L2 binding trial armed for %u s\n", seconds);
+-	return airoha_xr_reply_state(info, XR_PPE_L2_CMD_TRIAL_ARM, 0, false);
++	pr_info("xr_ppe_l2: %s window armed for %u s\n",
++		classify ? "classification-only" : "L2 binding", seconds);
++	return airoha_xr_reply_state(info, classify ? XR_PPE_L2_CMD_CLASSIFY_ARM :
++				   XR_PPE_L2_CMD_TRIAL_ARM, 0, false);
++}
++
++static int airoha_xr_trial_arm(struct sk_buff *skb, struct genl_info *info)
++{
++	return airoha_xr_window_arm(info, false);
++}
++
++/* Initialize the normal firmware/table path to inspect UNB classifications.
++ * Binding remains forbidden at every gate, including the DS-field gate.
++ * Shares the one-per-boot timer; a diagnostic reboot restores default mode.
++ */
++static int airoha_xr_classify_arm(struct sk_buff *skb, struct genl_info *info)
++{
++	return airoha_xr_window_arm(info, true);
+ }
+ 
+ static int airoha_xr_trial_stop(struct sk_buff *skb, struct genl_info *info)
+@@ -3088,6 +3111,10 @@
+ 		.cmd = XR_PPE_L2_CMD_TRIAL_STOP,
+ 		.doit = airoha_xr_trial_stop,
+ 		.flags = GENL_ADMIN_PERM,
++	}, {
++		.cmd = XR_PPE_L2_CMD_CLASSIFY_ARM,
++		.doit = airoha_xr_classify_arm,
++		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+ 
+@@ -3102,7 +3129,7 @@
+ 	.module = THIS_MODULE,
+ 	.small_ops = airoha_xr_ops,
+ 	.n_small_ops = ARRAY_SIZE(airoha_xr_ops),
+-	.resv_start_op = XR_PPE_L2_CMD_TRIAL_STOP + 1,
++	.resv_start_op = XR_PPE_L2_CMD_CLASSIFY_ARM + 1,
+ };
+ 
+ static void airoha_xr_publisher_init(struct airoha_ppe *ppe)

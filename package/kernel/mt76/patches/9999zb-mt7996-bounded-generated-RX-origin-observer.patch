@@ -1,0 +1,152 @@
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -433,6 +433,8 @@
+ 				 FIELD_GET(MT_DMA_PPE_ENTRY, info));
+ }
+ 
++#include "xr-rx-origin.h"
++
+ static int
+ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
+ 		   struct sk_buff *skb, u32 *info)
+@@ -711,6 +713,9 @@
+ 		skb_set_mac_header(skb, (unsigned char *)hdr - skb->data);
+ 	} else {
+ 		status->flag |= RX_FLAG_8023;
++		xr_origin_observe(skb, q, mt76_queue_is_npu_rx(&dev->mt76.q_rx[q]),
++				  *info, rxd1, rxd2, le16_to_cpu(fc), seq_ctrl,
++				  qos_ctl, hw_aggr);
+ 		mt7996_wed_check_ppe(dev, &dev->mt76.q_rx[q], msta, skb,
+ 				     *info);
+ 		if (msta && msta->vif &&
+--- /dev/null
++++ b/mt7996/xr-rx-origin.h
+@@ -0,0 +1,128 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Default-off, 30-second metadata audit of owned generated IPv6 UDP probes.
++ * No traffic decisions, skb changes, packet contents, MMIO or key material.
++ * Included only in mt7996/mac.c, so no shared ABI or module dependency change.
++ */
++#include <linux/jiffies.h>
++#include <linux/ipv6.h>
++#include <linux/udp.h>
++
++#define XR_ORIGIN_PHASES 12
++#define XR_ORIGIN_SEQS 400
++#define XR_ORIGIN_EVENTS 20
++struct xr_origin_meta {
++ u32 info, rxd2;
++ u16 seq, fc;
++ u8 q, tid, group4, hw_aggr, npu, valid;
++};
++struct xr_origin_event {
++ struct xr_origin_meta first, observed;
++ u16 phase, seq;
++ u8 repeated;
++};
++static DEFINE_SPINLOCK(xr_origin_lock);
++static unsigned int xr_origin_run;
++static unsigned long xr_origin_deadline;
++static struct xr_origin_meta xr_origin_seen[XR_ORIGIN_PHASES][XR_ORIGIN_SEQS];
++static struct xr_origin_event xr_origin_events[XR_ORIGIN_EVENTS];
++static u32 xr_origin_total, xr_origin_npu, xr_origin_duplicates;
++static u32 xr_origin_count, xr_origin_overflow, xr_origin_non_npu;
++
++static int xr_origin_set(const char *val, const struct kernel_param *kp)
++{
++ unsigned int run;
++ int err = kstrtouint(val, 0, &run);
++ if (err) return err;
++ if (run && run != 45602 && run != 45604 && run != 45606) return -EINVAL;
++ spin_lock_bh(&xr_origin_lock);
++ /* Disabling keeps completed observations available for inspection. */
++ if (run) {
++  memset(xr_origin_seen, 0, sizeof(xr_origin_seen));
++  memset(xr_origin_events, 0, sizeof(xr_origin_events));
++  xr_origin_total = xr_origin_npu = xr_origin_duplicates = 0;
++  xr_origin_count = xr_origin_overflow = xr_origin_non_npu = 0;
++ }
++ WRITE_ONCE(xr_origin_deadline, jiffies + 30 * HZ);
++ WRITE_ONCE(xr_origin_run, run);
++ spin_unlock_bh(&xr_origin_lock);
++ return 0;
++}
++
++static int xr_origin_get(char *buf, const struct kernel_param *kp)
++{
++ unsigned int i;
++ int n;
++ spin_lock_bh(&xr_origin_lock);
++ n = scnprintf(buf, PAGE_SIZE,
++  "schema=1 run=%u active=%u total=%u npu=%u repeated=%u non_npu=%u events=%u overflow=%u payload_saved=0\n",
++  xr_origin_run, !!xr_origin_run && time_before(jiffies, xr_origin_deadline),
++  xr_origin_total, xr_origin_npu, xr_origin_duplicates, xr_origin_non_npu,
++  xr_origin_count, xr_origin_overflow);
++ for (i = 0; i < xr_origin_count; i++) {
++  struct xr_origin_event *e = &xr_origin_events[i];
++  struct xr_origin_meta *a = &e->first, *b = &e->observed;
++  n += scnprintf(buf+n, PAGE_SIZE-n,
++   "p=%u s=%u dup=%u a=%u,%u,%u,%u,%04x,%04x,%08x,%08x,%u b=%u,%u,%u,%u,%04x,%04x,%08x,%08x,%u\n",
++   e->phase,e->seq,e->repeated,
++   a->q,a->npu,a->group4,a->tid,a->seq,a->fc,a->info,a->rxd2,a->hw_aggr,
++   b->q,b->npu,b->group4,b->tid,b->seq,b->fc,b->info,b->rxd2,b->hw_aggr);
++ }
++ spin_unlock_bh(&xr_origin_lock);
++ return n;
++}
++static const struct kernel_param_ops xr_origin_ops = {
++ .set = xr_origin_set, .get = xr_origin_get,
++};
++module_param_cb(xr_rx_origin, &xr_origin_ops, NULL, 0600);
++MODULE_PARM_DESC(xr_rx_origin, "Owned generated uplink metadata; 0 off, run45602/4/6 enables30s");
++
++static void xr_origin_observe(struct sk_buff *skb, unsigned int q, bool npu,
++ u32 info, u32 rxd1, u32 rxd2, u16 fc, u16 seq, u8 tid, u8 hw_aggr)
++{
++ static const u8 phone[6] = {0x0c,0xbd,0x75,0x21,0xb0,0xdd};
++ static const u8 pc[6] = {0x98,0xb7,0x85,0x1e,0xd5,0xdf};
++ static const u8 phone6[16] = {0xfd,0xdd,0x2e,0x15,0x72,0xb6,0,0,0xd5,0xa2,0xe0,0x32,0xcd,0x57,0xad,0x72};
++ static const u8 pc6[16] = {0xfd,0xdd,0x2e,0x15,0x72,0xb6,0,0,0,0,0,0,0,0,1,0x3f};
++ struct {
++  struct ethhdr eth;
++  struct ipv6hdr ip;
++  struct udphdr udp;
++  __be32 magic, run, phase, seq;
++ } __packed head;
++ struct xr_origin_meta observed, *old;
++ unsigned int run = READ_ONCE(xr_origin_run), phase, packet, port;
++ bool repeat;
++ if (!run || time_after_eq(jiffies, READ_ONCE(xr_origin_deadline))) return;
++ if (skb_copy_bits(skb, 0, &head, sizeof(head))) return;
++ if (head.eth.h_proto != htons(ETH_P_IPV6) ||
++     memcmp(head.eth.h_source, phone, 6) || memcmp(head.eth.h_dest, pc, 6) ||
++     head.ip.version != 6 || head.ip.nexthdr != IPPROTO_UDP ||
++     memcmp(head.ip.saddr.s6_addr, phone6, 16) || memcmp(head.ip.daddr.s6_addr, pc6, 16) ||
++     head.magic != htonl(0x58524453) || ntohl(head.run) != run) return;
++ port = 41080 + (run - 45601) * 2;
++ if (head.udp.source != htons(port+1) || head.udp.dest != htons(port) ||
++     ntohs(head.udp.len) < sizeof(head.udp)+16 ||
++     ntohs(head.ip.payload_len) < ntohs(head.udp.len)) return;
++ phase = ntohl(head.phase); packet = ntohl(head.seq);
++ if (phase >= XR_ORIGIN_PHASES || packet >= XR_ORIGIN_SEQS) return;
++ observed = (struct xr_origin_meta){.info=info,.rxd2=rxd2,.seq=seq,.fc=fc,
++  .q=q,.tid=tid,.group4=!!(rxd1 & MT_RXD1_NORMAL_GROUP_4),
++  .hw_aggr=hw_aggr,.npu=npu,.valid=1};
++ spin_lock_bh(&xr_origin_lock);
++ if (run != xr_origin_run || time_after_eq(jiffies, xr_origin_deadline)) goto out;
++ old = &xr_origin_seen[phase][packet]; repeat = old->valid;
++ xr_origin_total++; xr_origin_npu += npu; xr_origin_duplicates += repeat;
++ xr_origin_non_npu += !npu;
++ /* Keep duplicate pairs and the first otherwise unique normal-DMA arrival.
++  * Normal-DMA count remains complete, while bounded events never save payload.
++  */
++ if (repeat || (!npu && xr_origin_non_npu <= 4)) {
++  if (xr_origin_count < XR_ORIGIN_EVENTS) {
++   struct xr_origin_event *e = &xr_origin_events[xr_origin_count++];
++   e->first=*old; e->observed=observed; e->phase=phase; e->seq=packet; e->repeated=repeat;
++  } else xr_origin_overflow++;
++ }
++ if (!repeat) *old=observed;
++out:
++ spin_unlock_bh(&xr_origin_lock);
++}

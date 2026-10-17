@@ -1,0 +1,189 @@
+From: XR1710G AP project
+Subject: [PATCH] mt76: close NPU page, shared IRQ and RCU exit lifetime gaps
+
+Avoid stale page owners after dequeue/cleanup, reject missing buffers before
+handoff, initialize NAPI before shared IRQ registration, explicitly release
+devm IRQs before NAPI/private storage destruction, and defer provider puts
+until existing RCU readers have finished. Keep NPU boot policy default off.
+This is lifecycle hardening, not a claimed AP7 firmware truncation root cause.
+
+--- a/mt76.h
++++ b/mt76.h
+@@ -273,6 +273,9 @@
+ 	dma_addr_t desc_dma;
+ 	struct sk_buff *rx_head;
+ 	struct page_pool *page_pool;
++	int npu_irq;
++	bool npu_irq_registered;
++	bool npu_napi_registered;
+ };
+ 
+ struct mt76_mcu_ops {
+@@ -1679,6 +1682,7 @@
+ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q);
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q);
+ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q);
++void mt76_npu_release_rx_irq(struct mt76_dev *dev, struct mt76_queue *q);
+ void mt76_npu_disable_irqs(struct mt76_dev *dev);
+ int mt76_npu_init(struct mt76_dev *dev, phys_addr_t phy_addr, int type);
+ void mt76_npu_deinit(struct mt76_dev *dev);
+@@ -1716,6 +1720,12 @@
+ 					  struct mt76_queue *q)
+ {
+ }
++
++static inline void mt76_npu_release_rx_irq(struct mt76_dev *dev,
++                                          struct mt76_queue *q)
++{
++}
++
+ 
+ static inline void mt76_npu_disable_irqs(struct mt76_dev *dev)
+ {
+--- a/npu.c
++++ b/npu.c
+@@ -76,6 +76,9 @@
+ 
+ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	/* Partially initialized or already drained queues own no buffers. */
++	if (!q->ndesc || !q->entry || !q->queued)
++		return;
+ 	spin_lock_bh(&q->lock);
+ 	while (q->queued > 0) {
+ 		struct mt76_queue_entry *e = &q->entry[q->tail];
+@@ -83,7 +86,11 @@
+ 		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+ 					e->dma_len[0],
+ 					page_pool_get_dma_dir(q->page_pool));
+-		mt76_put_page_pool_buf(e->buf, false);
++		if (e->buf)
++			mt76_put_page_pool_buf(e->buf, false);
++		e->buf = NULL;
++		e->dma_addr[0] = 0;
++		e->dma_len[0] = 0;
+ 		q->tail = (q->tail + 1) % q->ndesc;
+ 		q->queued--;
+ 	}
+@@ -182,7 +189,7 @@
+ 		struct mt76_queue_entry *e = &q->entry[index];
+ 
+ 		ctrl = READ_ONCE(desc[index].ctrl);
+-		if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, ctrl) ||
++		if (!e->buf || !FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, ctrl) ||
+ 		    FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl) > e->dma_len[0])
+ 			return NULL;
+ 		index = (index + 1) % q->ndesc;
+@@ -222,6 +229,9 @@
+ 						len, q->buf_size);
+ 		}
+ 
++		/* Page ownership now belongs to the skb, never to cleanup. */
++		e->buf = NULL;
++
+ 		index = (index + 1) % q->ndesc;
+ 	}
+ 	q->tail = index;
+@@ -391,6 +401,18 @@
+ 		q->wed_regs = airoha_npu_wlan_get_queue_addr(npu, qid, xmit);
+ }
+ 
++/* Release the devm IRQ before queue/NAPI/hw-private storage is destroyed.
++ * devm_free_irq synchronizes in-flight shared handlers using q as dev_id.
++ */
++void mt76_npu_release_rx_irq(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	if (!q->npu_irq_registered)
++		return;
++	devm_free_irq(dev->dev, q->npu_irq, q);
++	q->npu_irq_registered = false;
++}
++EXPORT_SYMBOL_GPL(mt76_npu_release_rx_irq);
++
+ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	int err, irq, qid = q - &dev->q_rx[0];
+@@ -421,14 +443,23 @@
+ 		goto out;
+ 	}
+ 
++	/* A shared IRQ can run as soon as registration succeeds. Publish a
++	 * fully allocated, filled, enabled NAPI instance before requesting it.
++	 */
++	mt76_npu_fill_rx_queue(dev, q);
++	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
++	q->npu_napi_registered = true;
++	napi_enable(&dev->napi[qid]);
+ 	err = devm_request_irq(dev->dev, irq, mt76_npu_irq_handler,
+ 			       IRQF_SHARED, name, q);
+-	if (err)
++	if (err) {
++		napi_disable(&dev->napi[qid]);
++		netif_napi_del(&dev->napi[qid]);
++		q->npu_napi_registered = false;
+ 		goto out;
+-
+-	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
+-	mt76_npu_fill_rx_queue(dev, q);
+-	napi_enable(&dev->napi[qid]);
++	}
++	q->npu_irq = irq;
++	q->npu_irq_registered = true;
+ out:
+ 	mutex_unlock(&dev->mutex);
+ 
+@@ -644,19 +675,23 @@
+ 	struct airoha_npu *npu;
+ 
+ 	mutex_lock(&dev->mutex);
+-
+ 	npu = rcu_replace_pointer(dev->mmio.npu, NULL,
+ 				  lockdep_is_held(&dev->mutex));
++	ppe_dev = rcu_replace_pointer(dev->mmio.ppe_dev, NULL,
++				      lockdep_is_held(&dev->mutex));
++	mutex_unlock(&dev->mutex);
++
++	/* Published NULL prevents new readers; existing RX/TC readers retain
++	 * valid references until the grace period ends. No put before this.
++	 * Normal dma_cleanup already drained queues before page_pool_destroy.
++	 */
++	synchronize_rcu();
++	mt76_npu_release_rx_irq(dev, &dev->q_rx[MT_RXQ_NPU0]);
++	mt76_npu_release_rx_irq(dev, &dev->q_rx[MT_RXQ_NPU1]);
++	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU0]);
++	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU1]);
++	if (ppe_dev)
++		airoha_ppe_put_dev(ppe_dev);
+ 	if (npu)
+ 		airoha_npu_put(npu);
+-
+-	ppe_dev = rcu_replace_pointer(dev->mmio.ppe_dev, NULL,
+-				      lockdep_is_held(&dev->mutex));
+-	if (ppe_dev)
+-		airoha_ppe_put_dev(ppe_dev);
+-
+-	mutex_unlock(&dev->mutex);
+-
+-	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU0]);
+-	mt76_npu_queue_cleanup(dev, &dev->q_rx[MT_RXQ_NPU1]);
+-}
++}
+--- a/dma.c
++++ b/dma.c
+@@ -1217,7 +1217,15 @@
+ 	mt76_for_each_q_rx(dev, i) {
+ 		struct mt76_queue *q = &dev->q_rx[i];
+ 
+-		netif_napi_del(&dev->napi[i]);
++		if (mt76_queue_is_npu(q)) {
++			mt76_npu_release_rx_irq(dev, q);
++			if (q->npu_napi_registered) {
++				netif_napi_del(&dev->napi[i]);
++				q->npu_napi_registered = false;
++			}
++		} else {
++			netif_napi_del(&dev->napi[i]);
++		}
+ 		mt76_dma_rx_cleanup(dev, q);
+ 
+ 		page_pool_destroy(q->page_pool);

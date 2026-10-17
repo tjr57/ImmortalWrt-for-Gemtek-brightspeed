@@ -1,0 +1,33 @@
+{
+  "at": "2026-10-11T01:03:52.262676+08:00",
+  "version": "20261011-ap31-d331711d",
+  "imageSHA256": "82d648081434651041cfbc01a607e229223ae65dd4afaa6bd498b1042dcc8932",
+  "bothAPsDeployed": true,
+  "deploymentOrder": [
+    2,
+    1
+  ],
+  "configurationPreserved": true,
+  "healthChecksEach": 15,
+  "bootIDs": {
+    "1": "04d79dd7-776d-4067-8662-6ef2fbbe6e32",
+    "2": "d1faf374-1040-43fb-8f0c-d0afcb8847a4"
+  },
+  "NpuPpeEnabled": false,
+  "sourceEvidence": "development/ap31/ppe-context/progress.json",
+  "imageEvidence": "development/ap31/packed-files-qa.json",
+  "TCDependenciesPresent": true,
+  "automaticRulePublisherShipped": false,
+  "hardwareBindingProven": false,
+  "phoneTested": false,
+  "newThroughputOrLongTermQualification": false,
+  "softwarePostflight": "development/ap31/postflight.json",
+  "APBidirectionalProbes": "60/60",
+  "wiredPCtoAP2Probes": "10/10",
+  "remaining": [
+    "synchronous TC/bridge policy handoff and FDB mutation ordering",
+    "actual rule executor/coherent collector/transaction cleanup",
+    "applicable PPE hardware qualification with fresh AP31 ABI and recovery manifests"
+  ],
+  "mainRouterSwitchPCNetworkChanged": false
+}

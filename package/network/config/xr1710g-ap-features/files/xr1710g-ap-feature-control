@@ -1,0 +1,307 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Typed feature-only RPC. Credentials, country, SSIDs and VLANs are not inputs.
+set -e
+umask 077
+root=${XR_FEATURE_CONTROL_ROOT:-}
+CONF=${XR_FEATURE_CONTROL_CONFIG:-$root/etc/config}
+STATE=${XR_FEATURE_CONTROL_STATE:-$root/var/run/xr1710g-feature-control}
+LOCK=${XR_FEATURE_CONTROL_LOCK:-$root/var/lock}
+UCI=${XR_FEATURE_CONTROL_UCI:-/sbin/uci}
+HELPER=${XR_FEATURE_CONTROL_HELPER:-/usr/sbin/xr1710g-ap-configure}
+SERVICE=${XR_FEATURE_CONTROL_SERVICE:-/bin/ubus}
+STEERING=${XR_FEATURE_CONTROL_STEERING:-/etc/init.d/usteer}
+GUARD=${XR_FEATURE_CONTROL_GUARD:-/usr/sbin/xr1710g-ap-feature-control}
+. "${XR_FEATURE_CONTROL_JSHN:-/usr/share/libubox/jshn.sh}"
+profile=xr1710g_ap_configurator
+files="network wireless dhcp $profile"
+get() { "$UCI" -q -c "$CONF" -P "$STATE/read-delta" get "$profile.$1" 2>/dev/null || :; }
+boolean() { local v;v=$(get "$1");v=${v:-$2};[ "$v" = 1 ] && printf 1 || printf 0; }
+valid_id() { [ "${#1}" = 32 ] && case "$1" in *[!0-9a-f]*) false;;*) true;;esac; }
+now_seconds() {
+ local seconds unused
+ read -r seconds unused < "$root/proc/uptime" || return 1
+ seconds=${seconds%%.*}
+ case "$seconds" in ''|*[!0-9]*) return 1;;esac
+ printf '%s' "$seconds"
+}
+cache_load() {
+ CACHE_ID=;CACHE=;pending=0;remaining=0
+ [ -f "$STATE/current" ] && [ ! -L "$STATE/current" ] || return 1
+ CACHE_ID=$(cat "$STATE/current");valid_id "$CACHE_ID" || return 1
+ CACHE="$STATE/cache.$CACHE_ID"
+ [ -d "$CACHE" ] && [ ! -L "$CACHE" ] || return 1
+ if [ -f "$CACHE/pending" ];then
+  pending=1
+  local now end
+  now=$(now_seconds) || return 1;end=$(cat "$CACHE/until")
+  case "$end" in ''|*[!0-9]*) return 1;;esac
+  remaining=$((end-now));[ "$remaining" -ge 0 ] || remaining=0
+ fi
+}
+cache_fields() {
+ cache_load || :
+ json_add_boolean can_restore "$([ -n "$CACHE" ] && [ -d "$CACHE/before" ] && printf 1 || printf 0)"
+ json_add_boolean confirmation_pending "$pending"
+ json_add_int confirmation_seconds "$remaining"
+ json_add_boolean automatic_restore_conflict "$([ -n "$CACHE" ] && [ -f "$CACHE/conflict" ] && printf 1 || printf 0)"
+ [ "$pending" = 0 ] || json_add_string confirmation_id "$CACHE_ID"
+}
+reply() {
+ json_init;json_add_boolean ok "$1";json_add_string message "$2"
+ json_add_boolean reload_performed "${reloaded:-0}"
+ json_add_boolean reboot_required "${reboot_required:-0}"
+ cache_fields
+ [ -z "${preview:-}" ] || json_add_string preview "$preview"
+ json_dump
+}
+fail() { reply 0 "$1";exit 1; }
+settings() {
+ json_init
+ json_add_boolean roaming "$(boolean roaming.enabled 0)"
+ json_add_boolean ieee80211k "$(boolean roaming.ieee80211k 1)"
+ json_add_boolean ieee80211v "$(boolean roaming.ieee80211v 1)"
+ json_add_boolean ieee80211r "$(boolean roaming.ieee80211r 1)"
+ json_add_boolean mlo "$(boolean mlo.enabled 0)"
+ json_add_boolean puncturing "$(boolean puncturing.enabled 0)"
+ json_add_string mobility_domain "$(get roaming.mobility_domain)"
+ json_add_string mode "$(get puncturing.mode)"
+ local bitmap;bitmap=$(get puncturing.bitmap);bitmap=${bitmap:-0}
+ case "$bitmap" in *[!0-9]*|'') bitmap=0;;esac
+ json_add_int bitmap "$bitmap"
+ cache_fields
+ json_dump
+}
+acquire() {
+ [ -n "$root" ] || [ "$(id -u)" = 0 ] || fail '需要管理员权限。'
+ [ "$(cat "$root/tmp/sysinfo/board_name" 2>/dev/null)" = gemtek,xr1710g ] || fail '设备型号不匹配。'
+ [ -d "$CONF" ] && [ ! -L "$CONF" ] && [ ! -L "$STATE" ] || fail '配置路径不可用。'
+ mkdir -p "$STATE" "$LOCK";chmod 0700 "$STATE"
+ mkdir "$STATE/lock" 2>/dev/null || fail '另一个配置操作正在运行。'
+ printf '%s\n' "$$" > "$STATE/lock/pid"
+ work=$(mktemp -d "$STATE/request.XXXXXX")
+ cleanup() {
+  if [ "${publishing:-0}" = 1 ];then
+   local f okay=1
+   for f in $publish_touched;do
+    if cmp -s "$CONF/$f" "$publish_source/$f";then
+     cp "$work/original/$f" "$CONF/$f" && chmod 0600 "$CONF/$f" || okay=0
+    elif ! cmp -s "$CONF/$f" "$work/original/$f";then okay=0;fi
+   done
+   if [ "$okay" = 0 ] && [ -d "$work/original" ];then mv "$work/original" "$STATE/failed-rollback-$$";fi
+   if [ "$okay" = 1 ] && [ "${pointer_attempted:-0}" = 1 ];then
+    if [ -n "${previous_id:-}" ];then printf '%s\n' "$previous_id" > "$work/previous";mv -f "$work/previous" "$STATE/current"
+    else rm -f "$STATE/current";fi
+   fi
+  fi
+  for f in $files;do rm -f "$CONF/.xr-feature-$$-$f";done
+  [ -z "${new_cache:-}" ] || [ "${cache_committed:-0}" = 1 ] || rm -rf "$new_cache"
+  rm -rf "$work";rm -f "$STATE/lock/pid";rmdir "$STATE/lock" 2>/dev/null || :
+  [ "${publish_lock:-0}" = 0 ] || rmdir "$LOCK/xr1710g-ap-configurator.lock" 2>/dev/null || :
+ }
+ trap cleanup EXIT
+ trap 'exit 1' HUP INT TERM
+ mkdir "$work/original" "$work/stage" "$work/helper-lock" "$work/tmp"
+ for f in $files;do
+  [ -f "$CONF/$f" ] && [ ! -L "$CONF/$f" ] || fail '缺少本项目配置。'
+  cp "$CONF/$f" "$work/original/$f";cp "$CONF/$f" "$work/stage/$f"
+ done
+}
+stage_put() { "$UCI" -q -c "$work/stage" -t "$work/tmp" set "$profile.$1=$2"; }
+stage_get() { "$UCI" -q -c "$1" -t "$work/tmp" get "$2" 2>/dev/null || :; }
+copy_feature() {
+ local path=$1 kind=$2 value part
+ value=$(stage_get "$work/generated" "$path")
+ "$UCI" -q -c "$work/stage" -t "$work/tmp" delete "$path" 2>/dev/null || :
+ [ -n "$value" ] || return 0
+ if [ "$kind" = list ];then
+  for part in $value;do "$UCI" -q -c "$work/stage" -t "$work/tmp" add_list "$path=$part";done
+ else "$UCI" -q -c "$work/stage" -t "$work/tmp" set "$path=$value";fi
+}
+merge_features() {
+ local radio radios radio2 field original_key profile_key
+ [ "$(stage_get "$work/original" wireless.xr_users.xr1710g_owner)" = users ] &&
+ [ "$(stage_get "$work/original" wireless.xr_users.mode)" = ap ] || fail '请先完成本机 AP 配置，再设置无线功能。'
+ radios=$(stage_get "$work/stage" wireless.xr_users.device);radio=${radios%% *}
+ [ "$(stage_get "$work/original" "wireless.$radio.band")" = 5g ] || fail '用户频段配置不一致。'
+ if [ "$roaming" = 1 ] && [ "$ieee80211r" = 1 ];then
+  original_key=$(stage_get "$work/original" wireless.xr_users.key)
+  profile_key=$(stage_get "$work/stage" "$profile.users.key")
+  [ "$original_key" = "$profile_key" ] || fail '用户密码与项目配置不一致，请先同步配置后启用11r。'
+ fi
+ if [ "$puncturing" = 1 ];then
+  [ "$(stage_get "$work/original" "wireless.$radio.htmode")" = EHT160 ] &&
+  [ "$(stage_get "$work/original" "wireless.$radio.channel")" = "$(stage_get "$work/stage" "$profile.users.channel")" ] ||
+   fail '打孔需要实际5GHz为160MHz，且信道与项目配置一致。'
+ fi
+ mkdir "$work/generated"
+ cp "$work/stage/wireless" "$work/generated/wireless"
+ # The full configurator is a validator/generator, not the publication scope.
+ # Keep existing networks, services and every non-feature wireless field.
+ for field in network wireless dhcp;do cp "$work/original/$field" "$work/stage/$field";done
+ for field in mlo ieee80211k rrm_neighbor_report rrm_beacon_report bss_transition ieee80211r mobility_domain ft_iface ft_over_ds ft_psk_generate_local pmk_r1_push r1_key_holder nas_identifier;do
+  copy_feature "wireless.xr_users.$field" scalar
+ done
+ for field in device r0kh r1kh;do copy_feature "wireless.xr_users.$field" list;done
+ for field in punct_bitmap xr_pp_mode;do copy_feature "wireless.$radio.$field" scalar;done
+ if [ "$mlo" = 1 ];then
+  radio2=${radios#* }
+  [ "$radio2" != "$radios" ] && [ "$(stage_get "$work/original" "wireless.$radio2.band")" = 2g ] || fail 'MLO 的2.4GHz频段配置不一致。'
+  copy_feature "wireless.$radio2.htmode" scalar
+ fi
+ "$UCI" -q -c "$work/stage" -t "$work/tmp" commit wireless
+}
+configure() {
+ acquire
+ request=$(cat);json_load "$request" || fail '请求 JSON 无效。'
+ for field in apply roaming ieee80211k ieee80211v ieee80211r mlo puncturing;do
+  json_get_type type "$field";json_get_var value "$field"
+  [ "$type" = boolean ] || fail '开关字段必须为布尔值。'
+  case "$value" in 0|1) ;;*) fail '开关值无效。';;esac
+  eval "$field=\$value"
+ done
+ json_get_type type mobility_domain;json_get_var domain mobility_domain
+ [ "$type" = string ] && [ "${#domain}" = 4 ] && printf '%s' "$domain" | grep -Eq '^[0-9A-Fa-f]{4}$' || fail '漫游域必须是四位十六进制。'
+ json_get_type type mode;json_get_var mode mode
+ [ "$type" = string ] || fail '打孔模式无效。'
+ case "$mode" in manual|auto) ;;*) fail '打孔模式无效。';;esac
+ json_get_type type bitmap;json_get_var bitmap bitmap
+ [ "$type" = int ] || fail '位图必须为整数。'
+ case "$bitmap" in ''|*[!0-9]*|0[0-9]*) fail '位图无效。';;esac
+ [ "${#bitmap}" -le 3 ] && [ "$bitmap" -le 255 ] || fail '位图范围为0到255。'
+ # Allow only named supported fields, never an arbitrary UCI path or command.
+ for section in roaming mlo puncturing;do stage_put "$section" wifi;done
+ stage_put roaming.enabled "$roaming";stage_put roaming.ieee80211k "$ieee80211k"
+ stage_put roaming.ieee80211v "$ieee80211v";stage_put roaming.ieee80211r "$ieee80211r"
+ stage_put roaming.mobility_domain "$domain";stage_put mlo.enabled "$mlo"
+ stage_put mlo.bands '5g 2g';stage_put puncturing.enabled "$puncturing"
+ stage_put puncturing.mode "$mode";stage_put puncturing.bitmap "$bitmap"
+ "$UCI" -q -c "$work/stage" -t "$work/tmp" commit "$profile"
+ preview=$(XR1710G_CONFIG_DIR="$work/stage" XR1710G_UCI="$UCI" XR1710G_LOCK_DIR="$work/helper-lock" XR1710G_TMP_DIR="$work/tmp" "$HELPER" plan 2>&1) || fail "$preview"
+ preview=$(printf '用户漫游：%s（11k=%s，11v=%s，11r=%s，域=%s）\nMLO：%s（2.4GHz＋5GHz）\n5GHz 160MHz打孔：%s（模式=%s，位图=%s）\n基础网络、DHCP、SSID、密码和6GHz回程配置保留。' "$roaming" "$ieee80211k" "$ieee80211v" "$ieee80211r" "$domain" "$mlo" "$puncturing" "$mode" "$bitmap")
+ if [ "$apply" = 0 ];then reply 1 '配置检查通过，尚未应用。';return;fi
+ XR1710G_CONFIG_DIR="$work/stage" XR1710G_UCI="$UCI" XR1710G_LOCK_DIR="$work/helper-lock" XR1710G_TMP_DIR="$work/tmp" "$HELPER" apply > "$work/apply.log" 2>&1 || fail '配置生成失败，现有配置未修改。'
+ merge_features
+ previous_id=
+ if cache_load;then previous_id=$CACHE_ID;fi
+ if [ "$pending" = 1 ];then fail '请先确认或恢复上一批设置。';fi
+ [ ! -L "$STATE/current" ] || fail '恢复缓存路径无效。'
+ new_id=$(tr -d '-' < "$root/proc/sys/kernel/random/uuid");valid_id "$new_id" || fail '无法生成恢复标识。'
+ new_cache="$STATE/cache.$new_id";mkdir "$new_cache" "$new_cache/before" "$new_cache/after"
+ for f in $files;do cp "$work/original/$f" "$new_cache/before/$f";cp "$work/stage/$f" "$new_cache/after/$f";done
+ now=$(now_seconds) || fail '无法读取运行时间。'
+ printf '%s\n' "$((now+180))" > "$new_cache/until";printf 1 > "$new_cache/pending"
+ printf '%s\n' "$new_id" > "$work/current"
+ publish "$work/stage"
+ # Publishing stays armed until the single cache pointer is committed.
+ pointer_attempted=1
+ mv -f "$work/current" "$STATE/current"
+ cache_committed=1;publishing=0;release_publish_lock
+ # Start the guard before any operation can interrupt network management.
+ "$GUARD" watchdog "$new_id" </dev/null > "$STATE/guard.log" 2>&1 &
+ [ -z "$previous_id" ] || rm -rf "$STATE/cache.$previous_id"
+
+ activate
+}
+publish() {
+ local source=$1 f
+ publish_source=$source;publish_touched='';publishing=0
+ mkdir "$LOCK/xr1710g-ap-configurator.lock" 2>/dev/null || fail '配置器正在运行。'
+ publish_lock=1
+ for f in $files;do cmp -s "$CONF/$f" "$work/original/$f" || fail '配置已被其他操作更改，请重新检查。';done
+ for f in $files;do
+  cmp -s "$source/$f" "$CONF/$f" && continue
+  if ! cp "$source/$f" "$CONF/.xr-feature-$$-$f" || ! chmod 0600 "$CONF/.xr-feature-$$-$f";then
+   for f in $files;do rm -f "$CONF/.xr-feature-$$-$f";done
+   fail '配置暂存失败，现有配置未修改。'
+  fi
+ done
+ publishing=1
+ for f in $files;do
+  [ -e "$CONF/.xr-feature-$$-$f" ] || continue
+  publish_touched="$publish_touched $f"
+  if ! mv -f "$CONF/.xr-feature-$$-$f" "$CONF/$f";then
+   local restored=1
+   for f in $publish_touched;do
+    cp "$work/original/$f" "$CONF/$f" && chmod 0600 "$CONF/$f" || restored=0
+   done
+   for f in $files;do rm -f "$CONF/.xr-feature-$$-$f";done
+   publishing=0
+   if [ "$restored" = 0 ];then
+    mv "$work/original" "$STATE/failed-rollback-$$"
+    fail '恢复写入失败，管理员恢复数据已保留在临时缓存。'
+   fi
+   fail '配置写入失败，已恢复原配置。'
+  fi
+ done
+}
+release_publish_lock() { rmdir "$LOCK/xr1710g-ap-configurator.lock";publish_lock=0; }
+sync_steering() {
+ if [ "$(boolean roaming.enabled 0)" = 1 ] &&
+    [ "$(boolean roaming.ieee80211k 1)" = 1 ] &&
+    [ "$(boolean roaming.ieee80211v 1)" = 1 ] && "$STEERING" enabled >/dev/null 2>&1;then
+  "$STEERING" restart >/dev/null 2>&1
+ else "$STEERING" stop >/dev/null 2>&1;fi
+}
+activate() {
+ reboot_required=0;reloaded=0
+ if [ "$(get puncturing.enabled)" = 1 ] &&
+    [ "$(cat "$root/sys/module/mt7996e/parameters/puncturing_enable" 2>/dev/null)" != Y ];then
+  reboot_required=1;reply 1 '配置已暂存；请在180秒内确认。打孔驱动需要重启，当前无线未重载，重启会清除恢复缓存。';return
+ fi
+ if "$SERVICE" call network reload >/dev/null 2>&1;then
+  reloaded=1
+  if sync_steering;then reply 1 '配置已应用；请在180秒内确认，否则本次运行中会自动恢复。'
+  else reply 0 '无线已重载，但漫游服务同步失败；请恢复或等待自动恢复。';fi
+ else reply 0 '服务重载失败；请恢复或等待自动恢复。';fi
+}
+matches_cache() {
+ local f
+ for f in $files;do [ -f "$CACHE/after/$f" ] && [ ! -L "$CACHE/after/$f" ] && cmp -s "$CONF/$f" "$CACHE/after/$f" || return 1;done
+}
+restore() {
+ acquire
+ cache_load || fail '没有本次运行的恢复缓存。'
+ matches_cache || fail '配置已由其他操作修改，不能覆盖恢复。'
+ publish "$CACHE/before"
+ rm -f "$STATE/current";publishing=0;release_publish_lock
+ rm -rf "$CACHE"
+ # The restored config is final; never arm another confirmation timer.
+ reboot_required=0;reloaded=0
+ if "$SERVICE" call network reload >/dev/null 2>&1;then
+  reloaded=1
+  if sync_steering;then reply 1 '原配置已恢复。';else reply 0 '原配置已恢复，漫游服务同步失败。';fi
+ else reply 0 '原配置已恢复，服务重载失败。';fi
+}
+confirm() {
+ acquire
+ request=$(cat);json_load "$request" || fail '请求 JSON 无效。'
+ json_get_type type confirmation_id;json_get_var id confirmation_id
+ [ "$type" = string ] && valid_id "$id" || fail '确认标识无效。'
+ cache_load && [ "$pending" = 1 ] && [ "$CACHE_ID" = "$id" ] || fail '确认标识已失效。'
+ [ "$remaining" -gt 0 ] || fail '确认时间已过，请等待恢复。'
+ matches_cache || fail '配置已被其他操作修改，不能确认。'
+ rm -f "$CACHE/pending"
+ reply 1 '设置已确认，仍可使用恢复按钮还原。'
+}
+watchdog() {
+ local id=$1
+ valid_id "$id" || exit 2
+ trap '' HUP
+ while cache_load && [ "$CACHE_ID" = "$id" ] && [ "$pending" = 1 ];do
+  if [ "$remaining" -eq 0 ];then
+   if [ -d "$STATE/lock" ];then
+    local owner
+    owner=$(cat "$STATE/lock/pid" 2>/dev/null || :)
+    case "$owner" in ''|*[!0-9]*) :;;*)
+     if ! kill -0 "$owner" 2>/dev/null;then rm -f "$STATE/lock/pid";rmdir "$STATE/lock" 2>/dev/null || :;fi;;esac
+    sleep 2;continue
+   fi
+   if matches_cache;then restore
+   else printf '%s\n' '外部配置已改变，自动恢复拒绝覆盖；恢复缓存仍保留。' > "$CACHE/conflict";rm -f "$CACHE/pending";fi
+   return
+  fi
+  sleep 2
+ done
+}
+case "${1:-}" in settings) settings;;configure) configure;;restore) restore;;confirm) confirm;;watchdog) watchdog "${2:-}";;*) reply 0 '未知操作。';exit 2;;esac

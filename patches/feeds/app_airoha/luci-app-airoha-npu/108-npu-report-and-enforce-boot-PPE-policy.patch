@@ -1,0 +1,586 @@
+Subject: [PATCH] luci-app-airoha-npu: enforce independent PPE bridge and WLAN policies
+SPDX-License-Identifier: Apache-2.0
+
+Keep the cumulative policy/UI patch idempotent across feed preparation.
+Expose bridge opt-in and the kernel policy latch. The explicit-rule bridge
+ABI cannot be enabled by legacy sysctl-only switches; retain software policy.
+Global route permission and wireless NPU attachment remain independent.
+
+AP35 (owner decision 2026-10-11): no kmod-br-netfilter dependency; report the
+kernel TC/tcx/XDP/device-hook latch (xr_l2_netdev_policy_latched) separately.
+
+--- a/luci-app-airoha-npu/Makefile
++++ b/luci-app-airoha-npu/Makefile
+@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
+ 
+ LUCI_NAME:=luci-app-airoha-npu
+ PKG_VERSION:=2.0.0
+-PKG_RELEASE:=5
++PKG_RELEASE:=8
+ PKG_LICENSE:=Apache-2.0
+ PKG_MAINTAINER:=XR1710G Maintainer
+ TITLE:=LuCI Airoha XR1710G / XG2010G Status
+@@ -13,7 +13,10 @@ LUCI_TITLE:=LuCI Airoha XR1710G / XG2010G Status
+ LUCI_DESCRIPTION:=Unified Airoha XR1710G and XG2010G SoC/NPU status app with CPU, \
+ 	frame-engine, PPE hardware-offload, Ethernet topology and board-aware WiFi monitoring. \
+ 	The WiFi section is shown on XR1710G and omitted on radio-less XG2010G systems.
+-LUCI_DEPENDS:=+luci-base +kmod-br-netfilter
++# No kmod-br-netfilter: on the XR1710G AP it is a no-op whose bridge hooks
++# permanently latch L2 PPE binding off. Router-mode bridge-nf switches then
++# report the module as missing instead of loading it.
++LUCI_DEPENDS:=+luci-base
+ 
+ include $(TOPDIR)/feeds/luci/luci.mk
+ 
+--- a/luci-app-airoha-npu/htdocs/luci-static/resources/view/airoha_npu/status.js
++++ b/luci-app-airoha-npu/htdocs/luci-static/resources/view/airoha_npu/status.js
+@@ -39,11 +39,66 @@ function isEnabled(value) {
+ 	return value === true || value === 1 || value === '1';
+ }
+ 
++// Platform readiness is not evidence of a wireless NPU attachment.
++function wlanDmaState(st, ti) {
++	st = st || {}; ti = ti || {};
++	var policy = st.wlan_npu_boot_enabled;
++	var disabled = policy === false;
++	var active = !disabled && ti.npu_active === true;
++	var inactive = disabled || ti.npu_active === false;
++	return {
++		label: active ? 'NPU' : inactive ? _('PCIe DMA') : _('Unknown'),
++		active: active,
++		policy: disabled ? _('Wireless NPU disabled for this boot') :
++			policy === true ? _('Wireless NPU attachment allowed for this boot') :
++			_('Wireless NPU boot policy unavailable')
++	};
++}
++
+ function isBridgeOffloadBlocked(mode) {
+ 	mode = mode || {};
+ 	return isEnabled(mode.bridge_offload_blocked);
+ }
+ 
++function isPpeBootPolicyBlocked(mode) {
++	mode = mode || {};
++	return mode.ppe_binding_enabled === false ||
++		mode.bridge_offload_block_reason === 'ppe_boot_policy_disabled';
++}
++
++function isHardwareFlowOffloadBlocked(mode) {
++	mode = mode || {};
++	return isPpeBootPolicyBlocked(mode) || isEnabled(mode.hardware_flow_offload_blocked);
++}
++
++function offloadBlockText(mode) {
++	if (isPpeBootPolicyBlocked(mode))
++		return _('PPE forwarding is disabled for this boot; WLAN DMA policy is shown separately.');
++	switch ((mode || {}).bridge_offload_block_reason) {
++	case 'ppe_bridge_boot_policy_disabled':
++		return _('PPE bridge forwarding is disabled for this boot.');
++	case 'ppe_bridge_policy_latched':
++		return _('Bridge filtering requires software forwarding for this boot.');
++	case 'ppe_explicit_rules_required':
++		return _('This kernel requires explicit forwarding rules; these switches cannot enable hardware bridge offload.');
++	case 'ppe_bridge_policy_unavailable':
++		return _('Bridge forwarding policy is unavailable.');
++	default:
++		return _('Use hardware flow offload in router mode');
++	}
++}
++
++function offloadBlockLabel(mode) {
++	if (isPpeBootPolicyBlocked(mode)) return _('Disabled by boot policy');
++	switch ((mode || {}).bridge_offload_block_reason) {
++	case 'ppe_bridge_boot_policy_disabled': return _('Bridge disabled by boot policy');
++	case 'ppe_bridge_policy_latched': return _('Software forwarding required');
++	case 'ppe_explicit_rules_required': return _('Explicit forwarding rules required');
++	case 'ppe_bridge_policy_unavailable': return _('Forwarding policy unavailable');
++	default: return _('Router mode restricted');
++	}
++}
++
+ /* Token-pool occupancy → { text, kind }. */
+ function tokenHealth(c, s) {
+ 	if (!s) return { text: _('Unknown'), kind: '' };
+@@ -186,7 +241,7 @@ function portAccent(p) {
+ /* ── Summary tiles ── */
+ function npuSummaryTiles(st, ti) {
+ 	st = st || {}; ti = ti || {};
+-	var active = isEnabled(st.npu_loaded);
++	var dma = wlanDmaState(st, ti);
+ 	var clock = st.npu_clock ? Math.round(st.npu_clock / 1000000) : 0;
+ 	var bound = st.offload_bound || 0;
+ 	var total = st.offload_total || 0;
+@@ -204,10 +259,10 @@ function npuSummaryTiles(st, ti) {
+ 
+ 	var tiles = {
+ 		'npu-summary-status': aui.tile({
+-			id: 'npu-summary-status', title: _('NPU Status'),
+-			value: active ? _('Activated') : _('Not Activated'),
+-			accent: active ? 'var(--ai-npu)' : 'var(--ds-text-muted)',
+-			sub: active ? (st.npu_device || _('NPU device ready')) : _('Driver unavailable')
++			id: 'npu-summary-status', title: _('Wireless DMA Path'),
++			value: dma.label,
++			accent: dma.active ? 'var(--ai-npu)' : 'var(--ds-text-muted)',
++			sub: dma.policy
+ 		}),
+ 		'npu-summary-clock': aui.tile({
+ 			id: 'npu-summary-clock', title: _('NPU Clock / Cores'),
+@@ -511,10 +566,10 @@ function renderControlSettings(st) {
+ }
+ 
+ /* ── Offload switches ── */
+-function offloadState(enabled, blocked) {
++function offloadState(enabled, blocked, blockLabel) {
+ 	enabled = isEnabled(enabled);
+ 	blocked = isEnabled(blocked);
+-	if (blocked) return { kind: 'warn', text: _('Router mode restricted') };
++	if (blocked) return { kind: 'warn', text: blockLabel || _('Router mode restricted') };
+ 	return enabled ? { kind: 'ok', text: _('Enabled') } : { kind: '', text: _('Disabled') };
+ }
+ 
+@@ -529,16 +584,16 @@ function renderOffloadSwitch(cfg) {
+ 		blocked: isEnabled(cfg.blocked),
+ 		onLabel: _('Enabled'),
+ 		offLabel: _('Disabled'),
+-		blockedLabel: _('Router mode restricted'),
++		blockedLabel: cfg.blockedLabel || _('Router mode restricted'),
+ 		title: isEnabled(cfg.blocked)
+-			? (isEnabled(cfg.enabled) ? _('Suggested off in router mode') : _('Use hardware flow offload in router mode'))
++			? (cfg.blockReason || (isEnabled(cfg.enabled) ? _('Suggested off in router mode') : _('Use hardware flow offload in router mode')))
+ 			: (isEnabled(cfg.enabled) ? _('Click to disable') : _('Click to enable')),
+ 		onChange: function(input) {
+ 			var val = input.checked ? 1 : 0;
+ 			var blocked = input.getAttribute('data-blocked') === '1';
+ 			if (blocked && val === 1) {
+ 				input.checked = false;
+-				ui.addNotification(null, E('p', {}, _('Use hardware flow offload in router mode')), 'warning');
++				ui.addNotification(null, E('p', {}, cfg.blockReason || _('Use hardware flow offload in router mode')), 'warning');
+ 				return;
+ 			}
+ 			input.disabled = true;
+@@ -548,7 +603,7 @@ function renderOffloadSwitch(cfg) {
+ 					input.checked = !val;
+ 					ui.addNotification(null, E('p', {}, _('Error: ') + r.error), 'error');
+ 				} else {
+-					updateOffloadControl(cfg.inputId, cfg.badgeId, cfg.rowId, val, blocked);
++					updateOffloadControl(cfg.inputId, cfg.badgeId, cfg.rowId, val, blocked, cfg.blockedLabel, cfg.blockReason);
+ 				}
+ 			}).catch(function() {
+ 				input.checked = !val;
+@@ -558,30 +613,33 @@ function renderOffloadSwitch(cfg) {
+ 	});
+ }
+ 
+-function renderOffloadControls(topo, vo, flo, apo, blocked) {
++function renderOffloadControls(topo, vo, flo, apo, mode) {
++	var blocked = isBridgeOffloadBlocked(mode);
++	var blockReason = offloadBlockText(mode), blockLabel = offloadBlockLabel(mode);
+ 	var id = String(topo && topo.compatible || '');
+ 	if (!id) return null;
+ 	var bridge = !/^gemtek,xg2010g(?:-|$)/.test(id) &&
+ 		vo.supported !== false && apo.supported !== false;
+ 	var controls = [
+ 		renderOffloadSwitch({ rowId: 'flow-offload-row', inputId: 'flow-offload-select', badgeId: 'flow-offload-badge',
+-			name: _('Flow Offload'), enabled: flo.enabled, blocked: false, callFn: callSetFlowOffload })
++			name: _('Flow Offload'), enabled: flo.enabled, blocked: isHardwareFlowOffloadBlocked(mode), blockedLabel: blockLabel, blockReason: blockReason, callFn: callSetFlowOffload })
+ 	];
+ 	if (bridge) {
+ 		controls.unshift(renderOffloadSwitch({ rowId: 'vlan-offload-row', inputId: 'vlan-offload-select', badgeId: 'vlan-offload-badge',
+-			name: _('VLAN Offload'), enabled: vo.enabled, blocked: blocked, callFn: callSetVlanOffload }));
++			name: _('VLAN Offload'), enabled: vo.enabled, blocked: blocked, blockedLabel: blockLabel, blockReason: blockReason, callFn: callSetVlanOffload }));
+ 		controls.push(renderOffloadSwitch({ rowId: 'apmode-offload-row', inputId: 'apmode-offload-select', badgeId: 'apmode-offload-badge',
+-			name: _('AP Mode Acceleration'), enabled: apo.enabled, blocked: blocked, callFn: callSetApModeOffload }));
++			name: _('AP Mode Acceleration'), enabled: apo.enabled, blocked: blocked, blockedLabel: blockLabel, blockReason: blockReason, callFn: callSetApModeOffload }));
+ 	}
+ 	return E('div', { 'class': 'ai-offload-controls ai-grid' + (bridge ? ' ai-grid--3' : '') }, controls);
+ }
+ 
+-function updateOffloadControl(inputId, badgeId, rowId, enabled, blocked) {
++function updateOffloadControl(inputId, badgeId, rowId, enabled, blocked, blockLabel, blockReason) {
+ 	enabled = isEnabled(enabled);
+ 	blocked = isEnabled(blocked);
+ 	var input = document.getElementById(inputId);
+ 	if (input) {
+ 		input.setAttribute('data-blocked', blocked ? '1' : '0');
++		input.title = blocked ? blockReason || _('Use hardware flow offload in router mode') : '';
+ 		if (!input.matches(':focus')) input.checked = enabled;
+ 		input.disabled = blocked && !enabled;
+ 	}
+@@ -592,7 +650,7 @@ function updateOffloadControl(inputId, badgeId, rowId, enabled, blocked) {
+ 	}
+ 	var b = document.getElementById(badgeId);
+ 	if (b) {
+-		var state = offloadState(enabled, blocked);
++		var state = offloadState(enabled, blocked, blockLabel);
+ 		b.className = 'ai-pill' + (state.kind ? ' ai-pill--' + state.kind : '');
+ 		// Keep the leading dot; only the label text is swapped.
+ 		b.textContent = '';
+@@ -662,8 +720,9 @@ function renderWifiDetails(wifi, ppe, ti, st) {
+ 			retry > 50 ? { text: _('Poor'), kind: 'error' } :
+ 				retry > 20 ? { text: _('Fair'), kind: 'warn' } : { text: _('Good'), kind: 'ok' };
+ 		var txQueue = getTxQueue(ti, bd.band);
+-		var queueType = txQueue && txQueue.type ? String(txQueue.type).toUpperCase() :
+-			(isEnabled(st && st.npu_loaded) ? 'NPU' : 'DMA');
++		var queueType = st && st.wlan_npu_boot_enabled === false ? _('PCIe DMA') :
++			txQueue && txQueue.type ? String(txQueue.type).toUpperCase() :
++			wlanDmaState(st, ti).label;
+ 		var signal = (bd.stations || 0) > 0 ? (bd.avg_signal || 0) + ' / ' + (bd.min_signal || 0) : 'N/A';
+ 		return [
+ 			info.full,
+@@ -698,13 +757,16 @@ function renderWifiDetails(wifi, ppe, ti, st) {
+ }
+ 
+ /* ── NPU and PPE engine status ── */
+-function renderEngineStatus(st, ppe) {
++function renderEngineStatus(st, ppe, ti) {
+ 	st = st || {}; ppe = ppe || {};
+-	var npuActive = isEnabled(st.npu_loaded);
++	var platformLoaded = isEnabled(st.npu_platform_loaded);
++	var dma = wlanDmaState(st, ti);
+ 	var npuCard = aui.card({
+-		name: 'NPU', tag: npuActive ? 'ACTIVE' : 'OFF',
+-		accent: npuActive ? 'var(--ai-npu)' : 'var(--ds-border-strong)',
++		name: _('NPU Platform'), tag: platformLoaded ? 'READY' : 'UNAVAILABLE',
++		accent: platformLoaded ? 'var(--ai-npu)' : 'var(--ds-border-strong)',
+ 		body: [
++			aui.row(_('Wireless DMA Path'), dma.label),
++			aui.row(_('Wireless NPU Boot Policy'), dma.policy),
+ 			aui.row(_('Firmware / Clock / Cores'), (st.npu_version || 'Unknown') + ' · ' + (st.npu_clock ? Math.round(st.npu_clock / 1000000) + ' MHz' : 'N/A')),
+ 			aui.row('RISC-V', (st.npu_cores || 0) + ' ' + _('cores') + ' · PCIe RAM')
+ 		]
+@@ -917,8 +979,8 @@ return view.extend({
+ 				body: E('div', {}, [
+ 					renderSummary(st, ti),
+ 					E('div', { 'id': 'offload-controls', 'style': 'margin-top:var(--ds-sp-3)' },
+-						renderOffloadControls(topo, vo, flo, apo, bridgeBlocked)),
+-					E('div', { 'id': 'engine-status' }, renderEngineStatus(st, ppe))
++						renderOffloadControls(topo, vo, flo, apo, dm)),
++					E('div', { 'id': 'engine-status' }, renderEngineStatus(st, ppe, ti))
+ 				])
+ 			}),
+ 
+@@ -1009,19 +1071,19 @@ return view.extend({
+ 					}
+ 				}
+ 
+-				updateOffloadControl('vlan-offload-select', 'vlan-offload-badge', 'vlan-offload-row', vo.enabled, bridgeBlocked);
+-				updateOffloadControl('flow-offload-select', 'flow-offload-badge', 'flow-offload-row', flo.enabled, false);
+-				updateOffloadControl('apmode-offload-select', 'apmode-offload-badge', 'apmode-offload-row', apo.enabled, bridgeBlocked);
++				updateOffloadControl('vlan-offload-select', 'vlan-offload-badge', 'vlan-offload-row', vo.enabled, bridgeBlocked, offloadBlockLabel(dm), offloadBlockText(dm));
++				updateOffloadControl('flow-offload-select', 'flow-offload-badge', 'flow-offload-row', flo.enabled, isHardwareFlowOffloadBlocked(dm), offloadBlockLabel(dm), offloadBlockText(dm));
++				updateOffloadControl('apmode-offload-select', 'apmode-offload-badge', 'apmode-offload-row', apo.enabled, bridgeBlocked, offloadBlockLabel(dm), offloadBlockText(dm));
+ 
+ 				var controls = document.getElementById('offload-controls');
+-				var controlBoard = String(topo.compatible || '') + ':' + (vo.supported !== false && apo.supported !== false);
++				var controlBoard = String(topo.compatible || '') + ':' + (vo.supported !== false && apo.supported !== false) + ':' + String(dm.bridge_offload_block_reason || '');
+ 				if (controls && topo.compatible && controls.getAttribute('data-board') !== controlBoard) {
+-					controls.replaceChildren(renderOffloadControls(topo, vo, flo, apo, bridgeBlocked));
++					controls.replaceChildren(renderOffloadControls(topo, vo, flo, apo, dm));
+ 					controls.setAttribute('data-board', controlBoard);
+ 				}
+ 
+ 				var engineEl = document.getElementById('engine-status');
+-				if (engineEl) engineEl.replaceChildren(renderEngineStatus(st, ppe));
++				if (engineEl) engineEl.replaceChildren(renderEngineStatus(st, ppe, ti));
+ 				var epEl = document.getElementById('ethernet-ports');
+ 				if (epEl) { epEl.innerHTML = ''; epEl.appendChild(renderEthernetPorts(topo)); }
+ 				var wifiEl = document.getElementById('wifi-detail');
+--- a/luci-app-airoha-npu/po/zh_Hans/luci-app-airoha-npu.po
++++ b/luci-app-airoha-npu/po/zh_Hans/luci-app-airoha-npu.po
+@@ -743,3 +743,37 @@ msgstr "协商 / 预期速率"
+ 
+ msgid "Switches here apply the hardware offload settings for this device."
+ msgstr "此处开关用于应用本设备的硬件卸载设置。"
++
++
++msgid "Disabled by boot policy"
++msgstr "本次启动已禁止硬件转发"
++
++msgid "PPE forwarding is disabled for this boot; WLAN NPU DMA remains available."
++msgstr "本次启动已禁止 PPE 硬件转发；无线 NPU DMA 仍可用。"
++
++msgid "PPE forwarding is disabled for this boot; WLAN DMA policy is shown separately."
++msgstr "本次启动已关闭 PPE 硬件转发；无线 DMA 策略单独显示。"
++
++msgid "PPE bridge forwarding is disabled for this boot."
++msgstr "本次启动已关闭 PPE 桥接转发。"
++
++msgid "Bridge filtering requires software forwarding for this boot."
++msgstr "当前桥接过滤策略要求本次启动使用软件转发。"
++
++msgid "This kernel requires explicit forwarding rules; these switches cannot enable hardware bridge offload."
++msgstr "当前内核需要明确的转发规则；这些开关无法启用桥接硬件卸载。"
++
++msgid "Bridge forwarding policy is unavailable."
++msgstr "无法读取桥接转发策略。"
++
++msgid "Bridge disabled by boot policy"
++msgstr "启动策略已关闭桥接加速"
++
++msgid "Software forwarding required"
++msgstr "当前需要软件转发"
++
++msgid "Explicit forwarding rules required"
++msgstr "需要明确的转发规则"
++
++msgid "Forwarding policy unavailable"
++msgstr "转发策略不可用"
+--- a/luci-app-airoha-npu/root/usr/libexec/rpcd/luci.airoha_npu
++++ b/luci-app-airoha-npu/root/usr/libexec/rpcd/luci.airoha_npu
+@@ -22,28 +22,115 @@ _has_active_wan() {
+ 	[ -n "$l3_device$ipv4$ipv6" ]
+ }
+ 
++# Report the read-only boot binding policy separately from WLAN NPU DMA.
++# Older kernels do not expose the parameter; retain their existing behavior.
++_ppe_bind_policy() {
++	local value
++	value=$(cat /sys/module/airoha_eth/parameters/ppe_bind_enable 2>/dev/null)
++	case "$value" in
++	N|n|0) printf 'false' ;;
++	Y|y|1) printf 'true' ;;
++	*) printf 'null' ;;
++	esac
++}
++
++# WLAN attachment is a separate, read-only policy. Enabled permits attachment
++# but does not prove that a wireless device successfully attached to the NPU.
++_wlan_npu_boot_policy() {
++	local value
++	value=$(cat /sys/module/mt76/parameters/npu_enable 2>/dev/null)
++	case "$value" in
++	N|n|0) printf 'false' ;;
++	Y|y|1) printf 'true' ;;
++	*) printf 'null' ;;
++	esac
++}
++
++_ppe_binding_disabled() {
++	[ "$(_ppe_bind_policy)" = 'false' ]
++}
++
++# The explicit bridge-rule ABI is independent of global PPE permission.
++# Legacy sysctl switches do not publish the exact TC templates this ABI needs.
++_ppe_bool_file() {
++	local value
++	value=$(cat "$1" 2>/dev/null)
++	case "$value" in
++	N|n|0) printf 'false' ;;
++	Y|y|1) printf 'true' ;;
++	*) printf 'null' ;;
++	esac
++}
++
++_bridge_offload_reason() {
++	if _ppe_binding_disabled; then
++		printf 'ppe_boot_policy_disabled'
++	elif _has_active_wan; then
++		printf 'active_wan'
++	elif [ -e /sys/module/airoha_eth/parameters/ppe_bridge_bind_enable ]; then
++		case "$(_ppe_bool_file /sys/module/airoha_eth/parameters/ppe_bridge_bind_enable)" in
++		false) printf 'ppe_bridge_boot_policy_disabled'; return ;;
++		true) ;;
++		*) printf 'ppe_bridge_policy_unavailable'; return ;;
++		esac
++		case "$(_ppe_bool_file /sys/kernel/debug/ppe/xr_l2_netdev_policy_latched)" in
++		true) printf 'ppe_netdev_policy_latched'; return ;;
++		esac
++		case "$(_ppe_bool_file /sys/kernel/debug/ppe/xr_l2_policy_latched)" in
++		true) printf 'ppe_bridge_policy_latched' ;;
++		false) printf 'ppe_explicit_rules_required' ;;
++		*) printf 'ppe_bridge_policy_unavailable' ;;
++		esac
++	fi
++}
++
+ _bridge_offload_blocked() {
+-	_has_active_wan
++	[ -n "$(_bridge_offload_reason)" ]
+ }
+ 
+ _bridge_offload_block_error() {
+-	echo '{"error":"Bridge VLAN-tag / PPPoE-passthrough / AP-mode offload is disabled while WAN is active; use Hardware Flow Offload in router mode"}'
++	local reason message
++	reason=$(_bridge_offload_reason)
++	case "$reason" in
++	ppe_boot_policy_disabled) message='PPE forwarding is disabled for this boot; wireless DMA has a separate policy.' ;;
++	active_wan) message='Use hardware flow offload in router mode.' ;;
++	ppe_bridge_boot_policy_disabled) message='PPE bridge forwarding is disabled for this boot.' ;;
++	ppe_bridge_policy_latched) message='Bridge filtering requires software forwarding for this boot.' ;;
++	ppe_netdev_policy_latched) message='TC, XDP or device netfilter policy requires software forwarding for this boot.' ;;
++	ppe_explicit_rules_required) message='This kernel requires explicit forwarding rules; these switches cannot enable hardware bridge offload.' ;;
++	*) message='Bridge forwarding policy is unavailable.' ;;
++	esac
++	printf '{"error":"%s","reason":"%s"}' "$message" "$reason"
++}
++
++_ppe_disabled_status() {
++	printf '{"enabled":0,"policy_blocked":true,"reason":"ppe_boot_policy_disabled"}'
++}
++
++_bridge_disabled_status() {
++	printf '{"enabled":0,"policy_blocked":true,"reason":"%s"}' "$(_bridge_offload_reason)"
+ }
+ 
+ get_device_mode() {
+-	local dhcp_ignore
++	local mode='ap' reason='no_active_wan' blocked='false'
++	local binding hardware_blocked='false' block_reason='' bridge_binding latch netdev_latch
+ 
+ 	if _has_active_wan; then
+-		printf '{"mode":"router","reason":"active_wan","bridge_offload_blocked":true}'
+-		return
+-	fi
+-
+-	dhcp_ignore=$(uci get dhcp.lan.ignore 2>/dev/null)
+-	if [ "$dhcp_ignore" = "1" ]; then
+-		printf '{"mode":"ap","reason":"dhcp_disabled","bridge_offload_blocked":false}'
+-	else
+-		printf '{"mode":"ap","reason":"no_active_wan","bridge_offload_blocked":false}'
+-	fi
++		mode='router'
++		reason='active_wan'
++	elif [ "$(uci get dhcp.lan.ignore 2>/dev/null)" = '1' ]; then
++		reason='dhcp_disabled'
++	fi
++
++	binding=$(_ppe_bind_policy)
++	[ "$binding" = 'false' ] && hardware_blocked='true'
++	bridge_binding=$(_ppe_bool_file /sys/module/airoha_eth/parameters/ppe_bridge_bind_enable)
++	latch=$(_ppe_bool_file /sys/kernel/debug/ppe/xr_l2_policy_latched)
++	netdev_latch=$(_ppe_bool_file /sys/kernel/debug/ppe/xr_l2_netdev_policy_latched)
++	block_reason=$(_bridge_offload_reason)
++	[ -n "$block_reason" ] && blocked='true'
++	printf '{"mode":"%s","reason":"%s","bridge_offload_blocked":%s,"bridge_offload_block_reason":"%s","ppe_binding_enabled":%s,"hardware_flow_offload_blocked":%s,"ppe_bridge_binding_enabled":%s,"ppe_bridge_policy_latched":%s,"ppe_netdev_policy_latched":%s}' \
++		"$mode" "$reason" "$blocked" "$block_reason" "$binding" "$hardware_blocked" "$bridge_binding" "$latch" "$netdev_latch"
+ }
+ 
+ # Discover the active cpufreq policy dir (policy0 is not guaranteed to exist:
+@@ -104,6 +191,7 @@ _cpu_governor_allowed() {
+ get_status() {
+ 	# === NPU Status ===
+ 	local npu_ver=$(airoha_npu_version)
++	local wlan_npu_boot_enabled=$(_wlan_npu_boot_policy)
+ 
+ 	local npu_loaded="false"
+ 	local npu_device=""
+@@ -230,8 +318,8 @@ get_status() {
+ 	done
+ 	[ -n "$soc_compat" ] || soc_compat="Unknown"
+ 
+-	printf '{"npu_version":"%s","npu_loaded":%s,"npu_device":"%s","npu_clock":%d,"npu_cores":%d,"offload_bound":%d,"offload_total":%d,"memory_regions":%s,"cpu_cur_freq":%d,"cpu_hw_freq":%d,"cpu_governor":"%s","cpu_avail_governors":"%s","cpu_min_freq":%d,"cpu_max_freq":%d,"cpu_avail_freqs":"%s","cpu_cpufreq_available":%d,"cpu_cpufreq_reason":"%s","cpu_count":%d,"cpu_arch":"%s","cpu_temp":"%s","soc_compat":"%s","has_pon":%d}' \
+-		"${npu_ver:-Unknown}" "$npu_loaded" "${npu_device:-}" "${npu_clock:-0}" "${npu_cores:-0}" "${offload_bound:-0}" "${offload_total:-0}" "$regions" \
++	printf '{"npu_version":"%s","npu_loaded":%s,"npu_platform_loaded":%s,"wlan_npu_boot_enabled":%s,"npu_device":"%s","npu_clock":%d,"npu_cores":%d,"offload_bound":%d,"offload_total":%d,"memory_regions":%s,"cpu_cur_freq":%d,"cpu_hw_freq":%d,"cpu_governor":"%s","cpu_avail_governors":"%s","cpu_min_freq":%d,"cpu_max_freq":%d,"cpu_avail_freqs":"%s","cpu_cpufreq_available":%d,"cpu_cpufreq_reason":"%s","cpu_count":%d,"cpu_arch":"%s","cpu_temp":"%s","soc_compat":"%s","has_pon":%d}' \
++		"${npu_ver:-Unknown}" "$npu_loaded" "$npu_loaded" "$wlan_npu_boot_enabled" "${npu_device:-}" "${npu_clock:-0}" "${npu_cores:-0}" "${offload_bound:-0}" "${offload_total:-0}" "$regions" \
+ 		"${cpu_cur_freq:-0}" "${cpu_hw_freq:-0}" "${cpu_governor:-unknown}" "${cpu_avail_governors:-}" "${cpu_min_freq:-0}" "${cpu_max_freq:-0}" "${cpu_avail_freqs:-}" "${cpu_cpufreq_available:-0}" "${cpu_cpufreq_reason:-no_cpufreq}" "${cpu_count:-0}" \
+ 		"${cpu_arch:-}" "${cpu_temp:-N/A}" "${soc_compat:-}" "${has_pon:-0}"
+ }
+@@ -258,6 +346,9 @@ get_ppe_entries() {
+ get_token_info() {
+ 	local token_file="/sys/kernel/debug/ieee80211/phy0/mt76/token_info"
+ 	local has_wifi; has_wifi=$(airoha_has_wifi)
++	local wlan_npu_boot_enabled=$(_wlan_npu_boot_policy)
++	local missing_active=null
++	[ "$wlan_npu_boot_enabled" = false ] && missing_active=false
+ 
+ 	# Gather per-band WiFi station stats (count, retries, failures)
+ 	local sta_json="" band
+@@ -278,17 +369,18 @@ get_token_info() {
+ 	done
+ 
+ 	if [ ! -f "$token_file" ]; then
+-		printf '{"token_count":0,"token_size":0,"npu_active":false,"tx_queues":[],"station_counts":[%s],"has_wifi":%s}' "$sta_json" "$has_wifi"
++		printf '{"token_info_available":false,"token_count":0,"token_size":0,"npu_active":%s,"tx_queues":[],"station_counts":[%s],"has_wifi":%s}' "$missing_active" "$sta_json" "$has_wifi"
+ 		return
+ 	fi
+ 
+-	awk -v stations="$sta_json" -v hw="$has_wifi" '
++	awk -v stations="$sta_json" -v hw="$has_wifi" -v boot="$wlan_npu_boot_enabled" '
+ 	BEGIN {
+-		tc=0; ts=0; npu=0
++		tc=0; ts=0; npu="null"
+ 		tq_n=0
+ 	}
+ 	/^  token_count:/ { tc=$2+0; ts=$4+0 }
+-	/status:.*active/ { npu=1 }
++	/status:[[:space:]]*active([[:space:]]|$)/ { npu="true" }
++	/status:[[:space:]]*inactive([[:space:]]|$)/ { npu="false" }
+ 	/band [0-9]/ {
+ 		gsub(/\|/, " ")
+ 		for(i=1;i<=NF;i++) {
+@@ -304,8 +396,9 @@ get_token_info() {
+ 		tq_n++
+ 	}
+ 	END {
+-		printf "{\"token_count\":%d,\"token_size\":%d,\"npu_active\":%s,\"tx_queues\":[", \
+-			tc, ts, (npu?"true":"false")
++		if (boot=="false") npu="false"
++		printf "{\"token_info_available\":true,\"token_count\":%d,\"token_size\":%d,\"npu_active\":%s,\"tx_queues\":[", \
++			tc, ts, npu
+ 
+ 		for(i=0;i<tq_n;i++) {
+ 			if(i>0) printf ","
+@@ -315,7 +408,7 @@ get_token_info() {
+ 
+ 		printf "],\"station_counts\":[%s],\"has_wifi\":%s}", stations, hw
+ 	}
+-	' "$token_file" 2>/dev/null || printf '{"token_count":0,"token_size":0,"npu_active":false,"tx_queues":[],"station_counts":[%s],"has_wifi":%s}' "$sta_json" "$has_wifi"
++	' "$token_file" 2>/dev/null || printf '{"token_info_available":false,"token_count":0,"token_size":0,"npu_active":%s,"tx_queues":[],"station_counts":[%s],"has_wifi":%s}' "$missing_active" "$sta_json" "$has_wifi"
+ }
+ 
+ # Persist CPU governor / max_freq to UCI so the choice survives a reboot.
+@@ -463,6 +556,10 @@ get_vlan_offload() {
+ 		echo '{"supported":false,"enabled":0}'
+ 		return
+ 	}
++	if _bridge_offload_blocked; then
++		_bridge_disabled_status
++		return
++	fi
+ 	local tagged indev
+ 	# Mirror of this pair's owner semantics (set_vlan_offload): the two keys
+ 	# are one unit, so enabled is reported only when BOTH read 1.
+@@ -512,6 +609,10 @@ set_vlan_offload() {
+ }
+ 
+ get_pppoe_offload() {
++	if _bridge_offload_blocked; then
++		_bridge_disabled_status
++		return
++	fi
+ 	local val
+ 	# Use bridge-nf-filter-pppoe-tagged sysctl.
+ 	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null)
+@@ -552,6 +653,10 @@ set_pppoe_offload() {
+ }
+ 
+ get_flow_offload() {
++	if _ppe_binding_disabled; then
++		_ppe_disabled_status
++		return
++	fi
+ 	# Check the persisted UCI configuration.
+ 	local fo foh
+ 	fo=$(uci get firewall.@defaults[0].flow_offloading 2>/dev/null)
+@@ -571,6 +676,10 @@ set_flow_offload() {
+ 		echo '{"error":"enabled must be 0 or 1"}'
+ 		return
+ 	fi
++	if [ "$enabled" = "1" ] && _ppe_binding_disabled; then
++		_bridge_offload_block_error
++		return
++	fi
+ 	# Set both flow_offloading and flow_offloading_hw.
+ 	uci set firewall.@defaults[0].flow_offloading="$enabled" 2>/dev/null
+ 	uci set firewall.@defaults[0].flow_offloading_hw="$enabled" 2>/dev/null
+@@ -585,6 +694,10 @@ get_apmode_offload() {
+ 		echo '{"supported":false,"enabled":0}'
+ 		return
+ 	}
++	if _bridge_offload_blocked; then
++		_bridge_disabled_status
++		return
++	fi
+ 	local ipt ip6t arp filter_pppoe_tagged
+ 
+ 	# Mirrors set_apmode_offload(). Keep these four keys synchronized:

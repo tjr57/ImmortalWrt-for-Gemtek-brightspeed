@@ -1,0 +1,64 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -52,6 +52,20 @@
+ module_param_named(ppe_bind_enable, ppe_bind_enable, bool, 0400);
+ MODULE_PARM_DESC(ppe_bind_enable,
+                 "Allow PPE forwarding bindings (boot-only; NPU WLAN DMA remains available)");
++
++/* AP39 hardware evidence: an IPv4 bridge subflow remains BND when the
++ * same five-tuple changes DSCP/ECN, and rewrites every packet to IB2_DSCP.
++ * Copying the triggering DS byte, or rejecting only ECN triggers, cannot
++ * preserve later packets (including CE). Native L2B/IPv6 preservation has
++ * not been qualified either. No currently supported bridge format has a
++ * proven per-packet preserve or complete-DS-field match/trap mechanism.
++ * Keep the control-plane templates inert until such a mechanism is added
++ * and verified. This is a driver capability, not a writable policy bypass.
++ */
++static bool airoha_ppe_l2_dsfield_preserved(void)
++{
++	return false;
++}
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+ 	.head_offset = offsetof(struct airoha_flow_table_entry, node),
+@@ -1383,6 +1397,10 @@
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+ 	int type;
++
++	/* Covers both boot-enabled and kernel-timed bridge binding paths. */
++	if (!airoha_ppe_l2_dsfield_preserved())
++		return -EOPNOTSUPP;
+ 
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe_p)
+@@ -2644,6 +2662,7 @@
+ 	XR_PPE_L2_A_TRIAL_STATE,	/* u8: 0 never, 1 active, 2 ended */
+ 	XR_PPE_L2_A_TRIAL_REMAINING_MS,	/* u32 */
+ 	XR_PPE_L2_A_TRIAL_INVALIDATED,	/* u32, bound FOE entries cleared */
++	XR_PPE_L2_A_DSFIELD_PRESERVED,	/* u8: verified bridge capability */
+ 	__XR_PPE_L2_A_MAX,
+ };
+ #define XR_PPE_L2_A_MAX (__XR_PPE_L2_A_MAX - 1)
+@@ -2712,7 +2731,9 @@
+ 	    nla_put_u32(skb, XR_PPE_L2_A_ENTRIES, ppe->xr_pub_count) ||
+ 	    nla_put_u8(skb, XR_PPE_L2_A_TRIAL_STATE, trial) ||
+ 	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_REMAINING_MS, remaining) ||
+-	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_INVALIDATED, invalidated))
++	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_INVALIDATED, invalidated) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_DSFIELD_PRESERVED,
++		       airoha_ppe_l2_dsfield_preserved()))
+ 		return -EMSGSIZE;
+ 	return 0;
+ }
+@@ -3000,6 +3021,10 @@
+ 
+ 	if (GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_TRIAL_SECONDS))
+ 		return -EINVAL;
++	if (!airoha_ppe_l2_dsfield_preserved()) {
++		NL_SET_ERR_MSG(info->extack, "bridge PPE cannot preserve per-packet DSCP/ECN; software forwarding required");
++		return -EOPNOTSUPP;
++	}
+ 	if (ppe_bind_enable) {
+ 		NL_SET_ERR_MSG(info->extack, "boot permission already enables PPE binding");
+ 		return -EINVAL;

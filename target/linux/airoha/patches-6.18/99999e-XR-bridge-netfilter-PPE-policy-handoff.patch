@@ -1,0 +1,185 @@
+Subject: [PATCH] XR: revoke L2 PPE before bridge netfilter policy publication
+
+Preserve native connection-specific flowtable path; never bypass an unrepresented
+bridge policy. Both PPE opt-ins remain disabled.
+
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -14,8 +14,22 @@
+ #include <linux/module.h>
+ #include <linux/netfilter_defs.h>
+ #include <linux/netdevice.h>
++#include <linux/notifier.h>
+ #include <linux/sockptr.h>
+ #include <net/net_namespace.h>
++
++/* Hardware L2 caches must be revoked before a bridge policy hook becomes
++ * visible. This notifier carries no rules/packets and never rejects a hook.
++ */
++#if IS_ENABLED(CONFIG_NETFILTER)
++int nf_bridge_policy_notifier_register(struct notifier_block *nb);
++void nf_bridge_policy_notifier_unregister(struct notifier_block *nb);
++bool nf_bridge_policy_hooks_present(void);
++#else
++static inline int nf_bridge_policy_notifier_register(struct notifier_block *nb) { return 0; }
++static inline void nf_bridge_policy_notifier_unregister(struct notifier_block *nb) {}
++static inline bool nf_bridge_policy_hooks_present(void) { return false; }
++#endif
+ 
+ static inline int NF_DROP_GETERR(int verdict)
+ {
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -44,6 +44,41 @@
+ #define nf_entry_dereference(e) \
+ 	rcu_dereference_protected(e, lockdep_is_held(&nf_hook_mutex))
+ 
++static BLOCKING_NOTIFIER_HEAD(nf_bridge_policy_chain);
++
++int nf_bridge_policy_notifier_register(struct notifier_block *nb)
++{
++ return blocking_notifier_chain_register(&nf_bridge_policy_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_bridge_policy_notifier_register);
++
++void nf_bridge_policy_notifier_unregister(struct notifier_block *nb)
++{
++ blocking_notifier_chain_unregister(&nf_bridge_policy_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_bridge_policy_notifier_unregister);
++
++bool nf_bridge_policy_hooks_present(void)
++{
++#if IS_ENABLED(CONFIG_NETFILTER_FAMILY_BRIDGE)
++ struct net *net;
++ int i;
++ bool present = false;
++ rcu_read_lock();
++ for_each_net_rcu(net) {
++  for (i = 0; i < ARRAY_SIZE(net->nf.hooks_bridge); i++) {
++   if (rcu_access_pointer(net->nf.hooks_bridge[i])) { present = true; break; }
++  }
++  if (present) break;
++ }
++ rcu_read_unlock();
++ return present;
++#else
++ return false;
++#endif
++}
++EXPORT_SYMBOL_GPL(nf_bridge_policy_hooks_present);
++
+ static struct nf_hook_entries *allocate_hook_entries_size(u16 num)
+ {
+ 	struct nf_hook_entries *e;
+@@ -433,6 +468,12 @@
+ 
+ 	if (!IS_ERR(new_hooks)) {
+ 		hooks_validate(new_hooks);
++		/* Called before publication: a driver latches software-only state
++		 * and removes existing L2 flows under its cache lock. A simultaneous
++		 * bind cannot slip between invalidation and policy publication.
++		 */
++		if (pf == NFPROTO_BRIDGE)
++			blocking_notifier_call_chain(&nf_bridge_policy_chain, 0, NULL);
+ 		rcu_assign_pointer(*pp, new_hooks);
+ 	}
+ 
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -732,6 +732,8 @@
+ 	struct rhashtable l2_flows;
+ 	struct list_head l2_templates;
+ 	struct notifier_block l2_netdev_nb;
++	struct notifier_block l2_policy_nb;
++	bool l2_policy_latched;
+ 	struct notifier_block l2_switchdev_nb;
+ 	struct notifier_block l2_switchdev_atomic_nb;
+ 	u64 l2_invalidations;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -21,6 +21,7 @@
+ #include <net/switchdev.h>
+ 
+ #include "airoha_regs.h"
++#include <linux/netfilter.h>
+ #include "airoha_eth.h"
+ 
+ /* Serialize airoha_gdm_dev flags, QDMA pointer and PPE CPU port
+@@ -1210,6 +1211,27 @@
+ 		ppe->l2_invalidations++;
+ 	}
+ 	spin_unlock_bh(&ppe_lock);
++}
++
++/* Any bridge filtering policy requires software inspection unless a
++ * connection-specific netfilter flow rule can represent it. MAC-only bridge
++ * templates cannot express arbitrary IP/port/set/mark policies. Revocation is
++ * conservative across namespaces and remains latched until the next probe;
++ * removing a hook never silently reauthorizes a revoked hardware cache.
++ */
++static int airoha_ppe_l2_policy_event(struct notifier_block *nb,
++                                    unsigned long event, void *ptr)
++{
++ struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, l2_policy_nb);
++ struct airoha_flow_table_entry *e, *tmp;
++ spin_lock_bh(&ppe_lock);
++ ppe->l2_policy_latched = true;
++ list_for_each_entry_safe(e, tmp, &ppe->l2_templates, l2_gc_node) {
++  airoha_ppe_foe_remove_l2_flow(ppe, e);
++  ppe->l2_invalidations++;
++ }
++ spin_unlock_bh(&ppe_lock);
++ return NOTIFY_OK;
+ }
+ 
+ static int airoha_ppe_l2_netdev_event(struct notifier_block *nb,
+@@ -1576,7 +1598,7 @@
+ 		goto unlock;
+ 
+ l2_lookup:
+-	if (!bridge_eligible)
++	if (ppe->l2_policy_latched || !bridge_eligible)
+ 		goto unlock;
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &key,
+ 				   airoha_l2_flow_table_params);
+@@ -1597,6 +1619,10 @@
+ 	e->type = FLOW_TYPE_L2;
+ 	INIT_LIST_HEAD(&e->l2_gc_node);
+ 	spin_lock_bh(&ppe_lock);
++	if (ppe->l2_policy_latched) {
++		spin_unlock_bh(&ppe_lock);
++		return -EOPNOTSUPP;
++	}
+ 	prev = rhashtable_lookup_get_insert_fast(&ppe->l2_flows, &e->l2_node,
+ 					 airoha_l2_flow_table_params);
+ 	if (prev) {
+@@ -2455,6 +2481,20 @@
+ 		debugfs_remove(ppe->debugfs_dir);
+ 		goto error_l2_flow_table_destroy;
+ 	}
++	ppe->l2_policy_nb.notifier_call = airoha_ppe_l2_policy_event;
++	err = nf_bridge_policy_notifier_register(&ppe->l2_policy_nb);
++	if (err) {
++		unregister_switchdev_notifier(&ppe->l2_switchdev_atomic_nb);
++		unregister_switchdev_blocking_notifier(&ppe->l2_switchdev_nb);
++		unregister_netdevice_notifier(&ppe->l2_netdev_nb);
++		debugfs_remove(ppe->debugfs_dir);
++		goto error_l2_flow_table_destroy;
++	}
++	/* Register first, then scan. A racing callback may only latch true. */
++	if (nf_bridge_policy_hooks_present())
++		airoha_ppe_l2_policy_event(&ppe->l2_policy_nb, 0, NULL);
++	debugfs_create_bool("xr_l2_policy_latched", 0400, ppe->debugfs_dir,
++			    &ppe->l2_policy_latched);
+ 	debugfs_create_u64("xr_l2_invalidations", 0400, ppe->debugfs_dir,
+ 			   &ppe->l2_invalidations);
+ 	return 0;
+@@ -2471,6 +2511,7 @@
+ {
+ 	struct airoha_npu *npu;
+ 
++	nf_bridge_policy_notifier_unregister(&eth->ppe->l2_policy_nb);
+ 	unregister_switchdev_notifier(&eth->ppe->l2_switchdev_atomic_nb);
+ 	unregister_switchdev_blocking_notifier(&eth->ppe->l2_switchdev_nb);
+ 	unregister_netdevice_notifier(&eth->ppe->l2_netdev_nb);

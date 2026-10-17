@@ -1,0 +1,38 @@
+{
+  "at": "2026-10-11T01:03:29.774085+08:00",
+  "passed": true,
+  "checks": [
+    {
+      "unit": 1,
+      "passed": true,
+      "returnCode": 0,
+      "summary": "30 packets transmitted, 30 packets received, 0% packet loss",
+      "stdout": "PING 192.168.10.4 (192.168.10.4): 1400 data bytes\n1408 bytes from 192.168.10.4: seq=0 ttl=64 time=1.496 ms\n1408 bytes from 192.168.10.4: seq=1 ttl=64 time=1.462 ms\n1408 bytes from 192.168.10.4: seq=2 ttl=64 time=1.475 ms\n1408 bytes from 192.168.10.4: seq=3 ttl=64 time=1.457 ms\n1408 bytes from 192.168.10.4: seq=4 ttl=64 time=1.511 ms\n1408 bytes from 192.168.10.4: seq=5 ttl=64 time=1.492 ms\n1408 bytes from 192.168.10.4: seq=6 ttl=64 time=1.808 ms\n1408 bytes from 192.168.10.4: seq=7 ttl=64 time=1.600 ms\n1408 bytes from 192.168.10.4: seq=8 ttl=64 time=1.602 ms\n1408 bytes from 192.168.10.4: seq=9 ttl=64 time=1.595 ms\n1408 bytes from 192.168.10.4: seq=10 ttl=64 time=2.370 ms\n1408 bytes from 192.168.10.4: seq=11 ttl=64 time=1.521 ms\n1408 bytes from 192.168.10.4: seq=12 ttl=64 time=1.550 ms\n1408 bytes from 192.168.10.4: seq=13 ttl=64 time=1.523 ms\n1408 bytes from 192.168.10.4: seq=14 ttl=64 time=1.531 ms\n1408 bytes from 192.168.10.4: seq=15 ttl=64 time=2.069 ms\n1408 bytes from 192.168.10.4: seq=16 ttl=64 time=1.625 ms\n1408 bytes from 192.168.10.4: seq=17 ttl=64 time=3.102 ms\n1408 bytes from 192.168.10.4: seq=18 ttl=64 time=1.795 ms\n1408 bytes from 192.168.10.4: seq=19 ttl=64 time=2.002 ms\n1408 bytes from 192.168.10.4: seq=20 ttl=64 time=1.523 ms\n1408 bytes from 192.168.10.4: seq=21 ttl=64 time=1.556 ms\n1408 bytes from 192.168.10.4: seq=22 ttl=64 time=2.385 ms\n1408 bytes from 192.168.10.4: seq=23 ttl=64 time=1.549 ms\n1408 bytes from 192.168.10.4: seq=24 ttl=64 time=1.495 ms\n1408 bytes from 192.168.10.4: seq=25 ttl=64 time=1.482 ms\n1408 bytes from 192.168.10.4: seq=26 ttl=64 time=1.485 ms\n1408 bytes from 192.168.10.4: seq=27 ttl=64 time=1.526 ms\n1408 bytes from 192.168.10.4: seq=28 ttl=64 time=1.572 ms\n1408 bytes from 192.168.10.4: seq=29 ttl=64 time=2.692 ms\n\n--- 192.168.10.4 ping statistics ---\n30 packets transmitted, 30 packets received, 0% packet loss\nround-trip min/avg/max = 1.457/1.728/3.102 ms\n",
+      "stderr": "",
+      "bootID": "04d79dd7-776d-4067-8662-6ef2fbbe6e32"
+    },
+    {
+      "unit": 2,
+      "passed": true,
+      "returnCode": 0,
+      "summary": "30 packets transmitted, 30 packets received, 0% packet loss",
+      "stdout": "PING 192.168.10.3 (192.168.10.3): 1400 data bytes\n1408 bytes from 192.168.10.3: seq=0 ttl=64 time=1.311 ms\n1408 bytes from 192.168.10.3: seq=1 ttl=64 time=1.338 ms\n1408 bytes from 192.168.10.3: seq=2 ttl=64 time=1.418 ms\n1408 bytes from 192.168.10.3: seq=3 ttl=64 time=1.432 ms\n1408 bytes from 192.168.10.3: seq=4 ttl=64 time=1.353 ms\n1408 bytes from 192.168.10.3: seq=5 ttl=64 time=1.335 ms\n1408 bytes from 192.168.10.3: seq=6 ttl=64 time=1.445 ms\n1408 bytes from 192.168.10.3: seq=7 ttl=64 time=1.362 ms\n1408 bytes from 192.168.10.3: seq=8 ttl=64 time=1.804 ms\n1408 bytes from 192.168.10.3: seq=9 ttl=64 time=1.333 ms\n1408 bytes from 192.168.10.3: seq=10 ttl=64 time=1.390 ms\n1408 bytes from 192.168.10.3: seq=11 ttl=64 time=1.395 ms\n1408 bytes from 192.168.10.3: seq=12 ttl=64 time=1.404 ms\n1408 bytes from 192.168.10.3: seq=13 ttl=64 time=1.494 ms\n1408 bytes from 192.168.10.3: seq=14 ttl=64 time=1.401 ms\n1408 bytes from 192.168.10.3: seq=15 ttl=64 time=5.837 ms\n1408 bytes from 192.168.10.3: seq=16 ttl=64 time=2.517 ms\n1408 bytes from 192.168.10.3: seq=17 ttl=64 time=1.427 ms\n1408 bytes from 192.168.10.3: seq=18 ttl=64 time=1.314 ms\n1408 bytes from 192.168.10.3: seq=19 ttl=64 time=1.399 ms\n1408 bytes from 192.168.10.3: seq=20 ttl=64 time=1.410 ms\n1408 bytes from 192.168.10.3: seq=21 ttl=64 time=1.401 ms\n1408 bytes from 192.168.10.3: seq=22 ttl=64 time=1.368 ms\n1408 bytes from 192.168.10.3: seq=23 ttl=64 time=1.439 ms\n1408 bytes from 192.168.10.3: seq=24 ttl=64 time=1.420 ms\n1408 bytes from 192.168.10.3: seq=25 ttl=64 time=1.433 ms\n1408 bytes from 192.168.10.3: seq=26 ttl=64 time=1.400 ms\n1408 bytes from 192.168.10.3: seq=27 ttl=64 time=1.357 ms\n1408 bytes from 192.168.10.3: seq=28 ttl=64 time=2.295 ms\n1408 bytes from 192.168.10.3: seq=29 ttl=64 time=1.396 ms\n\n--- 192.168.10.3 ping statistics ---\n30 packets transmitted, 30 packets received, 0% packet loss\nround-trip min/avg/max = 1.311/1.620/5.837 ms\n",
+      "stderr": "",
+      "bootID": "d1faf374-1040-43fb-8f0c-d0afcb8847a4"
+    },
+    {
+      "source": "wired Windows PC",
+      "destination": "AP2 through AP1/Mesh",
+      "passed": true,
+      "returnCode": 0,
+      "stdout": "\r\nPinging 192.168.10.4 with 1400 bytes of data:\r\nReply from 192.168.10.4: bytes=1400 time=5ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=1ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=1ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=1ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=2ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=1ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=1ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=4ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=1ms TTL=64\r\nReply from 192.168.10.4: bytes=1400 time=2ms TTL=64\r\n\r\nPing statistics for 192.168.10.4:\r\n    Packets: Sent = 10, Received = 10, Lost = 0 (0% loss),\r\nApproximate round trip times in milli-seconds:\r\n    Minimum = 1ms, Maximum = 5ms, Average = 1ms\r\n"
+    }
+  ],
+  "payloadSize": 1400,
+  "APProbeCountEach": 30,
+  "PCProbeCount": 10,
+  "NpuPpeEnabled": false,
+  "configurationChanged": false,
+  "rawPacketCapture": false,
+  "throughputOrLongTermAcceptance": false
+}

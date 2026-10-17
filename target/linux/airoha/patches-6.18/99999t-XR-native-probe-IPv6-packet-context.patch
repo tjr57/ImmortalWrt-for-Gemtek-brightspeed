@@ -1,0 +1,67 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1522,6 +1522,8 @@
+ 	struct net_device *master;
+ 	const struct ethhdr *eh;
+ 	const struct iphdr *iph;
++	const struct ipv6hdr *ip6h;
++	__be16 network_proto;
+ 	const struct vlan_ethhdr *veh;
+ 	u16 vid = 0, proto = ETH_P_8021Q;
+ 	unsigned int offset = ETH_HLEN;
+@@ -1536,6 +1538,7 @@
+ 	if ((u8 *)eh < skb->head || (u8 *)(eh + 1) > skb_tail_pointer(skb) ||
+ 	    !is_valid_ether_addr(eh->h_source) || !is_valid_ether_addr(eh->h_dest))
+ 		return false;
++	network_proto = eh->h_proto;
+ 	if (eth_type_vlan(eh->h_proto)) {
+ 		if (skb_vlan_tag_present(skb) || is_vlan_dev(skb->dev) ||
+ 		    eh->h_proto != htons(ETH_P_8021Q) ||
+@@ -1544,11 +1547,8 @@
+ 		veh = (const void *)eh;
+ 		vid = ntohs(veh->h_vlan_TCI) & VLAN_VID_MASK;
+ 		tagged = true;
+-		if (veh->h_vlan_encapsulated_proto != htons(ETH_P_IP))
+-			return false;
++		network_proto = veh->h_vlan_encapsulated_proto;
+ 		offset = VLAN_ETH_HLEN;
+-	} else if (eh->h_proto != htons(ETH_P_IP)) {
+-		return false;
+ 	} else if (skb_vlan_tag_present(skb)) {
+ 		if (is_vlan_dev(skb->dev) || skb->vlan_proto != htons(ETH_P_8021Q))
+ 			return false;
+@@ -1561,12 +1561,29 @@
+ 	}
+ 	if (tagged && (!vid || vid >= VLAN_VID_MASK))
+ 		return false;
+-	iph = (const void *)((const u8 *)eh + offset);
+-	if ((u8 *)(iph + 1) > skb_tail_pointer(skb) || iph->version != 4 ||
+-	    iph->ihl < 5 || (u8 *)iph + iph->ihl * 4 > skb_tail_pointer(skb) ||
+-	    ip_is_fragment(iph) ||
+-	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
++	if (network_proto == htons(ETH_P_IP)) {
++		iph = (const void *)((const u8 *)eh + offset);
++		if ((u8 *)(iph + 1) > skb_tail_pointer(skb) || iph->version != 4 ||
++		    iph->ihl < 5 || (u8 *)iph + iph->ihl * 4 > skb_tail_pointer(skb) ||
++		    ip_is_fragment(iph) ||
++		    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
++			return false;
++	} else if (network_proto == htons(ETH_P_IPV6)) {
++		/* AP45 admitted only IPv4 before looking up an L2 template.
++		 * Keep IPv6 opt-in diagnostic-only until ASIC preservation is
++		 * measured. Fragment/extension headers and jumbograms fall back.
++		 * This selects a key, never authorizes a binding by itself.
++		 */
++		if (!READ_ONCE(xr_trial_native_l2) || !READ_ONCE(xr_trial_active))
++			return false;
++		ip6h = (const void *)((const u8 *)eh + offset);
++		if ((u8 *)(ip6h + 1) > skb_tail_pointer(skb) || ip6h->version != 6 ||
++		    (ip6h->nexthdr != IPPROTO_TCP && ip6h->nexthdr != IPPROTO_UDP) ||
++		    ntohs(ip6h->payload_len) < (ip6h->nexthdr == IPPROTO_TCP ? 20 : 8))
++			return false;
++	} else {
+ 		return false;
++	}
+ 	rcu_read_lock();
+ 	master = airoha_ppe_foe_get_bridge_master_rcu(skb->dev);
+ 	if (!master)

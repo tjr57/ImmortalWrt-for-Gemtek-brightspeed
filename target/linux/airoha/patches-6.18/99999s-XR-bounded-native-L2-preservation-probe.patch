@@ -1,0 +1,246 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -51,6 +51,8 @@
+ static bool xr_trial_active;
+ /* Classification window never grants data-plane binding permission. */
+ static bool xr_trial_classify_only;
++/* Diagnostic native L2 only; never a verified preservation capability. */
++static bool xr_trial_native_l2;
+ module_param_named(ppe_bind_enable, ppe_bind_enable, bool, 0400);
+ MODULE_PARM_DESC(ppe_bind_enable,
+                 "Allow PPE forwarding bindings (boot-only; NPU WLAN DMA remains available)");
+@@ -951,6 +953,13 @@
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, e->ib1) == AIROHA_FOE_STATE_BIND)
+ 		return -EOPNOTSUPP;
+ 
++	if (READ_ONCE(xr_trial_native_l2) &&
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, e->ib1) == AIROHA_FOE_STATE_BIND &&
++	    (!airoha_is_7581(eth) ||
++	     FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->ib1) != PPE_PKT_TYPE_BRIDGE ||
++	     FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) != PPE_PKT_TYPE_BRIDGE))
++		return -EOPNOTSUPP;
++
+ 	if (airoha_is_7581(eth) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
+ 	    PPE_PKT_TYPE_BRIDGE &&
+@@ -1401,7 +1410,8 @@
+ 	int type;
+ 
+ 	/* Covers both boot-enabled and kernel-timed bridge binding paths. */
+-	if (!airoha_ppe_l2_dsfield_preserved())
++	if (!airoha_ppe_l2_dsfield_preserved() &&
++	    !(xr_trial_native_l2 && xr_trial_active))
+ 		return -EOPNOTSUPP;
+ 
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
+@@ -1412,6 +1422,9 @@
+ 	hwe.ib1 = (hwe.ib1 & mask) | (bridge->ib1 & ~mask);
+ 
+ 	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1);
++	if (!airoha_ppe_l2_dsfield_preserved() &&
++	    (!airoha_is_7581(ppe->eth) || type != PPE_PKT_TYPE_BRIDGE))
++		return -EOPNOTSUPP;
+ 	if (airoha_is_7581(ppe->eth) && type == PPE_PKT_TYPE_BRIDGE) {
+ 		/* Preserve the hardware-learned ingress key, including source MAC. */
+ 		hwe.l2b.data = bridge->bridge.data;
+@@ -2638,6 +2651,7 @@
+ 	XR_PPE_L2_CMD_TRIAL_ARM,
+ 	XR_PPE_L2_CMD_TRIAL_STOP,
+ 	XR_PPE_L2_CMD_CLASSIFY_ARM,
++	XR_PPE_L2_CMD_NATIVE_ARM,
+ };
+ 
+ enum {
+@@ -2667,6 +2681,7 @@
+ 	XR_PPE_L2_A_TRIAL_INVALIDATED,	/* u32, bound FOE entries cleared */
+ 	XR_PPE_L2_A_DSFIELD_PRESERVED,	/* u8: verified bridge capability */
+ 	XR_PPE_L2_A_CLASSIFY_ONLY,	/* u8: diagnostic window, binding stays off */
++	XR_PPE_L2_A_NATIVE_PROBE, /* diagnostic permission, not preservation proof */
+ 	__XR_PPE_L2_A_MAX,
+ };
+ #define XR_PPE_L2_A_MAX (__XR_PPE_L2_A_MAX - 1)
+@@ -2710,7 +2725,7 @@
+ static int airoha_xr_put_state(struct sk_buff *skb, struct airoha_ppe *ppe)
+ {
+ 	u32 writers, remaining = 0, invalidated;
+-	bool nf, netdev, classify;
++	bool nf, netdev, classify, native;
+ 	u8 trial;
+ 	u64 gen;
+ 
+@@ -2721,6 +2736,7 @@
+ 	netdev = ppe->l2_netdev_policy_latched;
+ 	trial = ppe->xr_trial_state;
+ 	classify = xr_trial_classify_only;
++	native = xr_trial_native_l2;
+ 	invalidated = ppe->xr_trial_invalidated;
+ 	if (trial == 1 && time_before(jiffies, ppe->xr_trial_deadline))
+ 		remaining = jiffies_to_msecs(ppe->xr_trial_deadline - jiffies);
+@@ -2736,6 +2752,7 @@
+ 	    nla_put_u32(skb, XR_PPE_L2_A_ENTRIES, ppe->xr_pub_count) ||
+ 	    nla_put_u8(skb, XR_PPE_L2_A_TRIAL_STATE, trial) ||
+ 	    nla_put_u8(skb, XR_PPE_L2_A_CLASSIFY_ONLY, classify) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_NATIVE_PROBE, native) ||
+ 	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_REMAINING_MS, remaining) ||
+ 	    nla_put_u32(skb, XR_PPE_L2_A_TRIAL_INVALIDATED, invalidated) ||
+ 	    nla_put_u8(skb, XR_PPE_L2_A_DSFIELD_PRESERVED,
+@@ -2970,6 +2987,51 @@
+ 	return skb->len;
+ }
+ 
++/* Diagnostic profile established by AP44 on the exact EN7581 firmware.
++ * Only EtherType blacklist slots 3/4 change. This is not an assertion of
++ * per-packet preservation and is never selected by ordinary trial-arm.
++ */
++static int airoha_xr_native_profile(struct airoha_ppe *ppe, bool enable)
++{
++	struct airoha_eth *eth = ppe->eth;
++	unsigned int i;
++
++	lockdep_assert_held(&ppe_lock);
++	if (!airoha_is_7581(eth) || eth->soc->num_ppe != 2)
++		return -EOPNOTSUPP;
++	if (enable) {
++		/* Validate both engines before the first write. Mode 3 is rejected. */
++		for (i = 0; i < 2; i++) {
++			u32 base = 0xc00 + i * 0x1000;
++
++			if (airoha_fe_rr(eth, base + 0x288) != 0x001d077f ||
++			    airoha_fe_rr(eth, base + 0x28c) != 0x1b ||
++			    airoha_fe_rr(eth, base + 0x204) != 0x00198000 ||
++			    airoha_fe_rr(eth, base + 0x2d0) != 0x88a88100 ||
++			    airoha_fe_rr(eth, base + 0x2d4) != 0x08000000 ||
++			    airoha_fe_rr(eth, base + 0x2d8) != 0x000086dd)
++				return -EINVAL;
++		}
++	}
++	for (i = 0; i < 2; i++) {
++		u32 offset = 0xc00 + i * 0x1000 + 0x28c;
++
++		if (!enable && airoha_fe_rr(eth, offset) != 3)
++			continue; /* Do not overwrite an externally changed profile. */
++		airoha_fe_wr(eth, offset, enable ? 3 : 0x1b);
++	}
++	for (i = 0; i < 2; i++) {
++		u32 offset = 0xc00 + i * 0x1000 + 0x28c;
++
++		if (airoha_fe_rr(eth, offset) != (enable ? 3 : 0x1b)) {
++			if (enable)
++				airoha_xr_native_profile(ppe, false);
++			return -EIO;
++		}
++	}
++	return 0;
++}
++
+ /* End the trial: no further bind, revoke every L2 template and subflow, then
+  * clear any bound FOE entry left in SRAM/DRAM. With the boot-only
+  * ppe_bind_enable off, every bound entry can only come from this trial.
+@@ -3002,6 +3064,11 @@
+ 			cleared++;
+ 		}
+ 	}
++	if (xr_trial_native_l2) {
++		if (airoha_xr_native_profile(ppe, false))
++			pr_err("xr_ppe_l2: diagnostic profile restore failed\n");
++		xr_trial_native_l2 = false;
++	}
+ 	ppe->xr_trial_invalidated = cleared;
+ 	spin_unlock_bh(&ppe_lock);
+ 	pr_info("xr_ppe_l2: trial ended, %u bound FOE entries invalidated\n", cleared);
+@@ -3018,7 +3085,7 @@
+ /* One window per boot, never extended. PPE/NPU offload is initialized here,
+  * as TC would have done, because TC no longer publishes L2 templates.
+  */
+-static int airoha_xr_window_arm(struct genl_info *info, bool classify)
++static int airoha_xr_window_arm(struct genl_info *info, bool classify, bool native)
+ {
+ 	struct airoha_ppe *ppe = xr_pub_ppe;
+ 	struct airoha_eth *eth = ppe->eth;
+@@ -3027,7 +3094,7 @@
+ 
+ 	if (GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_TRIAL_SECONDS))
+ 		return -EINVAL;
+-	if (!classify && !airoha_ppe_l2_dsfield_preserved()) {
++	if (!classify && !native && !airoha_ppe_l2_dsfield_preserved()) {
+ 		NL_SET_ERR_MSG(info->extack, "bridge PPE cannot preserve per-packet DSCP/ECN; software forwarding required");
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -3049,6 +3116,21 @@
+ 		return err;
+ 	}
+ 	spin_lock_bh(&ppe_lock);
++	if (native) {
++		/* Keep all bridge/software policy fences; reject before MMIO. */
++		if (ppe->l2_policy_latched || ppe->l2_netdev_policy_latched ||
++		    ppe->l2_bridge_writers)
++			err = -EBUSY;
++		else
++			err = airoha_xr_native_profile(ppe, true);
++		if (err) {
++			ppe->xr_trial_state = 2;
++			spin_unlock_bh(&ppe_lock);
++			NL_SET_ERR_MSG(info->extack, "native L2 diagnostic profile unavailable");
++			return err;
++		}
++	}
++	xr_trial_native_l2 = native;
+ 	ppe->xr_trial_state = 1;
+ 	ppe->xr_trial_deadline = jiffies + seconds * HZ;
+ 	xr_trial_classify_only = classify;
+@@ -3056,14 +3138,14 @@
+ 	spin_unlock_bh(&ppe_lock);
+ 	schedule_delayed_work(&ppe->xr_trial_work, seconds * HZ);
+ 	pr_info("xr_ppe_l2: %s window armed for %u s\n",
+-		classify ? "classification-only" : "L2 binding", seconds);
++		classify ? "classification-only" : native ? "native L2 diagnostic" : "L2 binding", seconds);
+ 	return airoha_xr_reply_state(info, classify ? XR_PPE_L2_CMD_CLASSIFY_ARM :
+-				   XR_PPE_L2_CMD_TRIAL_ARM, 0, false);
++				   native ? XR_PPE_L2_CMD_NATIVE_ARM : XR_PPE_L2_CMD_TRIAL_ARM, 0, false);
+ }
+ 
+ static int airoha_xr_trial_arm(struct sk_buff *skb, struct genl_info *info)
+ {
+-	return airoha_xr_window_arm(info, false);
++	return airoha_xr_window_arm(info, false, false);
+ }
+ 
+ /* Initialize the normal firmware/table path to inspect UNB classifications.
+@@ -3072,7 +3154,16 @@
+  */
+ static int airoha_xr_classify_arm(struct sk_buff *skb, struct genl_info *info)
+ {
+-	return airoha_xr_window_arm(info, true);
++	return airoha_xr_window_arm(info, true, false);
++}
++
++/* Explicit diagnostic command: same bounded one-per-boot lifetime and
++ * policy generation machinery; only learned native L2 entries may bind.
++ * Does not set dsfield_preserved or authorize ordinary/daily offload.
++ */
++static int airoha_xr_native_arm(struct sk_buff *skb, struct genl_info *info)
++{
++	return airoha_xr_window_arm(info, false, true);
+ }
+ 
+ static int airoha_xr_trial_stop(struct sk_buff *skb, struct genl_info *info)
+@@ -3115,6 +3206,10 @@
+ 		.cmd = XR_PPE_L2_CMD_CLASSIFY_ARM,
+ 		.doit = airoha_xr_classify_arm,
+ 		.flags = GENL_ADMIN_PERM,
++	}, {
++		.cmd = XR_PPE_L2_CMD_NATIVE_ARM,
++		.doit = airoha_xr_native_arm,
++		.flags = GENL_ADMIN_PERM,
+ 	},
+ };
+ 
+@@ -3129,7 +3224,7 @@
+ 	.module = THIS_MODULE,
+ 	.small_ops = airoha_xr_ops,
+ 	.n_small_ops = ARRAY_SIZE(airoha_xr_ops),
+-	.resv_start_op = XR_PPE_L2_CMD_CLASSIFY_ARM + 1,
++	.resv_start_op = XR_PPE_L2_CMD_NATIVE_ARM + 1,
+ };
+ 
+ static void airoha_xr_publisher_init(struct airoha_ppe *ppe)

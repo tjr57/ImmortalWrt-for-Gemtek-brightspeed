@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+case "$1" in
+ list) printf '%s\n' '{"status":{},"settings":{},"configure":{"apply":true,"roaming":true,"ieee80211k":true,"ieee80211v":true,"ieee80211r":true,"mlo":true,"puncturing":true,"mobility_domain":"","mode":"","bitmap":0},"restore":{},"confirm":{"confirmation_id":""}}';;
+ call) case "$2" in status) exec /usr/sbin/xr1710g-ap-features status;;settings|configure|restore|confirm) /usr/sbin/xr1710g-ap-feature-control "$2" || exit 0;;*) exit 1;;esac;;
+ *) exit 1;;
+esac

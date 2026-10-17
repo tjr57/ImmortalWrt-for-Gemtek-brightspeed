@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "jobs": 12,
+  "binarySHA256": "ddd77f730e573a8871af653c9911598d7749416ff345c712ab4a2fab1a40ff0e",
+  "size": 551648,
+  "actualARMParserHelp": true,
+  "privateBuildOnly": true,
+  "productionStateUnchanged": true,
+  "selectedVariant": "tc-tiny",
+  "requiredPackages": [
+    "tc-tiny",
+    "kmod-sched-core",
+    "kmod-sched-flower",
+    "kmod-sched-act-vlan"
+  ],
+  "BPFOrXtablesRequired": false,
+  "fullImageBuiltOrFlashed": false
+}

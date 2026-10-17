@@ -32,6 +32,14 @@ config KERNEL_PROC_STRIPPED
 	bool "Strip non-essential /proc functionality to reduce code size"
 	default y if SMALL_FLASH
 
+config KERNEL_NET_AIROHA_PPE_BIND_DEFAULT
+	bool "Enable Airoha PPE forwarding bindings by default"
+	depends on TARGET_airoha
+	default y
+	help
+	  Preserve upstream PPE forwarding unless an AP image opts out.
+	  NPU WLAN DMA stays enabled. Override only at boot for A/B tests.
+
 config KERNEL_DEBUG_FS
 	bool "Compile the kernel with debug filesystem enabled"
 	default y

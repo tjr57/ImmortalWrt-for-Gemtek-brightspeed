@@ -1,0 +1,345 @@
+From: XR1710G AP project
+Subject: [PATCH] mt7996: bounded opt-in device MCU statistics
+
+RSSI wire layout adapted from Joshua Klinesmith v3/73c3ab3.
+No claim of current firmware ABI or historical NPU rootcause proof.
+
+--- a/mt7996/Makefile
++++ b/mt7996/Makefile
+@@ -4,7 +4,7 @@
+ obj-$(CONFIG_MT7996E) += mt7996e.o
+ 
+ mt7996e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+-	     debugfs.o mmio.o pp.o
++	     debugfs.o mmio.o pp.o xr_stats.o
+ 
+ mt7996e-$(CONFIG_MT7996_NPU) += npu.o
+ mt7996e-$(CONFIG_DEV_COREDUMP) += coredump.o
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -294,6 +294,9 @@
+ 
+ 	struct list_head rc_list;
+ 	u32 airtime_ac[8];
++	u32 mcu_airtime_ac[8];
++	bool mcu_airtime_valid;
++	spinlock_t mcu_airtime_lock;
+ 
+ 	int ack_signal;
+ 	struct ewma_avg_signal avg_ack_signal;
+@@ -474,6 +477,12 @@
+ 	atomic64_t mcu_sta_short_events;
+ 	atomic64_t mcu_sta_truncated_arrays;
+ 	atomic64_t mcu_sta_unknown_tags;
++	unsigned long mcu_stats_next;
++	u16 mcu_stats_cursor;
++	bool mcu_stats_faulted;
++	atomic64_t mcu_stats_queries;
++	atomic64_t mcu_stats_errors;
++	atomic64_t mcu_stats_bad_records;
+ 
+ 
+ 	struct mt7996_phy *radio_phy[MT7996_MAX_RADIOS];
+@@ -967,6 +976,10 @@
+ void mt7996_mac_update_beacons(struct mt7996_phy *phy);
+ void mt7996_mac_set_coverage_class(struct mt7996_phy *phy);
+ void mt7996_mac_work(struct work_struct *work);
++extern bool mt7996_mcu_stats_enable;
++extern bool mt7996_mcu_airtime_cumulative_us;
++void mt7996_mcu_stats_poll(struct mt7996_phy *phy);
++void mt7996_mcu_stats_airtime(struct mt7996_dev *dev, struct sk_buff *skb);
+ void mt7996_mac_reset_work(struct work_struct *work);
+ void mt7996_mac_dump_work(struct work_struct *work);
+ void mt7996_mac_sta_rc_work(struct work_struct *work);
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -116,6 +116,10 @@
+ 
+ 		idx = wcid->idx;
+ 
++		if (mt7996_mcu_stats_enable)
++			spin_lock_bh(&msta_link->mcu_airtime_lock);
++		if (!mt7996_mcu_stats_enable || !mt7996_mcu_airtime_cumulative_us ||
++		    READ_ONCE(dev->mcu_stats_faulted)) {
+ 		/* refresh peer's airtime reporting */
+ 		addr = mt7996_mac_wtbl_lmac_addr(dev, idx, 20);
+ 
+@@ -135,6 +139,14 @@
+ 			addr += 8;
+ 		}
+ 
++		/* Optional MCU mode stopped: baseline legacy MMIO once rather than
++		 * crediting airtime already registered by cumulative MCU samples.
++		 */
++		if (msta_link->mcu_airtime_valid) {
++			memset(tx_time, 0, sizeof(tx_time));
++			memset(rx_time, 0, sizeof(rx_time));
++			msta_link->mcu_airtime_valid = false;
++		}
+ 		if (clear) {
+ 			mt7996_mac_wtbl_update(dev, idx,
+ 					       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+@@ -142,8 +154,11 @@
+ 			       sizeof(msta_link->airtime_ac));
+ 		}
+ 
+-		if (!wcid->sta)
++		if (!wcid->sta) {
++			if (mt7996_mcu_stats_enable)
++				spin_unlock_bh(&msta_link->mcu_airtime_lock);
+ 			continue;
++		}
+ 
+ 		sta = container_of((void *)msta, struct ieee80211_sta,
+ 				   drv_priv);
+@@ -159,6 +174,12 @@
+ 			ieee80211_sta_register_airtime(sta, tid, tx_cur, rx_cur);
+ 		}
+ 
++		}
++		if (mt7996_mcu_stats_enable)
++			spin_unlock_bh(&msta_link->mcu_airtime_lock);
++
++		if (mt7996_mcu_stats_enable && !READ_ONCE(dev->mcu_stats_faulted))
++			continue;
+ 		/* get signal strength of resp frames (CTS/BA/ACK) */
+ 		addr = mt7996_mac_wtbl_lmac_addr(dev, idx, 34);
+ 		val = mt76_rr(dev, addr);
+@@ -3058,6 +3079,7 @@
+ 		mphy->mac_work_count = 0;
+ 
+ 		mt7996_mac_update_stats(phy);
++		mt7996_mcu_stats_poll(phy);
+ 
+ 		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
+ 		if (mtk_wed_device_active(&phy->dev->mt76.mmio.wed)) {
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -244,6 +244,8 @@
+ 	int ret = 0;
+ 
+ 	if (!skb) {
++		if (cmd == MCU_WM_UNI_CMD(PER_STA_INFO))
++			return -ETIMEDOUT;
+ 		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
+ 			cmd, seq);
+ 
+@@ -691,6 +693,10 @@
+ 	count = le16_to_cpu(res->sta_num);
+ 	tag = le16_to_cpu(res->tag);
+ 
++	if (tag == UNI_ALL_STA_TXRX_AIR_TIME) {
++		mt7996_mcu_stats_airtime(dev, skb);
++		return;
++	}
+ 	switch (tag) {
+ 	case UNI_ALL_STA_TXRX_RATE:
+ 		stride = sizeof(res->rate[0]);
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1217,6 +1217,8 @@
+ 	if (link_sta->sta->tdls)
+ 		set_bit(MT_WCID_FLAG_TDLS_PEER, &msta_link->wcid.flags);
+ 
++	msta_link->mcu_airtime_valid = false;
++	spin_lock_init(&msta_link->mcu_airtime_lock);
+ 	ewma_avg_signal_init(&msta_link->avg_ack_signal);
+ 	ewma_signal_init(&msta_link->wcid.rssi);
+ 
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -946,6 +946,11 @@
+             atomic64_read(&dev->mcu_sta_short_events),
+             atomic64_read(&dev->mcu_sta_truncated_arrays),
+             atomic64_read(&dev->mcu_sta_unknown_tags));
++ seq_printf(s, "mcu_stats_queries %lld\nmcu_stats_errors %lld\nmcu_stats_bad_records %lld\nmcu_stats_faulted %u\n",
++            (long long)atomic64_read(&dev->mcu_stats_queries),
++            (long long)atomic64_read(&dev->mcu_stats_errors),
++            (long long)atomic64_read(&dev->mcu_stats_bad_records), READ_ONCE(dev->mcu_stats_faulted));
++
+  seq_puts(s, "queue_counters=approximate\n");
+  for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++) {
+   struct mt76_queue *q = &mdev->q_rx[i];
+--- a/mt7996/xr_stats.c
++++ b/mt7996/xr_stats.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/* PER_STA/RSSI wire layout from Joshua Klinesmith, pinned73c3ab3.
++ * XR port: one bounded device batch/second, strict whole-response validation,
++ * request membership, no critical-radio reset for an optional query timeout.
++ * Neither parameter is enabled by default or by the AP feature controller.
++ * Airtime requires explicit knowledge of cumulative microsecond firmware ABI.
++ */
++#include "mt7996.h"
++#include "mcu.h"
++#include <linux/moduleparam.h>
++
++bool mt7996_mcu_stats_enable;
++module_param_named(mcu_stats_enable, mt7996_mcu_stats_enable, bool, 0400);
++MODULE_PARM_DESC(mcu_stats_enable, "Opt-in bounded PER_STA RSSI ABI; default off");
++bool mt7996_mcu_airtime_cumulative_us;
++module_param_named(mcu_airtime_cumulative_us, mt7996_mcu_airtime_cumulative_us, bool, 0400);
++MODULE_PARM_DESC(mcu_airtime_cumulative_us, "Require verified cumulative microsecond airtime ABI; default off");
++#define XR_STATS_BATCH 90
++struct xr_stats_header {
++ u8 reserved[4];
++ __le16 tag, len;
++ u8 more, reserved2;
++ __le16 count;
++ u8 reserved3[4];
++} __packed;
++struct xr_stats_rssi { __le16 index; u8 reserved[2], rcpi[4]; } __packed;
++struct xr_stats_airtime { __le16 index; u8 reserved[2]; __le32 tx[4], rx[4]; } __packed;
++static_assert(sizeof(struct xr_stats_header) == 16);
++static_assert(sizeof(struct xr_stats_rssi) == 8);
++static_assert(sizeof(struct xr_stats_airtime) == 36);
++
++/* Validate before count-based indexing. No guessed padding or chunk contract:
++ * TLV spans tag..records, permits received padding, and RSSI is one batch.
++ */
++static int xr_stats_validate(struct sk_buff *skb, u16 tag, unsigned int stride,
++                             unsigned int limit, bool allow_more)
++{
++ const struct xr_stats_header *h;
++ unsigned int count, bytes, tlv_len;
++ if (!pskb_may_pull(skb, sizeof(*h))) return -EPROTO;
++ h = (const void *)skb->data;
++ count = le16_to_cpu(h->count); tlv_len = le16_to_cpu(h->len);
++ if (le16_to_cpu(h->tag) != tag || count > limit ||
++     h->more > (allow_more ? 1 : 0) ||
++     count > (skb->len - sizeof(*h)) / stride) return -EPROTO;
++ bytes = sizeof(*h) + count * stride;
++ if (tlv_len < bytes - 4 || tlv_len > skb->len - 4 ||
++     !pskb_may_pull(skb, bytes)) return -EPROTO;
++ return count;
++}
++
++void mt7996_mcu_stats_poll(struct mt7996_phy *phy)
++{
++ struct mt7996_dev *dev = phy->dev;
++ struct mt76_wcid *requested[XR_STATS_BATCH];
++ struct sk_buff *skb = NULL;
++ struct {
++  u8 reserved1, unsolicited, reserved2[2];
++  __le16 tag, len, count;
++  u8 reserved3[2];
++  __le16 index[XR_STATS_BATCH];
++ } __packed req = { .len = cpu_to_le16(188) };
++ struct xr_stats_rssi *rows;
++ int i, j, n = 0, count, ret;
++
++ lockdep_assert_held(&dev->mt76.mutex);
++ if (!mt7996_mcu_stats_enable || READ_ONCE(dev->mcu_stats_faulted) ||
++     test_bit(MT76_MCU_RESET, &dev->mphy.state) ||
++     time_before(jiffies, dev->mcu_stats_next)) return;
++ dev->mcu_stats_next = jiffies + HZ;
++ rcu_read_lock();
++ for (i = dev->mcu_stats_cursor; i < mt7996_wtbl_size(dev) && n < XR_STATS_BATCH; i++) {
++  struct mt76_wcid *w = mt76_wcid_ptr(dev, i);
++  if (!w || !w->sta) continue;
++  req.index[n] = cpu_to_le16(i); requested[n++] = w;
++ }
++ rcu_read_unlock();
++ dev->mcu_stats_cursor = i < mt7996_wtbl_size(dev) ? i : 0;
++ if (!n) return;
++ req.count = cpu_to_le16(n);
++ atomic64_inc(&dev->mcu_stats_queries);
++ ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_WM_UNI_CMD(PER_STA_INFO),
++                                &req, sizeof(req), true, &skb);
++ if (ret) goto fault;
++ if (!skb) { ret = -EPROTO; goto fault; }
++ count = xr_stats_validate(skb, 0, sizeof(*rows), n, false);
++ if (count < 0) { ret = count; goto fault; }
++ rows = (void *)(skb->data + sizeof(struct xr_stats_header));
++ /* Validate every ID and duplicate before publishing any of this batch. */
++ for (i = 0; i < count; i++) {
++  for (j = 0; j < n && req.index[j] != rows[i].index; j++);
++  if (j == n) { ret = -EPROTO; goto fault; }
++  for (j = 0; j < i; j++)
++   if (rows[j].index == rows[i].index) { ret = -EPROTO; goto fault; }
++  for (j = 0; j < 4; j++)
++   if (rows[i].rcpi[j] > 220 && rows[i].rcpi[j] != 255) { ret = -EPROTO; goto fault; }
++ }
++ rcu_read_lock();
++ for (i = 0; i < count; i++) {
++  struct mt76_wcid *w;
++  struct mt7996_sta_link *link;
++  struct mt76_vif_link *vlink;
++  struct mt76_phy *mphy;
++  s8 rssi[4];
++  int signal;
++  for (j = 0; j < n && req.index[j] != rows[i].index; j++);
++  w = mt76_wcid_ptr(dev, le16_to_cpu(rows[i].index));
++  if (!w || w != requested[j] || !w->sta ||
++      test_bit(MT76_MCU_RESET, &dev->mphy.state)) continue;
++  link = container_of(w, struct mt7996_sta_link, wcid);
++  vlink = rcu_dereference(link->sta->vif->mt76.link[w->link_id]);
++  mphy = vlink ? mt76_vif_link_phy(vlink) : NULL;
++  if (!mphy) continue;
++  for (j = 0; j < 4; j++) rssi[j] = rows[i].rcpi[j] == 255 ? -127 : ((int)rows[i].rcpi[j] - 220) / 2;
++  signal = mt76_rx_signal(mphy->antenna_mask, rssi);
++  if (signal <= -127 || signal > 0) continue;
++  link->ack_signal = signal;
++  ewma_avg_signal_add(&link->avg_ack_signal, -signal);
++ }
++ rcu_read_unlock();
++ dev_kfree_skb(skb);
++ if (mt7996_mcu_airtime_cumulative_us) {
++  ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_AIR_TIME);
++  if (ret) { skb = NULL; goto fault; }
++ }
++ return;
++fault:
++ atomic64_inc(&dev->mcu_stats_errors);
++ WRITE_ONCE(dev->mcu_stats_faulted, true);
++ dev_kfree_skb(skb);
++ dev_warn_ratelimited(dev->mt76.dev, "Optional MCU statistics stopped: %d; retaining legacy statistics\n", ret);
++}
++
++void mt7996_mcu_stats_airtime(struct mt7996_dev *dev, struct sk_buff *skb)
++{
++ static const u8 ac_to_tid[4] = { [IEEE80211_AC_BE]=0, [IEEE80211_AC_BK]=1,
++                                [IEEE80211_AC_VI]=4, [IEEE80211_AC_VO]=6 };
++ DECLARE_BITMAP(seen, ARRAY_SIZE(dev->mt76.wcid));
++ struct xr_stats_airtime *rows;
++ int i, ac, count;
++ if (!mt7996_mcu_stats_enable || !mt7996_mcu_airtime_cumulative_us ||
++     READ_ONCE(dev->mcu_stats_faulted)) return;
++ count = xr_stats_validate(skb, UNI_ALL_STA_TXRX_AIR_TIME, sizeof(*rows),
++                           ARRAY_SIZE(dev->mt76.wcid), true);
++ if (count < 0) goto bad;
++ rows = (void *)(skb->data + sizeof(struct xr_stats_header));
++ bitmap_zero(seen, ARRAY_SIZE(dev->mt76.wcid));
++ for (i=0;i<count;i++) {
++  unsigned int idx = le16_to_cpu(rows[i].index);
++  if (idx >= ARRAY_SIZE(dev->mt76.wcid) || test_and_set_bit(idx, seen)) goto bad;
++ }
++ rcu_read_lock();
++ for (i=0;i<count;i++) {
++  struct mt76_wcid *w = mt76_wcid_ptr(dev, le16_to_cpu(rows[i].index));
++  struct ieee80211_sta *sta = wcid_to_sta(w);
++  struct mt7996_sta_link *link;
++  if (!sta || test_bit(MT76_MCU_RESET, &dev->mphy.state)) continue;
++  link = container_of(w, struct mt7996_sta_link, wcid);
++  spin_lock_bh(&link->mcu_airtime_lock);
++  if (READ_ONCE(dev->mcu_stats_faulted)) { spin_unlock_bh(&link->mcu_airtime_lock); continue; }
++  for (ac=0;ac<4;ac++) {
++   u8 map = mt76_connac_lmac_mapping(ac);
++   u32 tx = le32_to_cpu(rows[i].tx[map]), rx = le32_to_cpu(rows[i].rx[map]);
++   u32 dtx = tx - link->mcu_airtime_ac[ac], drx = rx - link->mcu_airtime_ac[ac+4];
++   /* First sample establishes a baseline; unchanged samples add zero.
++    * A counter reset/discontinuity must not credit billions of usec.
++    */
++   if (link->mcu_airtime_valid && dtx < 10000000 && drx < 10000000 && (dtx || drx))
++    ieee80211_sta_register_airtime(sta, ac_to_tid[ac], dtx, drx);
++   link->mcu_airtime_ac[ac] = tx; link->mcu_airtime_ac[ac+4] = rx;
++  }
++  link->mcu_airtime_valid = true;
++  spin_unlock_bh(&link->mcu_airtime_lock);
++ }
++ rcu_read_unlock();
++ return;
++bad:
++ atomic64_inc(&dev->mcu_stats_bad_records);
++ WRITE_ONCE(dev->mcu_stats_faulted, true);
++}

@@ -1,0 +1,28 @@
+{
+  "at": "2026-10-11T02:05:03.930207+08:00",
+  "passed": true,
+  "version": "20261011-ap33-d331711d",
+  "imageSHA256": "86bb59f36edb21b11b916467753a2f8e25530795439e34f5e22532da76b20659",
+  "imageSize": 18690346,
+  "bundle": "builds/20261011-ap33-d331711d-development",
+  "kernelContractSHA256": "c9bc011d275879842d27537774a084504dcc287080af5b89c8284b64a9d02c8f",
+  "jobs": 12,
+  "packedFiles": 138,
+  "rootfsChanges": [
+    "etc/banner",
+    "etc/openwrt_release",
+    "etc/openwrt_version",
+    "lib/apk/db/installed",
+    "lib/apk/db/scripts.tar.gz",
+    "usr/lib/os-release"
+  ],
+  "evidence": {
+    "image": "development/ap33/packed-files-qa.json",
+    "ABI": "development/ap33/build-module-abi.json",
+    "defaults": "development/ap33/defaults-qa.json",
+    "VM": "development/ap33/bridge-policy/vm-result.json"
+  },
+  "automaticPublisherShipped": false,
+  "NpuPpeDefaultsChanged": false,
+  "wholeHardwareQualification": false
+}

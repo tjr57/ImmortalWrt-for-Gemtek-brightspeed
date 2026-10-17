@@ -1,0 +1,52 @@
+--- a/luci-app-airoha-fancontrol/Makefile
++++ b/luci-app-airoha-fancontrol/Makefile
+@@ -2,7 +2,7 @@
+ 
+ LUCI_NAME:=luci-app-airoha-fancontrol
+ PKG_VERSION:=1.0.0
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+ 
+ PKG_MAINTAINER:=XR1710G Maintainer
+ PKG_LICENSE:=GPL-2.0-or-later
+@@ -16,6 +16,10 @@
+ 
+ include $(TOPDIR)/feeds/luci/luci.mk
+ 
++define Package/$(LUCI_NAME)/conffiles
++/etc/config/fan
++endef
++
+ define Package/$(LUCI_NAME)/install
+ 	# Install LuCI frontend views
+ 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/fan
+@@ -25,6 +29,10 @@
+ 	# Install UCI configuration
+ 	$(INSTALL_DIR) $(1)/etc/config
+ 	$(INSTALL_DATA) ./root/etc/config/fan $(1)/etc/config/
++
++	# Install the controller validation and transactional application helper
++	$(INSTALL_DIR) $(1)/usr/lib/xr1710g
++	$(INSTALL_DATA) ./root/usr/lib/xr1710g/fan-policy.sh $(1)/usr/lib/xr1710g/
+ 
+ 	# Install init.d script (executable)
+ 	$(INSTALL_DIR) $(1)/etc/init.d
+@@ -47,15 +55,13 @@
+ #!/bin/sh
+ [ -n "$${IPKG_INSTROOT}" ] && exit 0
+ 
+-# Enable and start the fan service
+-/etc/init.d/fan enable 2>/dev/null
+-/etc/init.d/fan start 2>/dev/null
+-
+-# Disable and stop the conflicting airoha_fan service if present
++# Retire the legacy owner before starting the UCI-aware owner.
+ if [ -f /etc/init.d/airoha_fan ]; then
+ 	/etc/init.d/airoha_fan stop 2>/dev/null
+ 	/etc/init.d/airoha_fan disable 2>/dev/null
+ fi
++/etc/init.d/fan enable 2>/dev/null
++/etc/init.d/fan start 2>/dev/null
+ 
+ # Reload rpcd to register the new luci.fan backend
+ /etc/init.d/rpcd reload 2>/dev/null

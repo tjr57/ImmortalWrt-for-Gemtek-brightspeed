@@ -1,0 +1,48 @@
+Subject: [PATCH] wifi: mt7996: check remaining bytes before TXFREE lookahead
+
+Avoid forming a pointer beyond the available control buffer merely to
+check a boundary. Validate the signed header length before forming end,
+and guard the current word and version-7 lookahead with remaining bytes.
+Keep count, format, warning and partial-cleanup behavior unchanged.
+
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1365,16 +1365,18 @@
+ 	struct mt76_wcid *wcid = NULL;
+ 	LIST_HEAD(free_list);
+ 	struct sk_buff *skb, *tmp;
+-	void *end = data + len;
++	u8 *end;
+ 	bool wake = false;
+ 	u16 total, count = 0;
+ 	u8 ver;
+ 
+-	if (unlikely(len < 2 * sizeof(*tx_free))) {
++	if (unlikely(len < 2 * (int)sizeof(*tx_free))) {
+ 		dev_warn_ratelimited(dev->mt76.dev,
+ 			"TXFREE short header: len=%d\n", len);
+ 		return;
+ 	}
++
++	end = (u8 *)data + len;
+ 
+ 	/* clean DMA queues and unmap buffers first */
+ 	mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_PSD], false);
+@@ -1397,7 +1399,7 @@
+ 		u32 msdu, info;
+ 		u8 i;
+ 
+-		if (WARN_ON_ONCE((void *)(cur_info + 1) > end)) {
++		if (WARN_ON_ONCE(end - (u8 *)cur_info < sizeof(*cur_info))) {
+ 			dev_warn_ratelimited(dev->mt76.dev,
+ 				"TXFREE truncated: len=%d rx_bytes=%u type=%u ver=%u completed=%u total=%u offset=%zu\n",
+ 				len, (u32)le32_get_bits(tx_free[0], MT_TXFREE0_RX_BYTE),
+@@ -1446,7 +1448,7 @@
+ 			}
+ next:
+ 			/* ver 7 has a new DW with pair = 1, skip it */
+-			if (ver == 7 && ((void *)(cur_info + 2) <= end) &&
++			if (ver == 7 && (end - (u8 *)cur_info >= 2 * sizeof(*cur_info)) &&
+ 			    (le32_to_cpu(*(cur_info + 1)) & MT_TXFREE_INFO_PAIR))
+ 				cur_info++;
+ 			continue;

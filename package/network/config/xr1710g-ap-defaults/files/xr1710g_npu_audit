@@ -1,0 +1,8 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+START=09
+STOP=01
+boot() {
+    . /usr/lib/xr1710g/npu-audit.sh
+    audit_boot
+}

@@ -1,0 +1,59 @@
+{
+  "startedAt": "2026-10-11T00:46:57.503340+08:00",
+  "command": [
+    "make",
+    "world",
+    "-j12"
+  ],
+  "jobs": 12,
+  "version": "20261011-ap31-d331711d",
+  "source": "/home/xrdev/projects/xr1710g/openwrt",
+  "steps": [
+    {
+      "command": [
+        "make",
+        "target/linux/compile",
+        "-j12"
+      ],
+      "exitCode": 0
+    },
+    {
+      "command": [
+        "make",
+        "package/kernel/mt76/clean"
+      ],
+      "exitCode": 0
+    },
+    {
+      "command": [
+        "make",
+        "package/kernel/mac80211/clean"
+      ],
+      "exitCode": 0
+    },
+    {
+      "command": [
+        "make",
+        "world",
+        "-j12"
+      ],
+      "exitCode": 0
+    },
+    {
+      "command": [
+        "/usr/bin/python3",
+        "/home/xrdev/projects/xr1710g/openwrt/scripts/xr1710g-module-abi.py",
+        "--root",
+        "/home/xrdev/projects/xr1710g/openwrt",
+        "--report",
+        "/home/xrdev/artifacts/xr1710g/build-ap31-module-abi.json"
+      ],
+      "exitCode": 0
+    }
+  ],
+  "exitCode": 0,
+  "kernelContractSHA256": "c7e1e1606ac14f7ce0d0cd1f7f0d0dc72b78d7e27956d6f98492a28cdfb36fd2",
+  "externalWlanRebuildRequired": true,
+  "wirelessKernelABIValidated": true,
+  "completedAt": "2026-10-11T00:51:06.134356+08:00"
+}

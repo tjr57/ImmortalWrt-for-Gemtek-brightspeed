@@ -1,0 +1,60 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -450,12 +450,15 @@
+ {
+ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
+ 	u32 pon_tag = 0;
+-	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
++	int wlan_etype = -EINVAL, dsa_port;
+ 	struct airoha_foe_mac_info_common *l2;
+ 	u8 smac_id = 0xf;
+ 
++	*egress_dev = NULL;
++	if (!netdev)
++		return -EOPNOTSUPP;
++	dsa_port = airoha_get_dsa_port(&netdev);
+ 	memset(hwe, 0, sizeof(*hwe));
+-	*egress_dev = NULL;
+ 
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, type) |
+@@ -1884,6 +1887,26 @@
+  return valid;
+ }
+ 
++/* A hardware entry has exactly one egress. An absent redirect must not
++ * reach DSA lookup with a NULL netdev, and multiple redirects cannot be
++ * represented by retaining only the last action's target.
++ */
++static bool airoha_ppe_rule_has_single_redirect(const struct flow_rule *rule)
++{
++ const struct flow_action_entry *act;
++ bool found = false;
++ int i;
++
++ flow_action_for_each(i, act, &rule->action) {
++  if (act->id != FLOW_ACTION_REDIRECT)
++   continue;
++  if (found || !act->dev)
++   return false;
++  found = true;
++ }
++ return found;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1897,6 +1920,12 @@
+ 	u8 dsfield = 0, l4proto = 0;
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
++
++	if (!airoha_ppe_rule_has_single_redirect(rule)) {
++		NL_SET_ERR_MSG_MOD(f->common.extack,
++				   "PPE requires exactly one valid redirect target");
++		return -EOPNOTSUPP;
++	}
+ 
+ 	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+ 			      airoha_flow_table_params))

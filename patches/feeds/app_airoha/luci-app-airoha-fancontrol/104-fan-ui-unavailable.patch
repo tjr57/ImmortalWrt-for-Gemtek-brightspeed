@@ -1,0 +1,29 @@
+--- a/luci-app-airoha-fancontrol/htdocs/luci-static/resources/view/fan/status.js
++++ b/luci-app-airoha-fancontrol/htdocs/luci-static/resources/view/fan/status.js
+@@ -118,7 +118,17 @@
+ }
+ 
+ function summaryData(status) {
+-	var mode = modeInfo(status.uci_mode);
++	if (status.controller_available === false) {
++		return [
++			{ id: 'fan-summary-rpm', title: _('Fan Speed'), value: _('Unavailable'), sub: _('NCT7802 controller not detected'), color: '#6b7280' },
++			{ id: 'fan-summary-pwm', title: 'PWM', value: _('Unavailable'), sub: _('No hardware control applied'), color: '#6b7280' },
++			{ id: 'fan-summary-mode', title: _('Control Mode'), value: _('Unavailable'), sub: _('Saved configuration is retained'), color: '#6b7280' },
++			{ id: 'fan-summary-preset', title: _('Fan Curve Preset'), value: _('Not applied'), sub: _('Controller unavailable'), color: '#6b7280' }
++		];
++	}
++	var mode = status.control_applied === false
++		? { value: _('Not applied'), sub: _('Saved configuration could not be applied'), color: '#f5a623' }
++		: modeInfo(status.uci_mode);
+ 	var preset = presetInfo(status.uci_mode, status.uci_preset);
+ 	return [
+ 		{ id: 'fan-summary-rpm', title: _('Fan Speed'), value: (status.fan_rpm || 0) + ' RPM', sub: (status.fan_percentage || 0) + '% PWM 输出', color: '#00c8ff' },
+@@ -176,6 +186,7 @@
+ }
+ 
+ function appendHistory(status) {
++	if (status.controller_available === false) return;
+ 	var now = Date.now();
+ 	history.push({ time: now, temperature: status.temp_board || 0, pwm: status.fan_pwm || 0, rpm: status.fan_rpm || 0 });
+ 	while (history.length && history[0].time < now - HISTORY_WINDOW_MS) history.shift();

@@ -1,0 +1,28 @@
+--- a/networking/ping.c
++++ b/networking/ping.c
+@@ -778,6 +778,12 @@
+ 	/* set recv buf (needed if we can get lots of responses: flood ping,
+ 	 * broadcast ping etc) */
+ 	sockopt = (datalen * 2) + 7 * 1024; /* giving it a bit of extra room */
++	/* RX skb memory accounting can exceed the payload size by a page.
++	 * Concurrent raw ICMP sockets also receive each other's replies.
++	 * Keep headroom for short bursts instead of shrinking to ~7 KiB.
++	 */
++	if (sockopt < 64 * 1024)
++		sockopt = 64 * 1024;
+ 	setsockopt_SOL_SOCKET_int(pingsock, SO_RCVBUF, sockopt);
+ 
+ 	if (opt_ttl != 0) {
+@@ -847,6 +853,12 @@
+ 	/* set recv buf (needed if we can get lots of responses: flood ping,
+ 	 * broadcast ping etc) */
+ 	sockopt = (datalen * 2) + 7 * 1024; /* giving it a bit of extra room */
++	/* RX skb memory accounting can exceed the payload size by a page.
++	 * Concurrent raw ICMP sockets also receive each other's replies.
++	 * Keep headroom for short bursts instead of shrinking to ~7 KiB.
++	 */
++	if (sockopt < 64 * 1024)
++		sockopt = 64 * 1024;
+ 	setsockopt_SOL_SOCKET_int(pingsock, SO_RCVBUF, sockopt);
+ 
+ 	sockopt = offsetof(struct icmp6_hdr, icmp6_cksum);

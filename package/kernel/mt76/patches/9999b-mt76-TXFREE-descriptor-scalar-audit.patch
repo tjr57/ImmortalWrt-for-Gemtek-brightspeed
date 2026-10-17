@@ -1,0 +1,127 @@
+Subject: [PATCH] wifi: mt76: add boot-only TXFREE descriptor scalar diagnostics
+
+Keep diagnostics disabled by default. Observe CPU-owned descriptors and
+at most two queued DONE neighbors; do not alter count, length, ownership,
+warnings or descriptor masks. Do not log payload, MACs or token values.
+
+--- a/npu.c
++++ b/npu.c
+@@ -5,6 +5,7 @@
+  */
+ #include <linux/kernel.h>
+ #include <linux/moduleparam.h>
++#include <linux/unaligned.h>
+ #include <net/flow_offload.h>
+ #include <net/pkt_cls.h>
+ 
+@@ -19,6 +20,10 @@
+ static bool npu_enable = MT76_NPU_ENABLE_DEFAULT;
+ module_param_named(npu_enable, npu_enable, bool, 0400);
+ MODULE_PARM_DESC(npu_enable, "Attach WLAN NPU at probe (read-only, boot policy)");
++
++static bool npu_rx_audit;
++module_param_named(npu_rx_audit, npu_rx_audit, bool, 0400);
++MODULE_PARM_DESC(npu_rx_audit, "Rate-limited TXFREE descriptor scalar diagnostics (boot-only)");
+ 
+ #define MT76_NPU_RX_BUF_SIZE	(1800 + \
+ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+@@ -81,14 +86,73 @@
+ 	spin_unlock_bh(&q->lock);
+ }
+ 
++
++/* Diagnostic only: descriptor scalars, never payload, MACs or token IDs.
++ * Called before refill while consumed descriptors remain CPU-owned. A next
++ * descriptor is inspected only when queued and its DONE bit grants ownership.
++ */
++static void mt76_npu_audit_txfree(struct mt76_dev *dev, struct mt76_queue *q,
++								struct sk_buff *skb, int start, int frames,
++								u32 first_ctrl, u32 first_info)
++{
++	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++	u32 last_ctrl, first_data, last_data, word0;
++	u32 next_cur[2] = {}, next_last[2] = {}, next_frag[2] = {};
++	bool next_done[2] = {}, next_same[2] = {};
++	int last = (start + frames - 1) % q->ndesc;
++	int i;
++
++	if (skb_headlen(skb) < 2 * sizeof(__le32))
++		return;
++	word0 = get_unaligned_le32(skb->data);
++	/* MT7996 RXD packet type 6 is the TXFREE control notification. */
++	if (FIELD_GET(GENMASK(31, 27), word0) != 6)
++		return;
++
++	last_ctrl = READ_ONCE(desc[last].ctrl);
++	first_data = READ_ONCE(desc[start].data);
++	last_data = READ_ONCE(desc[last].data);
++	for (i = 0; i < 2 && i < q->queued; i++) {
++		int index = (q->tail + i) % q->ndesc;
++		u32 ctrl = READ_ONCE(desc[index].ctrl);
++
++		if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
++			continue;
++		dma_rmb();
++		next_done[i] = true;
++		next_cur[i] = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl);
++		next_last[i] = !!(ctrl & NPU_RX_DMA_DESC_LAST_MASK);
++		next_frag[i] = FIELD_GET(NPU_RX_DMA_FRAG_TYPE_MASK,
++								READ_ONCE(desc[index].data));
++		next_same[i] = FIELD_GET(NPU_RX_DMA_PKT_ID_MASK,
++								READ_ONCE(desc[index].info)) ==
++					   FIELD_GET(NPU_RX_DMA_PKT_ID_MASK, first_info);
++	}
++	dev_info_ratelimited(dev->dev,
++		"NPU TXFREE audit: q=%u start=%u len=%u head=%u data_len=%u announced=%u encoded_count=%u frames=%u first_cur=%u first_len=%u first_last=%u first_frag=%u last_cur=%u last_len=%u last_last=%u last_frag=%u next0_done=%u next0_cur=%u next0_last=%u next0_frag=%u next0_same=%u next1_done=%u next1_cur=%u next1_last=%u next1_frag=%u next1_same=%u\n",
++		(unsigned int)(q - dev->q_rx), start, skb->len, skb_headlen(skb),
++		skb->data_len, (u32)FIELD_GET(GENMASK(15, 0), word0),
++		(u32)FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, first_info), frames,
++		(u32)FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, first_ctrl),
++		(u32)FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, first_ctrl),
++		!!(first_ctrl & NPU_RX_DMA_DESC_LAST_MASK),
++		(u32)FIELD_GET(NPU_RX_DMA_FRAG_TYPE_MASK, first_data),
++		(u32)FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, last_ctrl),
++		(u32)FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, last_ctrl),
++		!!(last_ctrl & NPU_RX_DMA_DESC_LAST_MASK),
++		(u32)FIELD_GET(NPU_RX_DMA_FRAG_TYPE_MASK, last_data),
++		next_done[0], next_cur[0], next_last[0], next_frag[0], next_same[0],
++		next_done[1], next_cur[1], next_last[1], next_frag[1], next_same[1]);
++}
++
+ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 					struct mt76_queue *q,
+ 					u32 *info)
+ {
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+-	int i, nframes, index = q->tail;
++	int i, nframes, start = q->tail, index = q->tail;
+ 	struct sk_buff *skb = NULL;
+-	u32 ctrl;
++	u32 ctrl, first_ctrl, first_info;
+ 
+ 	if (!q->queued)
+ 		return NULL;
+@@ -98,9 +162,10 @@
+ 	if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, ctrl))
+ 		return NULL;
+ 	dma_rmb();
+-
+-	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK,
+-			    READ_ONCE(desc[index].info));
++	first_ctrl = ctrl;
++	first_info = READ_ONCE(desc[index].info);
++
++	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, first_info);
+ 	nframes = max_t(int, nframes, 1);
+ 	/* Reject a corrupt/incomplete count without truncating the chain or
+ 	 * changing ring ownership. The poll's refill can replenish free slots.
+@@ -154,6 +219,9 @@
+ 	}
+ 	q->tail = index;
+ 	q->queued -= i;
++	if (unlikely(npu_rx_audit))
++		mt76_npu_audit_txfree(dev, q, skb, start, nframes,
++							 first_ctrl, first_info);
+ 
+ 	return skb;
+ }

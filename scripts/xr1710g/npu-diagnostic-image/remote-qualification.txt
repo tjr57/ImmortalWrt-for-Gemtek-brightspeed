@@ -1,0 +1,24 @@
+<!-- npu-remote-trials-current:start -->
+## Current remote NPU producer trial (2026-10-10)
+
+- Explicit owner accepts remote recovery loss; older physical-only holds below
+ are superseded. AP2 diagnostic image installed first and healthy, then AP1.
+- AP23-derived ROM contains b48d5e6e producer observer, not a root fix. Image
+ eb8e25b40ec03c50cf601911d95c6f118ab6534a339f839f373cc77fe88c5c7d;
+ base release still AP23 plus diagnostic marker. Production blob/config and
+ frozen AP23 are unchanged. Generic VM is not physical NPU acceptance.
+- AP2 epoch1 rejected before NPU enable because S08 precedes S10 debugfs mount;
+ old VM pre-mounted it. Early mount corrected, 23 ARM +3 real-kernel reboot
+ pairs per role pass. Optional diagnostic package release4 built-j12; ROM
+ release3 retained, live epochs temporarily use qualified role-specific helper.
+- AP2 epoch2 cd61bf16 enabled NPU and captured32 producer records, all length20/
+ header20, views equal, sourceLAST1. No fault across372 continuous kmsg records.
+ Independent180s deadline recovered to20f1ba3f, full health/config/41files pass.
+ First32/hart cannot prove later stream or historical TXFREE/Maple root fixed.
+- Latest AP1 deployment/epoch status and hashes: development/npu-remote-progress/
+ progress.json. Check it before acting. Never rerun submitted one-shot deploy
+ or epoch scripts; old epochs and qualifiers are immutable. Defaultflags off.
+<!-- npu-remote-trials-current:end -->
+
+
+Evidence: D:/ChatGPT/XR1710G/development/npu-remote-progress/progress.json

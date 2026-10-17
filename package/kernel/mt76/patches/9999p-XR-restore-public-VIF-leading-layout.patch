@@ -1,0 +1,29 @@
+Subject: [PATCH] mt7996: preserve VIF leading-member layout and assert nested casts
+
+Repair AP18 migration defect: public mt76 VIF link must remain at offset0.
+AP18 initial image must not be flashed to AP1.
+
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -323,9 +323,9 @@
+ };
+ 
+ struct mt7996_vif_link {
++	struct mt76_vif_link mt76; /* must be first */
+ 	u16 pp_sta_bitmap;
+ 	bool pp_sta_initialized;
+-	struct mt76_vif_link mt76; /* must be first */
+ 
+ 	struct mt7996_sta_link msta_link;
+ 	struct cfg80211_bitrate_mask bitrate_mask;
+@@ -603,6 +603,10 @@
+ 
+ /* mt76_alloc_device and mphy/mt76 aliases require this layout. */
+ static_assert(offsetof(struct mt7996_dev, mt76) == 0);
++/* Nested driver-private casts depend on each leading member as well. */
++static_assert(offsetof(struct mt7996_vif_link, mt76) == 0);
++static_assert(offsetof(struct mt7996_vif, deflink) == 0);
++static_assert(offsetof(struct mt7996_sta_link, wcid) == 0);
+ 
+ enum {
+ 	WFDMA0 = 0x0,

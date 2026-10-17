@@ -1,0 +1,111 @@
+Subject: [PATCH] airoha: reject unrepresented native-route policy predicates
+
+No wildcard widening or silent DSCP/flag/VLAN/namespace policy loss.
+Native netfilter predicates may remain software-only; not all policy can
+be represented by the hardware FOE ABI. PPE remains opt-in and off.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1802,6 +1802,88 @@
+ 	return true;
+ }
+ 
++/* A route FOE represents an exact IP/transport tuple, not a wildcard
++ * classifier. Match fields which the hardware ABI cannot encode stay in
++ * software, including DSCP/TTL/TCP flags, VLAN scopes, marks and tunnels.
++ * This deliberately rejects current nf_flow_table DSCP/FIN/RST predicates
++ * until their hardware match/trap semantics have been demonstrated.
++ */
++static bool airoha_ppe_l3_rule_exact(struct flow_rule *rule, u16 family,
++                                    struct net_device *odev)
++{
++ struct flow_match_meta meta;
++ struct flow_match_control control;
++ struct flow_match_basic basic;
++ struct flow_match_ports ports;
++ struct net_device *indev;
++ bool valid;
++ int i;
++
++ for (i=0;i<FLOW_DISSECTOR_KEY_MAX;i++) {
++  if (!flow_rule_match_key(rule,i)) continue;
++  switch (i) {
++  case FLOW_DISSECTOR_KEY_META: case FLOW_DISSECTOR_KEY_CONTROL:
++  case FLOW_DISSECTOR_KEY_BASIC: case FLOW_DISSECTOR_KEY_PORTS: break;
++  case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
++   if (family != FLOW_DISSECTOR_KEY_IPV4_ADDRS) return false;
++   break;
++  case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
++   if (family != FLOW_DISSECTOR_KEY_IPV6_ADDRS) return false;
++   break;
++  case FLOW_DISSECTOR_KEY_IP: {
++   struct flow_match_ip ip;
++   flow_rule_match_ip(rule,&ip);
++   if (ip.mask->tos || ip.mask->ttl || ip.key->tos) return false;
++   break;
++  }
++  case FLOW_DISSECTOR_KEY_TCP: {
++   struct flow_match_tcp tcp;
++   flow_rule_match_tcp(rule,&tcp);
++   if (tcp.mask->flags) return false;
++   break;
++  }
++  default: return false;
++  }
++ }
++ if (!odev || !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_META) ||
++     !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_CONTROL) ||
++     !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_BASIC) ||
++     !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_PORTS) ||
++     !flow_rule_match_key(rule,family)) return false;
++ flow_rule_match_meta(rule,&meta);flow_rule_match_control(rule,&control);
++ flow_rule_match_basic(rule,&basic);flow_rule_match_ports(rule,&ports);
++ if (meta.mask->ingress_ifindex != U32_MAX || meta.mask->ingress_iftype ||
++     meta.mask->l2_miss || meta.key->ingress_ifindex <= 0 ||
++     control.mask->addr_type != 0xffff || control.key->addr_type != family ||
++     control.mask->thoff || control.mask->flags ||
++     basic.mask->n_proto != htons(0xffff) || basic.mask->ip_proto != 0xff ||
++     basic.key->n_proto != htons(family == FLOW_DISSECTOR_KEY_IPV4_ADDRS ? ETH_P_IP : ETH_P_IPV6) ||
++     (basic.key->ip_proto != IPPROTO_TCP && basic.key->ip_proto != IPPROTO_UDP) ||
++     ports.mask->src != htons(0xffff) || ports.mask->dst != htons(0xffff)) return false;
++ if (family == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
++  struct flow_match_ipv4_addrs ip4;
++  flow_rule_match_ipv4_addrs(rule,&ip4);
++  if (ip4.mask->src != cpu_to_be32(U32_MAX) || ip4.mask->dst != cpu_to_be32(U32_MAX)) return false;
++ } else {
++  struct flow_match_ipv6_addrs ip6;
++  flow_rule_match_ipv6_addrs(rule,&ip6);
++  if (memchr_inv(&ip6.mask->src,0xff,sizeof(ip6.mask->src)) ||
++      memchr_inv(&ip6.mask->dst,0xff,sizeof(ip6.mask->dst))) return false;
++ }
++ /* Native route keys do not provide the context-complete L2B key. Do not
++  * promote bridged, VLAN, or namespace-isolated traffic through this path.
++  */
++ rcu_read_lock();
++ indev=dev_get_by_index_rcu(dev_net(odev),meta.key->ingress_ifindex);
++ valid=indev && net_eq(dev_net(indev),&init_net) &&
++       net_eq(dev_net(odev),&init_net) &&
++       !netif_is_bridge_port(indev) && !netif_is_bridge_port(odev) &&
++       !netif_is_bridge_master(indev) && !netif_is_bridge_master(odev) &&
++       !is_vlan_dev(indev) && !is_vlan_dev(odev);
++ rcu_read_unlock();
++ return valid;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1909,6 +1991,13 @@
+ 		default:
+ 			return -EOPNOTSUPP;
+ 		}
++	}
++
++	if (offload_type != PPE_PKT_TYPE_BRIDGE &&
++	    !airoha_ppe_l3_rule_exact(rule, addr_type, odev)) {
++		NL_SET_ERR_MSG_MOD(f->common.extack,
++		 "PPE cannot represent this exact policy/context; retained in software");
++		return -EOPNOTSUPP;
+ 	}
+ 
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||

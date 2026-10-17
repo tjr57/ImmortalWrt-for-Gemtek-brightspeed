@@ -1,0 +1,50 @@
+#!/bin/sh
+# One bounded AP1 log collection, explicitly requested for the next boot.
+# This service never changes modules, network settings, watchdogs or reboot policy.
+[ "${1:-}" = boot ] || exit 2
+request=/etc/xr-kmsg-capture.once
+binary=/usr/libexec/xr-kmsg-capture
+store=/root/xr-kmsg-journal
+[ -e "$request" ] || [ -L "$request" ] || exit 0
+[ -f "$request" ] && [ ! -L "$request" ] || exit 1
+permissions=$(ls -nd "$request") || exit 1
+set -- $permissions
+[ "$1:$3" = -rw-------:0 ] || exit 1
+[ "$(wc -c < "$request")" -le 128 ] || exit 1
+line=$(cat "$request") || exit 1
+old=${line#xr-kmsg-capture-v1 }
+[ "$line" = "xr-kmsg-capture-v1 $old" ] || exit 1
+[ "${#old}" = 36 ] || exit 1
+printf '%s\n' "$old" | grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' || exit 1
+boot=$(cat /proc/sys/kernel/random/boot_id) || exit 1
+[ "${#boot}" = 36 ] || exit 1
+printf '%s\n' "$boot" | grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' || exit 1
+# Arming must not start collection in the old running epoch.
+[ "$old" != "$boot" ] || exit 0
+[ "$(cat /tmp/sysinfo/board_name)" = gemtek,xr1710g ] || exit 1
+/usr/sbin/xr1710g-ap-role | grep -q '"role"[[:space:]]*:[[:space:]]*"ap1"' || exit 1
+[ -x "$binary" ] && [ ! -L "$binary" ] || exit 1
+[ ! -L /root ] || exit 1
+[ ! -L "$store" ] || exit 1
+umask 077
+if [ ! -e "$store" ]; then mkdir -m 700 "$store" || exit 1; fi
+[ -d "$store" ] || exit 1
+permissions=$(ls -nd "$store") || exit 1
+set -- $permissions
+[ "$1:$3" = drwx------:0 ] || exit 1
+record="$store/$boot"
+[ ! -e "$record" ] && [ ! -L "$record" ] || exit 1
+[ ! -e "$record.launch" ] && [ ! -L "$record.launch" ] || exit 1
+# Consume durably before starting; a later diagnostic reboot cannot re-arm it.
+rm -f "$request" || exit 1
+sync
+"$binary" "$record" 240 </dev/null >"$record.launch" 2>&1 &
+pid=$!
+for attempt in 1 2 3 4 5; do
+ [ ! -e "$record/fault.json" ] || exit 1
+ [ ! -e "$record/closed.json" ] || exit 1
+ [ -f "$record/ready.json" ] && exit 0
+ kill -0 "$pid" 2>/dev/null || exit 1
+ sleep 1
+done
+exit 1

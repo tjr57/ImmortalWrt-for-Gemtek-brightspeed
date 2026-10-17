@@ -1,0 +1,186 @@
+From: XR1710G AP project
+Subject: [PATCH] mt7996: add bounded per-link STA puncturing transport
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -440,7 +440,8 @@
+ 	dev->mt76.vif_mask &= ~BIT_ULL(mlink->idx);
+ 	dev->mld_idx_mask &= ~BIT_ULL(link->mld_idx);
+ 	phy->omac_mask &= ~BIT_ULL(mlink->omac_idx);
+-	if (!phy->omac_mask && READ_ONCE(phy->pp_mode) == 1) {
++	phy->pp_auto_owners &= ~BIT_ULL(mlink->omac_idx);
++	if (!phy->pp_auto_owners && READ_ONCE(phy->pp_mode) == 1) {
+ 		/* Interface removal must revoke firmware-auto even if userspace
+ 		 * disappeared before its vendor disable command was delivered.
+ 		 */
+@@ -992,6 +993,20 @@
+ 
+ 	phy = mphy->priv;
+ 
++	if (vif->type == NL80211_IFTYPE_STATION && (changed & BSS_CHANGED_BSSID))
++		link->pp_sta_initialized = false;
++
++	if (vif->type == NL80211_IFTYPE_STATION && info->eht_support &&
++	    (changed & (BSS_CHANGED_BSSID | BSS_CHANGED_BANDWIDTH))) {
++		int ret = mt7996_mcu_set_pp_sta_dscb(link, &info->chanreq.oper);
++		if (ret)
++			dev_warn_ratelimited(dev->mt76.dev, "STA puncturing update rejected: %d\n", ret);
++	}
++
++	if (vif->type == NL80211_IFTYPE_STATION &&
++	    (changed & BSS_CHANGED_BSSID) && is_zero_ether_addr(info->bssid))
++		link->pp_sta_initialized = false;
++
+ 	/* station mode uses BSSID to map the wlan entry to a peer,
+ 	 * and then peer references bss_info_rfch to set bandwidth cap.
+ 	 */
+@@ -1159,10 +1174,16 @@
+ 	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
+ 	struct mt7996_phy *phy = mt7996_vif_link_phy(link);
+ 	struct mt7996_sta_link *msta_link;
+-	int idx;
++	int idx, ret;
+ 
+ 	if (!phy)
+ 		return -EINVAL;
++
++	if (link_sta->eht_cap.has_eht && link_conf->vif->type == NL80211_IFTYPE_STATION) {
++		ret = mt7996_mcu_set_pp_sta_dscb(link, &link_conf->chanreq.oper);
++		if (ret)
++			return ret;
++	}
+ 
+ 	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
+ 	if (idx < 0)
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -5881,6 +5881,61 @@
+  * Static AP bitmap only: no unsolicited firmware-auto bitmap changes, no
+  * debug/vendor tree dependency. Preserve the existing channel/DFS validation.
+  */
++/* STA DSCB ABI from MediaTek Allen Ye, pinned feed08196fa6 patch0019.
++ * Cache belongs to the VIF link, never to another link sharing this PHY.
++ * Both STA/AP use the physical band's single bitmap; no regulatory override.
++ */
++int mt7996_mcu_set_pp_sta_dscb(struct mt7996_vif_link *link,
++                            const struct cfg80211_chan_def *chandef)
++{
++ struct mt7996_phy *phy = mt7996_vif_link_phy(link);
++ struct {
++  u8 reserved1[4];
++  __le16 tag, len;
++  u8 band, omac, eht_op_present, dscb_present;
++  __le16 bitmap;
++  u8 control, ccfs0, ccfs1, reserved2[3];
++ } __packed req = {
++  .tag = cpu_to_le16(1), .len = cpu_to_le16(16),
++  .eht_op_present = 1,
++ };
++ int ret;
++
++ if (!mt7996_puncturing_enable)
++  return 0;
++ if (!phy || !chandef->chan || !cfg80211_chandef_valid(chandef))
++  return -EINVAL;
++ if (chandef->chan->band == NL80211_BAND_2GHZ)
++  return chandef->punctured ? -EINVAL : 0;
++ switch (chandef->width) {
++ case NL80211_CHAN_WIDTH_320: req.control = 4; break;
++ case NL80211_CHAN_WIDTH_160: req.control = 3; break;
++ case NL80211_CHAN_WIDTH_80: req.control = 2; break;
++ default: return chandef->punctured ? -EINVAL : 0;
++ }
++ if (link->pp_sta_initialized && link->pp_sta_bitmap == chandef->punctured)
++  return 0;
++ req.band = phy->mt76->band_idx;
++ req.omac = link->mt76.omac_idx;
++ req.dscb_present = !!chandef->punctured;
++ req.bitmap = cpu_to_le16(chandef->punctured);
++ req.ccfs1 = ieee80211_frequency_to_channel(chandef->center_freq1);
++ req.ccfs0 = req.ccfs1;
++ if (chandef->width == NL80211_CHAN_WIDTH_320)
++  req.ccfs0 += chandef->chan->hw_value < req.ccfs1 ? -16 : 16;
++ else if (chandef->width == NL80211_CHAN_WIDTH_160)
++  req.ccfs0 += chandef->chan->hw_value < req.ccfs1 ? -8 : 8;
++ else
++  req.ccfs0 = 0;
++ ret = mt76_mcu_send_msg(&phy->dev->mt76, MCU_WM_UNI_CMD(PP),
++                        &req, sizeof(req), true);
++ if (!ret) {
++  link->pp_sta_bitmap = chandef->punctured;
++  link->pp_sta_initialized = true;
++ }
++ return ret;
++}
++
+ int mt7996_mcu_set_pp_mode(struct mt7996_phy *phy, u8 mode, u16 bitmap)
+ {
+ 	struct mt76_phy *mphy = phy->mt76;
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -320,6 +320,8 @@
+ };
+ 
+ struct mt7996_vif_link {
++	u16 pp_sta_bitmap;
++	bool pp_sta_initialized;
+ 	struct mt76_vif_link mt76; /* must be first */
+ 
+ 	struct mt7996_sta_link msta_link;
+@@ -449,6 +451,7 @@
+ 	bool rdd_tx_paused;
+ 	u16 punct_bitmap;
+ 	u8 pp_mode;
++	u64 pp_auto_owners;
+ };
+ 
+ struct mt7996_dev {
+@@ -820,6 +823,8 @@
+ int mt7996_mcu_set_chan_info(struct mt7996_phy *phy, u16 tag);
+ int mt7996_mcu_set_puncturing(struct mt7996_phy *phy);
+ extern bool mt7996_puncturing_enable;
++int mt7996_mcu_set_pp_sta_dscb(struct mt7996_vif_link *link,
++                            const struct cfg80211_chan_def *chandef);
+ int mt7996_mcu_set_pp_mode(struct mt7996_phy *phy, u8 mode, u16 bitmap);
+ void mt7996_pp_vendor_register(struct wiphy *wiphy);
+ void mt7996_pp_bitmap_event(struct mt7996_phy *phy, u16 bitmap);
+--- a/mt7996/pp.c
++++ b/mt7996/pp.c
+@@ -26,6 +26,8 @@
+ 	struct nlattr *tb[XR_PP_MAX + 1];
+ 	u8 id = 0, mode;
+ 	u16 bitmap = 0;
++	struct mt7996_phy *phy;
++	u64 others;
+ 	int ret;
+ 
+ 	if (!mt7996_puncturing_enable || !vif || vif->type != NL80211_IFTYPE_AP)
+@@ -50,7 +52,27 @@
+ 	mutex_lock(&dev->mt76.mutex);
+ 	link = (void *)rcu_dereference_protected(mvif->mt76.link[id],
+ 					      lockdep_is_held(&dev->mt76.mutex));
+-	ret = link && mt7996_vif_link_phy(link) ? mt7996_mcu_set_pp_mode(mt7996_vif_link_phy(link), mode, bitmap) : -EINVAL;
++	phy = link ? mt7996_vif_link_phy(link) : NULL;
++	if (!phy) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	others = phy->pp_auto_owners & ~BIT_ULL(link->mt76.omac_idx);
++	/* Firmware has one bitmap per physical band. Another AP's auto policy
++	 * cannot be overwritten by a manual setting or its neighbor stopping.
++	 */
++	if (others && mode == 2) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	ret = !mode && others ? 0 : mt7996_mcu_set_pp_mode(phy, mode, bitmap);
++	if (!ret) {
++		if (mode == 1)
++			phy->pp_auto_owners |= BIT_ULL(link->mt76.omac_idx);
++		else
++			phy->pp_auto_owners &= ~BIT_ULL(link->mt76.omac_idx);
++	}
++unlock:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 	return ret;
+ }

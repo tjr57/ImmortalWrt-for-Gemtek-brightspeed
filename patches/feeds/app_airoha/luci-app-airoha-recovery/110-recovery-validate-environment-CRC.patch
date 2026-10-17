@@ -1,0 +1,269 @@
+Subject: [PATCH] luci: distinguish invalid boot CRC from environment I/O failure
+
+Do not accept compiled-in fallback values as stored environment data.
+Initialize known defaults only for CRC-invalid environments, verify writes
+against a readable valid CRC, and show initialization explicitly in LuCI.
+
+--- a/luci-app-airoha-recovery/Makefile
++++ b/luci-app-airoha-recovery/Makefile
+@@ -2,7 +2,7 @@
+ 
+ LUCI_NAME:=luci-app-airoha-recovery
+ PKG_VERSION:=1.0.0
+-PKG_RELEASE:=4
++PKG_RELEASE:=5
+ 
+ PKG_MAINTAINER:=XR1710G Maintainer
+ PKG_LICENSE:=GPL-2.0-or-later
+--- a/luci-app-airoha-recovery/htdocs/luci-static/resources/view/airoha_recovery/recovery.js
++++ b/luci-app-airoha-recovery/htdocs/luci-static/resources/view/airoha_recovery/recovery.js
+@@ -74,6 +74,10 @@
+ 	render: function(status) {
+ 		var supported = !!(status && status.supported);
+ 		var recoveryActive = !!(status && status.recovery_active);
++		var needsInitialization = !!(status && status.env_state === 'invalid-crc');
++		var envValid = !!(status && status.env_state === 'ok');
++		var canRecover = supported && (envValid || needsInitialization);
++		this.envNeedsInitialization = needsInitialization;
+ 
+ 		injectCSS();
+ 
+@@ -83,29 +87,33 @@
+ 			body.appendChild(E('p', { 'class': 'alert-message warning' },
+ 				_('The device is configured to boot into the U-Boot HTTP recovery environment. Re-flash the firmware from the U-Boot interface.')));
+ 		}
++		if (needsInitialization)
++			body.appendChild(E('p', { 'class': 'alert-message warning' },
++				_('The stored U-Boot environment has an invalid CRC. Recovery will initialize the known boot defaults before rebooting.')));
+ 
+ 		var card = [
+ 			E('p', { 'class': 'rec-desc' },
+ 				_('Reboots the device into the U-Boot HTTP recovery environment using a one-shot trigger. The normal boot command is left unchanged.')),
+ 			E('div', { 'class': 'rec-status' }, [
+ 				E('span', { 'class': 'rec-status-label' }, _('U-Boot environment')),
+-				E('span', { 'class': 'rec-status-value' + (supported ? '' : ' fail') },
+-					supported ? _('Available') : _('Unavailable'))
++				E('span', { 'class': 'rec-status-value' + (envValid ? '' : ' fail') },
++					needsInitialization ? _('Invalid CRC (initialization required)') :
++					(envValid ? _('Available') : _('Unavailable')))
+ 			])
+ 		];
+ 
+ 		/* Surface the backend reason code so a failure can be reported
+ 		 * without digging through the device shell. */
+-		if (!supported && status && status.reason)
++		if (status && status.reason)
+ 			card.push(E('p', { 'class': 'rec-desc' },
+ 				_('Diagnostic code:') + ' ' + status.reason));
+ 
+ 		card.push(E('div', { 'class': 'rec-btn' }, [
+ 			E('button', {
+ 				'class': 'cbi-button cbi-button-action important',
+-				'disabled': (supported && !recoveryActive) ? null : 'disabled',
++				'disabled': (canRecover && !recoveryActive) ? null : 'disabled',
+ 				'click': ui.createHandlerFn(this, 'handleRebootToUboot')
+-			}, _('Reboot to U-Boot'))
++			}, needsInitialization ? _('Initialize environment and reboot to U-Boot') : _('Reboot to U-Boot'))
+ 		]));
+ 
+ 		body.appendChild(E('div', { 'class': 'rec-card' }, card));
+@@ -117,7 +125,9 @@
+ 		var self = this;
+ 
+ 		return L.ui.showModal(_('Reboot to U-Boot'), [
+-			E('p', {}, _('The device will reboot into the U-Boot HTTP recovery environment now. Continue?')),
++			E('p', {}, this.envNeedsInitialization
++				? _('Initialize the CRC-invalid environment with the known boot defaults, then reboot into U-Boot HTTP recovery?')
++				: _('The device will reboot into the U-Boot HTTP recovery environment now. Continue?')),
+ 			E('div', { 'class': 'right' }, [
+ 				E('button', {
+ 					'class': 'cbi-button cbi-button-apply',
+--- a/luci-app-airoha-recovery/po/templates/luci-app-airoha-recovery.pot
++++ b/luci-app-airoha-recovery/po/templates/luci-app-airoha-recovery.pot
+@@ -57,3 +57,15 @@
+ #: htdocs/luci-static/resources/view/airoha_recovery/recovery.js
+ msgid "Cancel"
+ msgstr ""
++
++msgid "The stored U-Boot environment has an invalid CRC. Recovery will initialize the known boot defaults before rebooting."
++msgstr ""
++
++msgid "Invalid CRC (initialization required)"
++msgstr ""
++
++msgid "Initialize environment and reboot to U-Boot"
++msgstr ""
++
++msgid "Initialize the CRC-invalid environment with the known boot defaults, then reboot into U-Boot HTTP recovery?"
++msgstr ""
+--- a/luci-app-airoha-recovery/po/zh_Hans/luci-app-airoha-recovery.po
++++ b/luci-app-airoha-recovery/po/zh_Hans/luci-app-airoha-recovery.po
+@@ -62,3 +62,15 @@
+ #: htdocs/luci-static/resources/view/airoha_recovery/recovery.js
+ msgid "Cancel"
+ msgstr "取消"
++
++msgid "The stored U-Boot environment has an invalid CRC. Recovery will initialize the known boot defaults before rebooting."
++msgstr "已保存的 U-Boot 环境 CRC 无效。进入恢复模式前将写入本机已知的引导默认值。"
++
++msgid "Invalid CRC (initialization required)"
++msgstr "CRC 无效（需要初始化）"
++
++msgid "Initialize environment and reboot to U-Boot"
++msgstr "初始化引导环境并重启进入 U-Boot"
++
++msgid "Initialize the CRC-invalid environment with the known boot defaults, then reboot into U-Boot HTTP recovery?"
++msgstr "是否使用本机已知的引导默认值初始化 CRC 无效的环境，然后重启进入 U-Boot HTTP 恢复模式？"
+--- a/luci-app-airoha-recovery/root/usr/libexec/rpcd/luci.airoha_recovery
++++ b/luci-app-airoha-recovery/root/usr/libexec/rpcd/luci.airoha_recovery
+@@ -46,6 +46,7 @@
+ 
+ # Reason code of the last failure, consumed by get_status().
+ ENV_REASON=""
++ENV_STATE="unavailable"
+ # stderr of the last failed fw_setenv call.
+ ENV_ERROR=""
+ 
+@@ -199,12 +200,34 @@
+ # meaningless and the environment must be populated from scratch.
+ env_crc_ok()
+ {
+-	local out
+-
+-	out="$(/usr/sbin/fw_printenv -c "$ENV_CONF" 2>&1 >/dev/null)"
+-	case "$out" in
+-		*Bad\ CRC*|*environment\ not\ initialized*) return 1 ;;
+-	esac
++	local out rc
++
++	# fw_printenv can exit zero after falling back to compiled-in defaults.
++	# Capture only stderr, never environment values or boot arguments.
++	out="$(LC_ALL=C /usr/sbin/fw_printenv -c "$ENV_CONF" 2>&1 >/dev/null)"
++	rc=$?
++	ENV_STATE="unreadable"
++	ENV_REASON="uboot-env-unreadable"
++	if [ "$rc" != 0 ]; then
++		ENV_ERROR="fw_printenv failed (rc=$rc): $out"
++		log_msg "env_crc_ok: $ENV_ERROR"
++		return 2
++	fi
++	if printf '%s' "$out" | grep -Eiq 'bad[[:space:]]+crc|using[[:space:]]+default[[:space:]]+environment'; then
++		ENV_STATE="invalid-crc"
++		ENV_REASON="uboot-env-invalid-crc"
++		ENV_ERROR="stored environment CRC is invalid"
++		log_msg "env_crc_ok: $ENV_ERROR"
++		return 1
++	fi
++	if [ -n "$out" ]; then
++		ENV_ERROR="fw_printenv diagnostic: $out"
++		log_msg "env_crc_ok: $ENV_ERROR"
++		return 2
++	fi
++	ENV_STATE="ok"
++	ENV_REASON=""
++	ENV_ERROR=""
+ 	return 0
+ }
+ 
+@@ -229,8 +252,14 @@
+ 		return 1
+ 	fi
+ 
++	# A value from the fallback environment is not a successful write-back.
++	if ! env_crc_ok; then
++		log_msg "env_write $var: CRC/readability verification failed"
++		return 2
++	fi
+ 	stored="$(/usr/sbin/fw_printenv -c "$ENV_CONF" -n "$var" 2>>"$ENV_LOG")"
+-	if [ "$stored" != "$value" ]; then
++	rc=$?
++	if [ "$rc" != 0 ] || [ "$stored" != "$value" ]; then
+ 		ENV_ERROR="$var not written (read back '$stored', expected '$value')"
+ 		log_msg "env_write $var: $ENV_ERROR"
+ 		return 2
+@@ -276,10 +305,21 @@
+ 	}
+ 	boot_env_defaults > "$dflt" 2>/dev/null
+ 
+-	env_crc_ok || {
+-		crc_ok=0
+-		log_msg "ensure_boot_env: environment CRC invalid, populating defaults"
+-	}
++	if env_crc_ok; then
++		:
++	else
++		case $? in
++			1)
++				crc_ok=0
++				log_msg "ensure_boot_env: environment CRC invalid, populating defaults"
++				;;
++			*)
++				# Read or configuration failures must never cause initialization.
++				rm -f "$dflt"
++				return 1
++				;;
++		esac
++	fi
+ 
+ 	while IFS= read -r line; do
+ 		[ -n "$line" ] || continue
+@@ -341,11 +381,15 @@
+ 	elif ! ensure_env_conf; then
+ 		reason="$ENV_REASON"
+ 		log_msg "get_status: $reason"
+-	elif ! /usr/sbin/fw_printenv -c "$ENV_CONF" >/dev/null 2>>"$ENV_LOG"; then
+-		# A real probe: config file present but the env is unusable.
+-		reason="uboot-env-unreadable"
+-		env_state="unreadable"
+-		log_msg "get_status: fw_printenv failed on $ENV_CONF"
++	elif ! env_crc_ok; then
++		reason="$ENV_REASON"
++		env_state="$ENV_STATE"
++		# Recovery can initialize a known board's CRC-invalid environment,
++		# but the UI must not present fallback defaults as stored values.
++		if [ "$env_state" = "invalid-crc" ]; then
++			supported=1
++			conf="$ENV_CONF"
++		fi
+ 	else
+ 		supported=1
+ 		reason=""
+@@ -390,24 +434,24 @@
+ 		return 0
+ 	fi
+ 
+-	if ! /usr/sbin/fw_printenv -c "$ENV_CONF" >/dev/null 2>>"$ENV_LOG"; then
++	if env_crc_ok; then
++		if env_read "$RECOVERY_TRIGGER" >/dev/null 2>&1; then
++			printf '{"success":false,"error":"Device is already configured to boot into U-Boot recovery"}\n'
++			return 0
++		fi
++
++		bootcmd="$(env_read bootcmd)"
++		case "$bootcmd" in
++			*airoha_recovery_once*|http_recovery|run\ http_recovery)
++				printf '{"success":false,"error":"Device is already configured to boot into U-Boot recovery"}\n'
++				return 0
++				;;
++		esac
++	elif [ "$ENV_STATE" != "invalid-crc" ]; then
+ 		printf '{"success":false,"error":"Cannot read the U-Boot environment: %s"}\n' \
+ 			"$(last_error_hint)"
+ 		return 0
+ 	fi
+-
+-	if env_read "$RECOVERY_TRIGGER" >/dev/null 2>&1; then
+-		printf '{"success":false,"error":"Device is already configured to boot into U-Boot recovery"}\n'
+-		return 0
+-	fi
+-
+-	bootcmd="$(env_read bootcmd)"
+-	case "$bootcmd" in
+-		*airoha_recovery_once*|http_recovery|run\ http_recovery)
+-			printf '{"success":false,"error":"Device is already configured to boot into U-Boot recovery"}\n'
+-			return 0
+-			;;
+-	esac
+ 
+ 	if ! ensure_boot_env; then
+ 		printf '{"success":false,"error":"Cannot ensure boot environment: %s"}\n' \

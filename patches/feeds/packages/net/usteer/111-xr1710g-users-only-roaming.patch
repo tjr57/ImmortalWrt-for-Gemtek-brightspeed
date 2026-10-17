@@ -1,0 +1,224 @@
+--- a/net/usteer/Makefile
++++ b/net/usteer/Makefile
+@@ -5,7 +5,7 @@
+ PKG_NAME:=usteer
+ PKG_SOURCE_DATE:=2026-05-19
+ PKG_SOURCE_VERSION:=7532e1252fb937fe34b6da05e86fd34babd91ef5
+-PKG_RELEASE:=1
++PKG_RELEASE:=4
+ 
+ PKG_SOURCE_PROTO:=git
+ PKG_SOURCE_URL=https://git.openwrt.org/project/usteer.git
+@@ -30,6 +30,11 @@
+ /etc/config/usteer
+ endef
+ 
++define Build/Prepare
++	$(call Build/Prepare/Default)
++	$(CP) ./files/xr1710g-usteer.init $(PKG_BUILD_DIR)/openwrt/usteer/files/etc/init.d/usteer
++endef
++
+ define Package/usteer/install
+ 	$(INSTALL_DIR) $(1)/sbin $(1)/etc/init.d $(1)/etc/config
+ 
+--- /dev/null
++++ b/net/usteer/files/xr1710g-usteer.init
+@@ -0,0 +1,198 @@
++#!/bin/sh /etc/rc.common
++# Copyright (C) 2013 OpenWrt.org
++
++START=50
++USE_PROCD=1
++
++NAME=usteer
++PROG=/sbin/usteerd
++
++# XR1710G: use only an explicitly enabled users profile. Old profiles and
++# factory presets never start steering. usteer enables k/v together internally,
++# so do not override an operator who disabled either flag in the AP profile.
++xr_profile_ready() {
++ [ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = 'gemtek,xr1710g' ] || return 0
++ [ "$(uci -q get xr1710g_ap_configurator.users.enabled)" = 1 ] &&
++ [ "$(uci -q get xr1710g_ap_configurator.roaming.enabled)" = 1 ] &&
++ [ "$(uci -q get xr1710g_ap_configurator.roaming.ieee80211k)" != 0 ] &&
++ [ "$(uci -q get xr1710g_ap_configurator.roaming.ieee80211v)" != 0 ] &&
++ [ "$(uci -q get wireless.xr_users.xr1710g_owner)" = users ] &&
++ [ "$(uci -q get wireless.xr_users.mode)" = ap ] &&
++ [ "$(uci -q get wireless.xr_users.disabled)" != 1 ] &&
++ [ "$(uci -q get wireless.xr_users.ieee80211k)" = 1 ] &&
++ [ "$(uci -q get wireless.xr_users.bss_transition)" = 1 ] || return 1
++ local user_ssid iot_ssid
++ user_ssid=$(uci -q get wireless.xr_users.ssid)
++ iot_ssid=$(uci -q get wireless.xr_iot.ssid)
++ [ -n "$user_ssid" ] && [ "$user_ssid" != "$iot_ssid" ]
++}
++xr_service_ready() {
++ xr_profile_ready || return 1
++ [ "$(uci -q get usteer.@usteer[-1].enabled)" != 0 ]
++}
++
++xr_users_policy() {
++	[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = 'gemtek,xr1710g' ] || return 0
++	# Replace upstream all-SSID/all-network defaults after ordinary config load.
++	# No password is read. IoT and the dedicated mesh are not steered.
++	json_add_array interfaces
++	for i in $(load_ifaces lan); do json_add_string "" "$i"; done
++	json_close_array
++	json_add_array ssid_list
++	json_add_string "" "$(uci -q get wireless.xr_users.ssid)"
++	json_close_array
++	json_add_boolean local_mode 0
++	json_add_boolean ipv6 0
++	json_add_boolean assoc_steering 0
++	json_add_boolean load_kick_enabled 0
++	json_add_int aggressiveness 1
++	json_add_int band_steering_interval 0
++	json_add_int min_connect_snr 0
++	json_add_int min_snr 0
++	json_add_int signal_diff_threshold 8
++	json_add_int roam_scan_snr -67
++	json_add_int roam_trigger_snr -72
++	json_add_int roam_scan_interval 10000
++	json_add_int roam_trigger_interval 60000
++	json_add_int max_neighbor_reports 8
++}
++
++. /lib/functions/network.sh
++. /usr/share/libubox/jshn.sh
++. /lib/functions.sh
++
++load_ifaces() {
++	local network="${1:-$(uci get usteer.@usteer[-1].network)}"
++	for n in $network; do
++		local device
++		json_load "$(ifstatus $n)"
++		json_get_var device l3_device
++		echo -n "$device "
++	done
++}
++
++_add_string() {
++	json_add_string "" "$1"
++}
++
++uci_option_to_json_string_array() {
++	local cfg="$1"
++	local option="$2"
++
++	json_add_array "$option"
++	config_list_foreach "$cfg" "$option" _add_string
++	json_close_array
++}
++
++uci_option_to_json_bool() {
++	local cfg="$1"
++	local option="$2"
++	local val
++
++	config_get_bool val "$cfg" $option
++	[ -n "$val" ] && json_add_boolean $option $val
++}
++
++uci_option_to_json_string() {
++	local cfg="$1"
++	local option="$2"
++	local val
++
++	config_get val "$cfg" "$option"
++	[ -n "$val" ] && json_add_string $option "$val"
++}
++
++uci_option_to_json() {
++	local cfg="$1"
++	local option="$2"
++	local val
++
++	config_get val "$cfg" $option
++	[ -n "$val" ] && json_add_int $option $val
++}
++
++uci_usteer() {
++	local cfg="$1"
++
++	uci_option_to_json_bool "$cfg" syslog
++	uci_option_to_json_bool "$cfg" ipv6
++	uci_option_to_json_bool "$cfg" local_mode
++	uci_option_to_json_bool "$cfg" load_kick_enabled
++	uci_option_to_json_bool "$cfg" assoc_steering
++	uci_option_to_json_string "$cfg" node_up_script
++	uci_option_to_json_string_array "$cfg" ssid_list
++	uci_option_to_json_string_array "$cfg" aggressiveness_mac_list
++	uci_option_to_json_string_array "$cfg" event_log_types
++
++	for opt in \
++		debug_level \
++		sta_block_timeout local_sta_timeout local_sta_update \
++		max_neighbor_reports max_retry_band seen_policy_timeout \
++		aggressiveness measurement_report_timeout \
++		load_balancing_threshold band_steering_threshold \
++		remote_update_interval remote_node_timeout\
++		min_connect_snr min_snr min_snr_kick_delay signal_diff_threshold \
++		initial_connect_delay steer_reject_timeout roam_process_timeout\
++		roam_kick_delay roam_scan_tries roam_scan_timeout \
++		roam_scan_snr roam_scan_interval roam_trigger_snr roam_trigger_interval \
++		link_measurement_interval \
++		band_steering_interval band_steering_min_snr band_steering_signal_threshold \
++		load_kick_threshold load_kick_delay load_kick_min_clients \
++		load_kick_reason_code
++	do
++		uci_option_to_json "$cfg" "$opt"
++	done
++}
++
++
++load_config() {
++	xr_profile_ready || return 0
++	[ "$ENABLED" -gt 0 ] || return
++
++	ubus -t 10 wait_for usteer
++
++	json_init
++	json_add_array interfaces
++	for i in $(load_ifaces); do
++		json_add_string "" "$i"
++	done
++	json_close_array
++
++	config_load usteer
++	config_foreach uci_usteer usteer
++	xr_users_policy
++
++	ubus call usteer set_config "$(json_dump)"
++}
++
++reload_service() {
++ if [ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = 'gemtek,xr1710g' ] && ! xr_service_ready;then
++  stop
++  return 0
++ fi
++ start
++ load_config
++}
++
++service_started() {
++	load_config
++}
++
++service_triggers() {
++	procd_add_reload_trigger usteer xr1710g_ap_configurator
++	procd_add_raw_trigger "interface.*" 2000 /etc/init.d/usteer reload
++}
++
++start_service()
++{
++	xr_profile_ready || return 0
++	local network="$(uci -q get usteer.@usteer[-1].network)"
++	ENABLED="$(uci -q get usteer.@usteer[-1].enabled)"
++	ENABLED="${ENABLED:-1}"
++
++	[ "$ENABLED" -gt 0 ] || return
++
++	procd_open_instance
++	procd_set_param command "$PROG"
++	procd_close_instance
++}

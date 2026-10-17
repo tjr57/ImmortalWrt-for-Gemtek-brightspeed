@@ -1,0 +1,110 @@
+From: XR1710G AP development review
+Subject: [PATCH] net: airoha: add a boot-only PPE forwarding binding gate
+
+SPDX-License-Identifier: GPL-2.0-only
+
+Keep generic builds enabled by default. AP builds can select a default-off
+kernel option, retaining NPU WLAN DMA while rejecting forwarding bindings.
+Gate TC REPLACE, RX cache-miss/cache-hit insertion, and final BIND commit.
+Do not allow live writes: already-bound SRAM/DRAM entries would otherwise
+survive a false disable. A/B tests must explicitly reboot between modes.
+
+Prepared against naoki66 d331711dfa7aec1633076b71cefc14a5facd2184 effective
+Linux 6.18.54 after its 9990/9993/9994 Airoha PPE patches. Not hardware tested.
+No Signed-off-by is asserted by this generated review candidate.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -8,6 +8,7 @@
+ #include <linux/ip.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ipv6.h>
++#include <linux/moduleparam.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
+@@ -25,6 +26,15 @@
+  */
+ DEFINE_MUTEX(flow_offload_mutex);
+ static DEFINE_SPINLOCK(ppe_lock);
++
++/* Boot-only policy: a live disable would also have to invalidate existing
++ * SRAM/DRAM bindings. Do not expose a writable switch that leaves them active.
++ * This controls PPE forwarding, not the NPU WLAN DMA/ring transport.
++ */
++static bool ppe_bind_enable = IS_ENABLED(CONFIG_NET_AIROHA_PPE_BIND_DEFAULT);
++module_param_named(ppe_bind_enable, ppe_bind_enable, bool, 0400);
++MODULE_PARM_DESC(ppe_bind_enable,
++                "Allow PPE forwarding bindings (boot-only; NPU WLAN DMA remains available)");
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+ 	.head_offset = offsetof(struct airoha_flow_table_entry, node),
+@@ -892,6 +902,13 @@
+ 	struct airoha_eth *eth = ppe->eth;
+ 	struct airoha_npu *npu;
+ 	int err = 0;
++
++	/* Final guard covers every bind caller, including direct bridge fallback.
++	 * INVALID/unbind writes must remain available for teardown.
++	 */
++	if (!ppe_bind_enable &&
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, e->ib1) == AIROHA_FOE_STATE_BIND)
++		return -EOPNOTSUPP;
+ 
+ 	if (airoha_is_7581(eth) &&
+ 	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) ==
+@@ -1490,6 +1507,10 @@
+ 	struct hlist_node *n;
+ 	u32 index, state;
+ 
++	/* Also block cache hits and bridge fallback before resolving a path. */
++	if (!ppe_bind_enable)
++		return;
++
+ 	if (!local)
+ 		bridge_ready = airoha_ppe_foe_prepare_bridge_subflow(ppe, skb,
+ 							     &bridge_hwe);
+@@ -2101,7 +2122,15 @@
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+ 	struct airoha_eth *eth = ppe->eth;
++	struct flow_cls_offload *f = type_data;
+ 	int err = 0;
++
++	/* Reject new TC/netfilter HW rules before initializing PPE forwarding.
++	 * Keep destroy/stats callbacks available to the existing cleanup path.
++	 */
++	if (!ppe_bind_enable && f->command == FLOW_CLS_REPLACE)
++		return -EOPNOTSUPP;
++
+ 
+ 	/* Netfilter flowtable can try to offload flower rules while not all
+ 	 * the net_devices are registered or initialized. Delay offloading
+@@ -2128,6 +2157,9 @@
+ 	struct airoha_ppe *ppe = dev->priv;
+ 	u32 ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+ 	u16 now, diff;
++
++	if (!ppe_bind_enable)
++		return;
+ 
+ 	if (hash > ppe_hash_mask)
+ 		return;
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -26,6 +26,15 @@
+ 	  This driver supports the gigabit ethernet MACs in the
+ 	  Airoha SoC family.
+ 
++config NET_AIROHA_PPE_BIND_DEFAULT
++	bool "Enable PPE forwarding bindings by default"
++	depends on NET_AIROHA
++	default y
++	help
++	  Keep the normal PPE forwarding behavior by default. Disable this
++	  for an AP software-forwarding baseline without disabling NPU WLAN
++	  DMA. The boot-only ppe_bind_enable parameter can override the default.
++
+ config AIROHA_PON_COMPAT
+ 	bool "Airoha legacy xPON compatibility"
+ 	depends on NET_AIROHA

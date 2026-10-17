@@ -1,0 +1,71 @@
+Subject: [PATCH] wifi: mt76: order and validate NPU RX chain preflight
+SPDX-License-Identifier: GPL-2.0-only
+
+Review candidate following ownership 0011 and refill 0158. Read DONE before
+the metadata barrier/count. Reject a chain exceeding armed slots instead
+of turning it into a truncated packet. Validate every DONE and DMA buffer
+length before handing any page to an skb. Preserve the final read barrier
+and existing zero-count-as-one semantics. No DMA_IDX or field-layout change.
+
+No Signed-off-by is asserted by this generated review candidate.
+
+--- a/npu.c
++++ b/npu.c
+@@ -79,17 +79,33 @@
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 	int i, nframes, index = q->tail;
+ 	struct sk_buff *skb = NULL;
++	u32 ctrl;
+ 
+ 	if (!q->queued)
+ 		return NULL;
+ 
+-	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, desc[index].info);
+-	/* a chain can never span more slots than are armed */
+-	nframes = clamp(nframes, 1, q->queued);
+-
+-	/* a partial chain cannot be unwound: the ring still owns its pages */
++	/* DONE transfers ownership; only then may metadata be consumed. */
++	ctrl = READ_ONCE(desc[index].ctrl);
++	if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, ctrl))
++		return NULL;
++	dma_rmb();
++
++	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK,
++			    READ_ONCE(desc[index].info));
++	nframes = max_t(int, nframes, 1);
++	/* Reject a corrupt/incomplete count without truncating the chain or
++	 * changing ring ownership. The poll's refill can replenish free slots.
++	 */
++	if (nframes > q->queued)
++		return NULL;
++
++	/* Validate the whole chain before any page is handed to an skb. */
+ 	for (i = 0; i < nframes; i++) {
+-		if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, desc[index].ctrl))
++		struct mt76_queue_entry *e = &q->entry[index];
++
++		ctrl = READ_ONCE(desc[index].ctrl);
++		if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, ctrl) ||
++		    FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl) > e->dma_len[0])
+ 			return NULL;
+ 		index = (index + 1) % q->ndesc;
+ 	}
+@@ -99,7 +115,7 @@
+ 	for (i = 0; i < nframes; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+ 		int len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK,
+-				    desc[index].ctrl);
++				    READ_ONCE(desc[index].ctrl));
+ 
+ 		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+ 					e->dma_len[0],
+@@ -124,7 +140,7 @@
+ 						len, q->buf_size);
+ 		}
+ 
+-		*info = desc[index].info;
++		*info = READ_ONCE(desc[index].info);
+ 		index = (index + 1) % q->ndesc;
+ 	}
+ 	q->tail = index;

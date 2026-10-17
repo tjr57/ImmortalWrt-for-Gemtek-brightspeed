@@ -1,0 +1,211 @@
+--- a/luci-app-airoha-fancontrol/root/usr/libexec/rpcd/luci.fan
++++ b/luci-app-airoha-fancontrol/root/usr/libexec/rpcd/luci.fan
+@@ -1,15 +1,6 @@
+ #!/bin/sh
+ # Airoha Fan Control RPC backend for LuCI
+-# Dynamically find NCT7802 fan controller hwmon device
+-find_nct7802() {
+-	for hwmon in /sys/class/hwmon/hwmon*; do
+-		if [ -f "$hwmon/name" ] && [ "$(cat "$hwmon/name" 2>/dev/null)" = "nct7802" ]; then
+-			echo "$hwmon"
+-			return
+-		fi
+-	done
+-	echo "/sys/class/hwmon/hwmon5"  # fallback
+-}
++. /usr/lib/xr1710g/fan-policy.sh
+ 
+ # Dynamically find mt7996 WiFi hwmon devices
+ find_mt7996_hwmon() {
+@@ -45,26 +36,13 @@
+ 	echo ""
+ }
+ 
+-# Cache hwmon paths — they don't change after boot, avoid scanning on every RPC call
+-_HWMON_CACHE="/tmp/fan-hwmon-cache.sh"
+-if [ -f "$_HWMON_CACHE" ]; then
+-	. "$_HWMON_CACHE"
+-else
+-	HWMON=$(find_nct7802)
+-	PHY1_HWMON=$(find_phy_hwmon ":05")
+-	PHY2_HWMON=$(find_phy_hwmon ":08")
+-	WIFI_24G_HWMON=$(find_mt7996_hwmon 0)
+-	WIFI_5G_HWMON=$(find_mt7996_hwmon 1)
+-	WIFI_6G_HWMON=$(find_mt7996_hwmon 2)
+-	cat > "$_HWMON_CACHE" 2>/dev/null <<EOF
+-HWMON="$HWMON"
+-PHY1_HWMON="$PHY1_HWMON"
+-PHY2_HWMON="$PHY2_HWMON"
+-WIFI_24G_HWMON="$WIFI_24G_HWMON"
+-WIFI_5G_HWMON="$WIFI_5G_HWMON"
+-WIFI_6G_HWMON="$WIFI_6G_HWMON"
+-EOF
+-fi
++# Rescan by sensor name on every call. Never source stale cached paths.
++HWMON=$(find_nct7802) || HWMON=''
++PHY1_HWMON=$(find_phy_hwmon ':05')
++PHY2_HWMON=$(find_phy_hwmon ':08')
++WIFI_24G_HWMON=$(find_mt7996_hwmon 0)
++WIFI_5G_HWMON=$(find_mt7996_hwmon 1)
++WIFI_6G_HWMON=$(find_mt7996_hwmon 2)
+ 
+ read_temp() {
+ 	local file="$1"
+@@ -87,18 +65,24 @@
+ 
+ get_status() {
+ 	local temp_cpu temp_board temp_phy1 temp_phy2
+-	local fan_rpm fan_pwm fan_mode fan_percentage
++	local fan_rpm=0 fan_pwm=0 fan_mode=-1 fan_percentage=0
++	local controller_available=false control_applied=false
+ 
+ 	temp_cpu=$(read_temp "/sys/class/thermal/thermal_zone0/temp")
+-	temp_board=$(read_temp "${HWMON}/temp1_input")
++	temp_board=0
++	[ -z "$HWMON" ] || temp_board=$(read_temp "${HWMON}/temp1_input")
+ 
+ 	temp_phy1=$([ -n "$PHY1_HWMON" ] && read_temp "$PHY1_HWMON/temp1_input" || echo 0)
+ 	temp_phy2=$([ -n "$PHY2_HWMON" ] && read_temp "$PHY2_HWMON/temp1_input" || echo 0)
+ 
+-	fan_rpm=$(read_value "${HWMON}/fan1_input")
+-	fan_pwm=$(read_value "${HWMON}/pwm1")
+-	fan_mode=$(read_value "${HWMON}/pwm1_enable")
+-	fan_percentage=$((fan_pwm * 100 / 255))
++	if [ -n "$HWMON" ]; then
++		controller_available=true
++		fan_rpm=$(read_value "$HWMON/fan1_input")
++		fan_pwm=$(read_value "$HWMON/pwm1")
++		fan_mode=$(read_value "$HWMON/pwm1_enable")
++		fan_percentage=$((fan_pwm * 100 / 255))
++		if [ -r "$FAN_STATUS_FILE" ] && [ "$(jsonfilter -i "$FAN_STATUS_FILE" -e '@.applied' 2>/dev/null)" = 'true' ]; then control_applied=true; fi
++	fi
+ 
+ 	local wifi_24g=0 wifi_5g=0 wifi_6g=0
+ 	[ -n "$WIFI_24G_HWMON" ] && wifi_24g=$(read_temp "$WIFI_24G_HWMON/temp1_input")
+@@ -109,7 +93,7 @@
+ 	local uci_preset=$(uci -q get fan.settings.curve_preset || echo "balanced")
+ 	local uci_manual_pwm=$(uci -q get fan.settings.manual_pwm || echo "127")
+ 
+-	local mode_desc="Unknown"
++	local mode_desc="Unavailable"
+ 	case "$fan_mode" in
+ 		0) mode_desc="Full Speed" ;;
+ 		1) mode_desc="Manual" ;;
+@@ -117,12 +101,12 @@
+ 		3) mode_desc="Auto (Closed Loop)" ;;
+ 	esac
+ 
+-	printf '{"temp_cpu":%d,"temp_board":%d,"temp_phy1":%d,"temp_phy2":%d,"wifi_24g":%d,"wifi_5g":%d,"wifi_6g":%d,"fan_rpm":%d,"fan_pwm":%d,"fan_percentage":%d,"fan_mode":%d,"fan_mode_desc":"%s","uci_mode":"%s","uci_preset":"%s","uci_manual_pwm":%d}' \
++	printf '{"temp_cpu":%d,"temp_board":%d,"temp_phy1":%d,"temp_phy2":%d,"wifi_24g":%d,"wifi_5g":%d,"wifi_6g":%d,"fan_rpm":%d,"fan_pwm":%d,"fan_percentage":%d,"fan_mode":%d,"fan_mode_desc":"%s","uci_mode":"%s","uci_preset":"%s","uci_manual_pwm":%d,"controller_available":%s,"control_applied":%s}' \
+ 		"$temp_cpu" "$temp_board" "$temp_phy1" "$temp_phy2" \
+ 		"$wifi_24g" "$wifi_5g" "$wifi_6g" \
+ 		"$fan_rpm" "$fan_pwm" "$fan_percentage" \
+ 		"$fan_mode" "$mode_desc" \
+-		"$uci_mode" "$uci_preset" "$uci_manual_pwm"
++		"$uci_mode" "$uci_preset" "$uci_manual_pwm" "$controller_available" "$control_applied"
+ }
+ 
+ get_curve() {
+@@ -163,14 +147,25 @@
+ 	echo "$curves"
+ }
+ 
++fan_commit_reload() {
++	if ! uci commit fan; then
++		echo '{"success":false,"saved":false,"applied":false,"error":"Configuration save failed"}'
++		return 1
++	fi
++	# reload_service propagates apply_settings failure through rc.common.
++	if /etc/init.d/fan reload >/dev/null 2>&1; then
++		echo '{"success":true,"saved":true,"applied":true}'
++	else
++		echo '{"success":false,"saved":true,"applied":false,"error":"Configuration saved but fan control is unavailable or could not be applied"}'
++	fi
++}
++
+ set_mode() {
+ 	local mode="$1"
+ 	case "$mode" in
+ 		manual|auto)
+ 			uci set fan.settings.mode="$mode"
+-			uci commit fan
+-			/etc/init.d/fan reload
+-			echo '{"success":true}'
++			fan_commit_reload
+ 			;;
+ 		*)
+ 			echo '{"success":false,"error":"Invalid mode"}'
+@@ -180,11 +175,9 @@
+ 
+ set_manual_pwm() {
+ 	local pwm="$1"
+-	if [ "$pwm" -ge 0 ] && [ "$pwm" -le 255 ] 2>/dev/null; then
++	if fan_uint "$pwm" 255; then
+ 		uci set fan.settings.manual_pwm="$pwm"
+-		uci commit fan
+-		/etc/init.d/fan reload
+-		echo '{"success":true}'
++		fan_commit_reload
+ 	else
+ 		echo '{"success":false,"error":"Invalid PWM value (0-255)"}'
+ 	fi
+@@ -195,9 +188,7 @@
+ 	case "$preset" in
+ 		quiet|balanced|performance|custom)
+ 			uci set fan.settings.curve_preset="$preset"
+-			uci commit fan
+-			/etc/init.d/fan reload
+-			echo '{"success":true}'
++			fan_commit_reload
+ 			;;
+ 		*)
+ 			echo '{"success":false,"error":"Invalid preset"}'
+@@ -206,25 +197,29 @@
+ }
+ 
+ set_custom_curve() {
+-	local json
+-	read json
+-	if command -v jsonfilter >/dev/null 2>&1; then
+-		for i in 1 2 3 4 5; do
+-			local idx=$((i - 1))
+-			local temp=$(echo "$json" | jsonfilter -e "@.points[${idx}].temp" 2>/dev/null)
+-			local pwm=$(echo "$json" | jsonfilter -e "@.points[${idx}].pwm" 2>/dev/null)
+-			if [ -n "$temp" ] && [ -n "$pwm" ]; then
+-				uci set fan.custom.point${i}_temp="$temp"
+-				uci set fan.custom.point${i}_pwm="$pwm"
+-			fi
+-		done
+-		uci set fan.settings.curve_preset="custom"
+-		uci commit fan
+-		/etc/init.d/fan reload
+-		echo '{"success":true}'
+-	else
+-		echo '{"success":false,"error":"jsonfilter not available"}'
+-	fi
++	local json i idx temp pwm last_temp=-1 last_pwm=-1
++	read -r json
++	if ! command -v jsonfilter >/dev/null 2>&1; then
++		echo '{"success":false,"error":"jsonfilter not available"}'; return 1
++	fi
++	# Validate the complete curve before changing a single UCI option.
++	for i in 1 2 3 4 5; do
++		idx=$((i - 1))
++		temp=$(printf '%s' "$json" | jsonfilter -e "@.points[${idx}].temp" 2>/dev/null)
++		pwm=$(printf '%s' "$json" | jsonfilter -e "@.points[${idx}].pwm" 2>/dev/null)
++		if ! fan_uint "$temp" 120 || ! fan_uint "$pwm" 255 || [ "$temp" -le "$last_temp" ] || [ "$pwm" -lt "$last_pwm" ] || { [ "$i" -eq 5 ] && [ "$pwm" -ne 255 ]; }; then
++			echo '{"success":false,"error":"Curve requires increasing temperatures (0-120), nondecreasing PWM (0-255), and final PWM 255"}'; return 1
++		fi
++		eval "custom_temp_$i=\$temp custom_pwm_$i=\$pwm"
++		last_temp="$temp"; last_pwm="$pwm"
++	done
++	for i in 1 2 3 4 5; do
++		eval "temp=\$custom_temp_$i pwm=\$custom_pwm_$i"
++		uci set "fan.custom.point${i}_temp=$temp"
++		uci set "fan.custom.point${i}_pwm=$pwm"
++	done
++	uci set fan.settings.curve_preset='custom'
++	fan_commit_reload
+ }
+ 
+ case "$1" in

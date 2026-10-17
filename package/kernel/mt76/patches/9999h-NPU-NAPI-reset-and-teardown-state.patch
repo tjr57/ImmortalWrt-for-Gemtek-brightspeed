@@ -1,0 +1,105 @@
+--- a/mt76.h
++++ b/mt76.h
+@@ -276,6 +276,7 @@
+ 	int npu_irq;
+ 	bool npu_irq_registered;
+ 	bool npu_napi_registered;
++	bool npu_napi_enabled;
+ };
+ 
+ struct mt76_mcu_ops {
+@@ -2182,6 +2183,30 @@
+ 	return mt76_dereference(mvif->link[link_conf->link_id], dev);
+ }
+ 
++/* Reset and teardown share this software state. napi_disable twice waits
++ * forever; netif_napi_del of an enabled instance is invalid. Only NPU queues
++ * need the additional partial-init/teardown tracking, other RX paths retain
++ * their previous lifecycle.
++ */
++static inline void mt76_rx_napi_disable(struct mt76_dev *dev, int qid)
++{
++	bool npu = qid == MT_RXQ_NPU0 || qid == MT_RXQ_NPU1;
++	if (npu && !dev->q_rx[qid].npu_napi_enabled)
++		return;
++	napi_disable(&dev->napi[qid]);
++	if (npu)
++		dev->q_rx[qid].npu_napi_enabled = false;
++}
++static inline void mt76_rx_napi_enable(struct mt76_dev *dev, int qid)
++{
++	bool npu = qid == MT_RXQ_NPU0 || qid == MT_RXQ_NPU1;
++	if (npu && dev->q_rx[qid].npu_napi_enabled)
++		return;
++	napi_enable(&dev->napi[qid]);
++	if (npu)
++		dev->q_rx[qid].npu_napi_enabled = true;
++}
++
+ static inline struct mt76_phy *
+ mt76_vif_link_phy(struct mt76_vif_link *mlink)
+ {
+--- a/npu.c
++++ b/npu.c
+@@ -450,11 +450,11 @@
+ 	mt76_npu_fill_rx_queue(dev, q);
+ 	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
+ 	q->npu_napi_registered = true;
+-	napi_enable(&dev->napi[qid]);
++	mt76_rx_napi_enable(dev, qid);
+ 	err = devm_request_irq(dev->dev, irq, mt76_npu_irq_handler,
+ 			       IRQF_SHARED, name, q);
+ 	if (err) {
+-		napi_disable(&dev->napi[qid]);
++		mt76_rx_napi_disable(dev, qid);
+ 		netif_napi_del(&dev->napi[qid]);
+ 		q->npu_napi_registered = false;
+ 		goto out;
+--- a/dma.c
++++ b/dma.c
+@@ -1220,6 +1220,7 @@
+ 		if (mt76_queue_is_npu(q)) {
+ 			mt76_npu_release_rx_irq(dev, q);
+ 			if (q->npu_napi_registered) {
++				mt76_rx_napi_disable(dev, i);
+ 				netif_napi_del(&dev->napi[i]);
+ 				q->npu_napi_registered = false;
+ 			}
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2372,7 +2372,7 @@
+ 			continue;
+ 
+ 		if (mdev->q_rx[i].ndesc)
+-			napi_disable(&dev->mt76.napi[i]);
++			mt76_rx_napi_disable(&dev->mt76, i);
+ 	}
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
+@@ -2388,7 +2388,7 @@
+ 			continue;
+ 
+ 		if (mdev->q_rx[i].ndesc) {
+-			napi_enable(&dev->mt76.napi[i]);
++			mt76_rx_napi_enable(&dev->mt76, i);
+ 			local_bh_disable();
+ 			napi_schedule(&dev->mt76.napi[i]);
+ 			local_bh_enable();
+@@ -2652,7 +2652,7 @@
+ 		if (mt76_queue_is_npu_txfree(&dev->mt76.q_rx[i]))
+ 			continue;
+ 
+-		napi_disable(&dev->mt76.napi[i]);
++		mt76_rx_napi_disable(&dev->mt76, i);
+ 	}
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
+@@ -2712,7 +2712,7 @@
+ 		if (mt76_queue_is_npu_txfree(&dev->mt76.q_rx[i]))
+ 			continue;
+ 
+-		napi_enable(&dev->mt76.napi[i]);
++		mt76_rx_napi_enable(&dev->mt76, i);
+ 		local_bh_disable();
+ 		napi_schedule(&dev->mt76.napi[i]);
+ 		local_bh_enable();

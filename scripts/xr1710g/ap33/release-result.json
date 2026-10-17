@@ -1,0 +1,48 @@
+{
+  "at": "2026-10-11T02:09:07.458835+08:00",
+  "version": "20261011-ap33-d331711d",
+  "imageSHA256": "86bb59f36edb21b11b916467753a2f8e25530795439e34f5e22532da76b20659",
+  "imageSize": 18690346,
+  "bothAPsDeployed": true,
+  "deploymentOrder": [
+    2,
+    1
+  ],
+  "configurationPreserved": true,
+  "healthChecksEach": 15,
+  "bootIDs": {
+    "1": "f1b1852c-1bec-438c-9992-6a4be7dec3f6",
+    "2": "ccb3377f-f9ae-4eee-a12a-d436a6bb5490"
+  },
+  "sourceEvidence": "development/ap33/source-progress.json",
+  "imageEvidence": "development/ap33/packed-files-qa.json",
+  "implemented": [
+    "15 VLAN/port/MST/membership mutation fences including error rollback",
+    "PPE templates/packet key require per-VLAN forwarding state",
+    "L2 binding latched/revoked before policy observer teardown"
+  ],
+  "nativeSanitizedAndARMChecksEach": {
+    "context": 66758,
+    "packet": 78682
+  },
+  "realKernelVMChecks": 38,
+  "realKernelVMEvents": 151,
+  "realKernelFailureInjections": 5,
+  "liveWriterCountReturnsZero": true,
+  "NpuPpeEnabled": false,
+  "policyLatchRetained": true,
+  "automaticRulePublisherShipped": false,
+  "hardwareBindingProven": false,
+  "phoneTested": false,
+  "newThroughputOrLongTermQualification": false,
+  "softwarePostflight": "development/ap33/postflight.json",
+  "APBidirectionalProbes": "60/60",
+  "wiredPCtoAP2Probes": "10/10",
+  "remaining": [
+    "other netdevice and TC policy transition coverage",
+    "actual publisher and coherent collector under qualified policy control",
+    "applicable hardware qualification with fresh AP33 ABI/address/recovery manifests"
+  ],
+  "nextPolicyAudit": "development/ap33/next-policy-audit.json",
+  "mainRouterSwitchPCNetworkChanged": false
+}

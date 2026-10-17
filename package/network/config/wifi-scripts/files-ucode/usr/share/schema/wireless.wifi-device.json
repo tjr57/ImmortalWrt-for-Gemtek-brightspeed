@@ -97,10 +97,14 @@
 		"chanbw": {
 			"description": "Specifies a narrow channel width in MHz, possible values are: 5, 10, 20",
 			"type": "number",
-			"enum": [ 5,  10, 20 ]
+			"enum": [
+				5,
+				10,
+				20
+			]
 		},
 		"channel": {
-			"description": "Specifies the wireless channel. “auto” defaults to the lowest available channel, or utilizes the ACS algorithm depending on hardware/driver support",
+			"description": "Specifies the wireless channel. \u201cauto\u201d defaults to the lowest available channel, or utilizes the ACS algorithm depending on hardware/driver support",
 			"type": "string"
 		},
 		"channels": {
@@ -112,7 +116,7 @@
 			"default": "chanlist"
 		},
 		"chanlist": {
-			"description": "Use specific channels, when channel is in “auto” mode. This option allows hostapd to select one of the provided channels when a channel should be automatically selected. Channels can be provided as range using hyphen ('-') or individual channels can be specified by space (' ') separated values",
+			"description": "Use specific channels, when channel is in \u201cauto\u201d mode. This option allows hostapd to select one of the provided channels when a channel should be automatically selected. Channels can be provided as range using hyphen ('-') or individual channels can be specified by space (' ') separated values",
 			"type": "array",
 			"items": {
 				"type": "string"
@@ -197,7 +201,12 @@
 			"description": "The duration of PE field in an HE PPDU in us",
 			"type": "number",
 			"default": 4,
-			"enum": [ 4, 8, 12, 16 ]
+			"enum": [
+				4,
+				8,
+				12,
+				16
+			]
 		},
 		"he_mu_beamformer": {
 			"description": "HE multiple user beamformer support",
@@ -374,10 +383,25 @@
 			"description": "Specifies the high throughput mode",
 			"type": "string",
 			"enum": [
-				"NOHT", "HT20", "HT40-", "HT40+", "HT40",
-				"VHT20", "VHT40", "VHT80", "VHT160",
-				"HE20", "HE40", "HE80", "HE160",
-				"EHT20", "EHT40", "EHT80", "EHT160", "EHT320" ]
+				"NOHT",
+				"HT20",
+				"HT40-",
+				"HT40+",
+				"HT40",
+				"VHT20",
+				"VHT40",
+				"VHT80",
+				"VHT160",
+				"HE20",
+				"HE40",
+				"HE80",
+				"HE160",
+				"EHT20",
+				"EHT40",
+				"EHT80",
+				"EHT160",
+				"EHT320"
+			]
 		},
 		"hwmode": {
 			"type": "alias",
@@ -386,7 +410,12 @@
 		"hw_mode": {
 			"description": "Legacy way, use the band property instead",
 			"type": "string",
-			"enum": [ "11a", "11b", "11g", "11ad" ]
+			"enum": [
+				"11a",
+				"11b",
+				"11g",
+				"11ad"
+			]
 		},
 		"ieee80211d": {
 			"description": "Enables IEEE 802.11d country IE (information element) advertisement in beacon and probe response frames. This IE contains the country code and channel/power map. Requires country",
@@ -583,7 +612,11 @@
 		"require_mode": {
 			"description": "Sets the minimum client capability level mode that connecting clients must support to be allowed to connect",
 			"type": "string",
-			"enum": [ "n", "ac", "ax" ]
+			"enum": [
+				"n",
+				"ac",
+				"ax"
+			]
 		},
 		"rnr_beacon": {
 			"description": "",
@@ -714,7 +747,7 @@
 			"default": true
 		},
 		"tx_stbc_2by1": {
-			"description": "Supports transmission of at least 2×1 STBC",
+			"description": "Supports transmission of at least 2\u00d71 STBC",
 			"type": "boolean",
 			"default": true
 		},
@@ -753,13 +786,29 @@
 		"vht_max_mpdu": {
 			"description": "Maximum MPDU length",
 			"type": "number",
-			"enum": [ 3895, 7991, 11454 ],
+			"enum": [
+				3895,
+				7991,
+				11454
+			],
 			"default": 11454
 		},
 		"vht_txop_ps": {
 			"description": "VHT TXOP PS mode",
 			"type": "boolean",
 			"default": true
+		},
+		"punct_bitmap": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 65535,
+			"description": "Experimental EHT disabled20MHz subchannel bitmap; requires driver support"
+		},
+		"xr_pp_mode": {
+			"type": "integer",
+			"minimum": 0,
+			"maximum": 1,
+			"description": "Opt-in MediaTek firmware automatic puncturing, default0"
 		}
 	}
 }

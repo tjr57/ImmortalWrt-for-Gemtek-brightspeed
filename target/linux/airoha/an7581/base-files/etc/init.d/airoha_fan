@@ -1,49 +1,42 @@
 #!/bin/sh /etc/rc.common
-#
-# Copyright (C) 2025 openwrt.org
-#
-
+# SPDX-License-Identifier: GPL-2.0-or-later
 START=99
-
 . "$IPKG_INSTROOT/lib/functions.sh"
 
-find_nct7802()
-{
+find_nct7802() {
+	local hwmon found=''
 	for hwmon in /sys/class/hwmon/hwmon*; do
-		if [ -f "$hwmon/name" ] && [ "$(cat "$hwmon/name" 2>/dev/null)" = "nct7802" ]; then
-			echo "$hwmon"
-			return
-		fi
+		[ -r "$hwmon/name" ] || continue
+		[ "$(cat "$hwmon/name" 2>/dev/null)" = 'nct7802' ] || continue
+		[ -z "$found" ] || return 2
+		found="$hwmon"
 	done
-	echo "/sys/class/hwmon/hwmon5" # fallback
+	[ -n "$found" ] || return 1
+	printf '%s\n' "$found"
 }
 
-boot()
-{
-	case $(board_name) in
-	gemtek,w1700k-ubi|\
-	gemtek,xr1710g|\
-	gemtek,xr1710g-ubi)
-		hwmon=$(find_nct7802)
-
-		# Temporarily disable automatic fan control to configure curve
-		echo 1 > $hwmon/pwm1_enable
-
-		# Match trigger points from vendor firmware
-		echo 40000 > $hwmon/pwm1_auto_point1_temp
-		echo 50000 > $hwmon/pwm1_auto_point2_temp
-		echo 60000 > $hwmon/pwm1_auto_point3_temp
-		echo 70000 > $hwmon/pwm1_auto_point4_temp
-		echo 80000 > $hwmon/pwm1_auto_point5_temp
-
-		# Match fan speed from vendor firmware
-		echo 54  > $hwmon/pwm1_auto_point1_pwm
-		echo 69  > $hwmon/pwm1_auto_point2_pwm
-		echo 95  > $hwmon/pwm1_auto_point3_pwm
-		echo 199 > $hwmon/pwm1_auto_point4_pwm
-
-		# Re-enable automatic fan control
-		echo 2 > $hwmon/pwm1_enable
-		;;
+boot() {
+	local hwmon attribute i
+	# AP profile has exactly one owner, even before 96 executes or if a stale
+	# sysupgrade rc.d symlink re-enables this legacy service.
+	[ ! -f /etc/xr1710g-ap-profile ] || return 0
+	if [ -x /etc/init.d/fan ] && /etc/init.d/fan enabled; then return 0; fi
+	case "$(board_name)" in
+		gemtek,w1700k-ubi|gemtek,xr1710g|gemtek,xr1710g-ubi) ;;
+		*) return 0 ;;
 	esac
+	hwmon=$(find_nct7802) || { logger -t airoha_fan 'NCT7802 absent or ambiguous; no fan writes performed'; return 1; }
+	for attribute in pwm1_enable pwm1_auto_point1_temp pwm1_auto_point2_temp pwm1_auto_point3_temp pwm1_auto_point4_temp pwm1_auto_point5_temp pwm1_auto_point1_pwm pwm1_auto_point2_pwm pwm1_auto_point3_pwm pwm1_auto_point4_pwm; do
+		[ -w "$hwmon/$attribute" ] || { logger -t airoha_fan 'NCT7802 attributes unavailable; no fan writes performed'; return 1; }
+	done
+	# Preserve legacy non-AP vendor defaults only on an actual controller.
+	printf '1\n' > "$hwmon/pwm1_enable" || return 1
+	for i in 1 2 3 4 5; do
+		printf '%s\n' "$((30000 + i * 10000))" > "$hwmon/pwm1_auto_point${i}_temp" || return 1
+	done
+	printf '54\n' > "$hwmon/pwm1_auto_point1_pwm" || return 1
+	printf '69\n' > "$hwmon/pwm1_auto_point2_pwm" || return 1
+	printf '95\n' > "$hwmon/pwm1_auto_point3_pwm" || return 1
+	printf '199\n' > "$hwmon/pwm1_auto_point4_pwm" || return 1
+	printf '2\n' > "$hwmon/pwm1_enable"
 }

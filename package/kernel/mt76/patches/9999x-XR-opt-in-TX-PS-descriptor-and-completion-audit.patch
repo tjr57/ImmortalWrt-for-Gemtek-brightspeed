@@ -1,0 +1,179 @@
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -9,6 +9,7 @@
+ #include "mt7996.h"
+ #include "../dma.h"
+ #include "mac.h"
++#include "xr_tx_ps_audit.h"
+ #include "mcu.h"
+ 
+ #define to_rssi(field, rcpi)	((FIELD_GET(field, rcpi) - 220) / 2)
+@@ -1236,6 +1237,12 @@
+ 		txp->fw.rept_wds_wcid = cpu_to_le16(sta ? wcid->idx : 0xfff);
+ 	}
+ 
++	if (READ_ONCE(xr_tx_ps.selected) == wcid->idx)
++		xr_tx_ps_record(wcid->idx, 0,
++			test_bit(MT_WCID_FLAG_PS, &wcid->flags), qid,
++			info->tx_time_est,
++			atomic_read(&mt76_wcid_primary(wcid)->non_aql_packets));
++
+ 	tx_info->skb = NULL;
+ 
+ 	/* pass partial skb header to fw */
+@@ -1500,6 +1507,12 @@
+ 			tx_retries = count ? count - 1 : 0;
+ 			/* Successful retries are retries, not terminal TX failures. */
+ 			tx_failed = !!FIELD_GET(MT_TXFREE_INFO_STAT, info);
++
++			if (READ_ONCE(xr_tx_ps.selected) == wcid->idx)
++				xr_tx_ps_record(wcid->idx, 1,
++					test_bit(MT_WCID_FLAG_PS, &wcid->flags), count,
++					FIELD_GET(MT_TXFREE_INFO_STAT, info),
++					atomic_read(&mt76_wcid_primary(wcid)->non_aql_packets));
+ 
+ 			wcid->stats.tx_retries += tx_retries;
+ 			wcid->stats.tx_failed += tx_failed;
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -920,9 +920,11 @@
+   struct mt7996_sta_link *link = mt7996_sta_link(msta, link_id);
+   if (!link)
+    continue;
+-  seq_printf(s, "mac=%pM link=%u wcid=%u phy=%u ps=%u\n", sta->addr,
++  seq_printf(s, "mac=%pM link=%u wcid=%u phy=%u ps=%u uapsd=%u max_sp=%u non_aql=%d\n", sta->addr,
+              link_id, link->wcid.idx, link->wcid.phy_idx,
+-             test_bit(MT_WCID_FLAG_PS, &link->wcid.flags));
++             test_bit(MT_WCID_FLAG_PS, &link->wcid.flags),
++             sta->uapsd_queues, sta->max_sp,
++             atomic_read(&mt76_wcid_primary(&link->wcid)->non_aql_packets));
+  }
+  rcu_read_unlock();
+ }
+@@ -930,7 +932,7 @@
+ static int mt7996_xr_ps_state_read(struct seq_file *s, void *data)
+ {
+  struct mt7996_dev *dev = dev_get_drvdata(s->private);
+- seq_puts(s, "schema=1 snapshot=approximate\n");
++ seq_puts(s, "schema=2 snapshot=approximate\n");
+  ieee80211_iterate_stations_atomic(mt76_hw(dev), mt7996_xr_ps_sta_read, s);
+  return 0;
+ }
+--- /dev/null
++++ b/mt7996/xr_tx_ps_audit.h
+@@ -0,0 +1,115 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/* Opt-in scalar descriptor/TXFREE audit; no frame contents or hardware writes. */
++#ifndef __XR_TX_PS_AUDIT_H
++#define __XR_TX_PS_AUDIT_H
++#include <linux/moduleparam.h>
++#include <linux/ktime.h>
++#include <linux/spinlock.h>
++
++#define XR_TX_PS_DISABLED 65535
++#define XR_TX_PS_SIZE 24
++struct xr_tx_ps_event {
++ u64 seq, ns;
++ u32 a, b;
++ s32 pending;
++ u8 kind, ps;
++};
++struct xr_tx_ps_snapshot {
++ u64 prepared, sleeping, zero_est, pending_non_aql, status[4], total;
++ u16 selected;
++ struct xr_tx_ps_event ring[XR_TX_PS_SIZE];
++};
++static DEFINE_SPINLOCK(xr_tx_ps_lock);
++static struct xr_tx_ps_snapshot xr_tx_ps = { .selected = XR_TX_PS_DISABLED };
++
++static int xr_tx_ps_select_set(const char *val, const struct kernel_param *kp)
++{
++ unsigned long flags;
++ u16 selected;
++ int ret = kstrtou16(val, 0, &selected);
++ if (ret)
++  return ret;
++ if (selected >= 2048 && selected != XR_TX_PS_DISABLED)
++  return -ERANGE;
++ spin_lock_irqsave(&xr_tx_ps_lock, flags);
++ /* Readers and writers use this lock; fast rejection is only advisory. */
++ memset(&xr_tx_ps, 0, sizeof(xr_tx_ps));
++ WRITE_ONCE(xr_tx_ps.selected, selected);
++ spin_unlock_irqrestore(&xr_tx_ps_lock, flags);
++ return 0;
++}
++
++static int xr_tx_ps_select_get(char *buf, const struct kernel_param *kp)
++{
++ return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(xr_tx_ps.selected));
++}
++
++/* kind0: successfully prepared descriptor, a=qid, b=airtime estimate.
++ * kind1: firmware TXFREE header, a=attempt count, b=raw 2-bit status.
++ * pending is the primary WCID's non-AQL count, sampled before accounting/free.
++ * Header status units are not individual UDP packets. No status meanings guessed.
++ */
++static void xr_tx_ps_record(u16 wcid, u8 kind, bool ps, u32 a, u32 b, s32 pending)
++{
++ struct xr_tx_ps_event *e;
++ unsigned long flags;
++ if (wcid >= 2048 || READ_ONCE(xr_tx_ps.selected) != wcid ||
++     kind > 1 || (kind == 1 && b > 3))
++  return;
++ spin_lock_irqsave(&xr_tx_ps_lock, flags);
++ if (xr_tx_ps.selected != wcid)
++  goto out;
++ if (!kind) {
++  xr_tx_ps.prepared++;
++  if (!ps)
++   goto out;
++  xr_tx_ps.sleeping++;
++  xr_tx_ps.zero_est += !b;
++  xr_tx_ps.pending_non_aql += pending > 0;
++ } else {
++  xr_tx_ps.status[b]++;
++  if (!b)
++   goto out;
++ }
++ e = &xr_tx_ps.ring[xr_tx_ps.total % XR_TX_PS_SIZE];
++ *e = (struct xr_tx_ps_event) {
++  .seq = ++xr_tx_ps.total, .ns = ktime_get_mono_fast_ns(),
++  .kind = kind, .ps = ps, .a = a, .b = b, .pending = pending,
++ };
++out:
++ spin_unlock_irqrestore(&xr_tx_ps_lock, flags);
++}
++
++static int xr_tx_ps_events_get(char *buf, const struct kernel_param *kp)
++{
++ struct xr_tx_ps_snapshot snap;
++ unsigned long flags;
++ unsigned int count, i, length;
++ spin_lock_irqsave(&xr_tx_ps_lock, flags);
++ snap = xr_tx_ps;
++ spin_unlock_irqrestore(&xr_tx_ps_lock, flags);
++ count = min_t(u64, snap.total, XR_TX_PS_SIZE);
++ length = scnprintf(buf, PAGE_SIZE,
++   "schema=1 selected=%u prepared=%llu sleeping=%llu zero_est=%llu pending_non_aql=%llu status0=%llu status1=%llu status2=%llu status3=%llu total=%llu retained=%u\n",
++   snap.selected, snap.prepared, snap.sleeping, snap.zero_est,
++   snap.pending_non_aql, snap.status[0], snap.status[1], snap.status[2],
++   snap.status[3], snap.total, count);
++ for (i = 0; i < count; i++) {
++  struct xr_tx_ps_event *e = &snap.ring[(snap.total - count + i) % XR_TX_PS_SIZE];
++  length += scnprintf(buf + length, PAGE_SIZE - length,
++      "seq=%llu ns=%llu kind=%u ps=%u a=%u b=%u p=%d\n",
++      e->seq, e->ns, e->kind, e->ps, e->a, e->b, e->pending);
++ }
++ return length;
++}
++static const struct kernel_param_ops xr_tx_ps_select_ops = {
++ .set = xr_tx_ps_select_set, .get = xr_tx_ps_select_get,
++};
++static const struct kernel_param_ops xr_tx_ps_events_ops = {
++ .get = xr_tx_ps_events_get,
++};
++module_param_cb(tx_ps_audit_wcid, &xr_tx_ps_select_ops, NULL, 0600);
++MODULE_PARM_DESC(tx_ps_audit_wcid, "TX/PS scalar audit WCID; 65535 disables; each write resets");
++module_param_cb(tx_ps_audit_events, &xr_tx_ps_events_ops, NULL, 0400);
++MODULE_PARM_DESC(tx_ps_audit_events, "Selected descriptor/firmware completion counters and bounded PS/error events");
++#endif

@@ -1,0 +1,96 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1723,6 +1723,59 @@
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
++/* Exact rule subset is independently testable. Unsupported constraints
++ * must never become a broader hardware bridge permission.
++ */
++static bool airoha_ppe_l2_rule_exact(struct flow_rule *rule)
++{
++	struct flow_match_meta meta;
++	struct flow_match_eth_addrs eth;
++	struct flow_match_basic basic;
++	int i;
++
++	for (i = 0; i < FLOW_DISSECTOR_KEY_MAX; i++) {
++		if (!flow_rule_match_key(rule, i))
++			continue;
++		switch (i) {
++		case FLOW_DISSECTOR_KEY_META:
++		case FLOW_DISSECTOR_KEY_CONTROL:
++		case FLOW_DISSECTOR_KEY_BASIC:
++		case FLOW_DISSECTOR_KEY_ETH_ADDRS:
++		case FLOW_DISSECTOR_KEY_VLAN:break;
++		default:return false;
++		}
++	}
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC))
++		return false;
++	flow_rule_match_meta(rule, &meta);
++	flow_rule_match_eth_addrs(rule, &eth);
++	flow_rule_match_basic(rule, &basic);
++	if (meta.mask->ingress_ifindex != U32_MAX || meta.mask->ingress_iftype ||
++	    meta.mask->l2_miss || !is_broadcast_ether_addr(eth.mask->src) ||
++	    !is_broadcast_ether_addr(eth.mask->dst) || basic.mask->ip_proto ||
++	    (basic.mask->n_proto && (basic.mask->n_proto != htons(0xffff) ||
++	                             basic.key->n_proto != htons(ETH_P_IP))))
++		return false;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
++		struct flow_match_control control;
++		flow_rule_match_control(rule, &control);
++		if (control.key->addr_type || control.mask->thoff || control.mask->flags)
++			return false;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_match_vlan vlan;
++		flow_rule_match_vlan(rule, &vlan);
++		if (vlan.mask->vlan_priority || vlan.mask->vlan_dei ||
++		    (vlan.mask->vlan_eth_type &&
++		     (vlan.mask->vlan_eth_type != htons(0xffff) ||
++		      vlan.key->vlan_eth_type != htons(ETH_P_IP))))
++			return false;
++	}
++	return true;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1922,31 +1975,8 @@
+ 		struct net_device *indev, *master;
+ 		u16 pvid = 0;
+ 
+-		/* Do not broaden IP/protocol/mark or other flower constraints into
+-		 * an all-IP MAC cache entry. This bridge subset authorizes exact
+-		 * MAC+ingress+VID and optional EtherType only.
+-		 */
+-		for (i = 0; i < FLOW_DISSECTOR_KEY_MAX; i++) {
+-			if (!flow_rule_match_key(rule, i))
+-				continue;
+-			switch (i) {
+-			case FLOW_DISSECTOR_KEY_META:
+-			case FLOW_DISSECTOR_KEY_CONTROL:
+-			case FLOW_DISSECTOR_KEY_BASIC:
+-			case FLOW_DISSECTOR_KEY_ETH_ADDRS:
+-			case FLOW_DISSECTOR_KEY_VLAN:
+-				break;
+-			default:err = -EOPNOTSUPP;goto free_entry;
+-			}
+-		}
+-		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
+-			struct flow_match_basic basic;
+-			flow_rule_match_basic(rule, &basic);
+-			if (basic.mask->ip_proto ||
+-			    (basic.mask->n_proto &&
+-			     (basic.mask->n_proto != htons(0xffff) || basic.key->n_proto != htons(ETH_P_IP)))) {
+-				err = -EOPNOTSUPP;goto free_entry;
+-			}
++		if (!airoha_ppe_l2_rule_exact(rule)) {
++			err = -EOPNOTSUPP;goto free_entry;
+ 		}
+ 		flow_rule_match_meta(rule, &meta);
+ 		flow_rule_match_eth_addrs(rule, &addrs);

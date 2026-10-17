@@ -1,0 +1,798 @@
+Subject: [PATCH] XR: single generic netlink owner for PPE bridge templates
+
+Owner decision 2026-10-11: L2 templates are published only through the
+xr_ppe_l2 generic netlink family (CAP_NET_ADMIN), never through TC. PUBLISH
+validates the live bridge (ports, MTU, policy flags, MST, per-VLAN state,
+PVID, FDB direction, local destination) under RTNL, derives the bridge's own
+egress tagging, and commits only if the caller's generation is still current.
+Revoked entries stay owned until REVOKE; DUMP marks itself interrupted when
+the generation or owner set changes so collectors can retry. TC REPLACE of a
+bridge template is rejected. Templates stay inert while boot-only PPE bind
+permissions are off. NPU/PPE opt-ins remain disabled.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -739,6 +739,9 @@
+ 	u32 l2_bridge_writers;
+ 	bool l2_policy_latched;
+ 	bool l2_netdev_policy_latched;
++	/* xr_ppe_l2 owner entries; serialized by the genetlink family lock. */
++	struct list_head xr_pub_entries;
++	u32 xr_pub_count;
+ 	struct notifier_block l2_switchdev_nb;
+ 	struct notifier_block l2_switchdev_atomic_nb;
+ 	u64 l2_invalidations;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -20,6 +20,7 @@
+ #include <net/route.h>
+ #include <net/ip.h>
+ #include <net/switchdev.h>
++#include <net/genetlink.h>
+ 
+ #include "airoha_regs.h"
+ #include <linux/netfilter.h>
+@@ -1824,59 +1825,6 @@
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
+-/* Exact rule subset is independently testable. Unsupported constraints
+- * must never become a broader hardware bridge permission.
+- */
+-static bool airoha_ppe_l2_rule_exact(struct flow_rule *rule)
+-{
+-	struct flow_match_meta meta;
+-	struct flow_match_eth_addrs eth;
+-	struct flow_match_basic basic;
+-	int i;
+-
+-	for (i = 0; i < FLOW_DISSECTOR_KEY_MAX; i++) {
+-		if (!flow_rule_match_key(rule, i))
+-			continue;
+-		switch (i) {
+-		case FLOW_DISSECTOR_KEY_META:
+-		case FLOW_DISSECTOR_KEY_CONTROL:
+-		case FLOW_DISSECTOR_KEY_BASIC:
+-		case FLOW_DISSECTOR_KEY_ETH_ADDRS:
+-		case FLOW_DISSECTOR_KEY_VLAN:break;
+-		default:return false;
+-		}
+-	}
+-	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
+-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS) ||
+-	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC))
+-		return false;
+-	flow_rule_match_meta(rule, &meta);
+-	flow_rule_match_eth_addrs(rule, &eth);
+-	flow_rule_match_basic(rule, &basic);
+-	if (meta.mask->ingress_ifindex != U32_MAX || meta.mask->ingress_iftype ||
+-	    meta.mask->l2_miss || !is_broadcast_ether_addr(eth.mask->src) ||
+-	    !is_broadcast_ether_addr(eth.mask->dst) || basic.mask->ip_proto ||
+-	    basic.mask->n_proto != htons(0xffff) ||
+-	    basic.key->n_proto != htons(ETH_P_IP))
+-		return false;
+-	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
+-		struct flow_match_control control;
+-		flow_rule_match_control(rule, &control);
+-		if (control.key->addr_type || control.mask->thoff || control.mask->flags)
+-			return false;
+-	}
+-	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
+-		struct flow_match_vlan vlan;
+-		flow_rule_match_vlan(rule, &vlan);
+-		if (vlan.mask->vlan_priority || vlan.mask->vlan_dei ||
+-		    (vlan.mask->vlan_eth_type &&
+-		     (vlan.mask->vlan_eth_type != htons(0xffff) ||
+-		      vlan.key->vlan_eth_type != htons(ETH_P_IP))))
+-			return false;
+-	}
+-	return true;
+-}
+-
+ /* A route FOE represents an exact IP/transport tuple, not a wildcard
+  * classifier. Match fields which the hardware ABI cannot encode stay in
+  * software, including DSCP/TTL/TCP flags, VLAN scopes, marks and tunnels.
+@@ -1978,59 +1926,6 @@
+  return found;
+ }
+ 
+-/* FOE VLAN fields describe the final output stack, not a push counter.
+- * Keeping an input tag needs per-packet PCP/DEI preservation and remains in
+- * software. This helper only validates; it does not touch hardware.
+- */
+-static bool airoha_ppe_l2_actions(struct flow_rule *rule, u16 vid,
+-                                bool ingress_tagged, bool egress_untagged,
+-                                struct airoha_flow_data *data)
+-{
+- const struct flow_action_entry *act;
+- bool tagged = ingress_tagged, popped = false, pushed = false;
+- bool redirected = false;
+- int i;
+-
+- if (vid >= VLAN_VID_MASK || (!vid && (ingress_tagged || !egress_untagged)))
+-  return false;
+- flow_action_for_each(i, act, &rule->action) {
+-  if (redirected)
+-   return false;
+-  switch (act->id) {
+-  case FLOW_ACTION_VLAN_POP:
+-   if (!tagged || popped || pushed)
+-    return false;
+-   tagged = false;
+-   popped = true;
+-   break;
+-  case FLOW_ACTION_VLAN_PUSH:
+-   if (tagged || pushed || !vid || act->vlan.vid != vid ||
+-       act->vlan.proto != htons(ETH_P_8021Q) || act->vlan.prio)
+-    return false;
+-   tagged = true;
+-   pushed = true;
+-   break;
+-  case FLOW_ACTION_REDIRECT:
+-   if (!act->dev)
+-    return false;
+-   redirected = true;
+-   break;
+-  default:
+-   /* Includes checksum mutation, PPPoE and unrepresented metadata. */
+-   return false;
+-  }
+- }
+- if (!redirected || (ingress_tagged && !popped) ||
+-     tagged == egress_untagged)
+-  return false;
+- data->vlan.num = tagged ? 1 : 0;
+- if (tagged) {
+-  data->vlan.hdr[0].id = vid;
+-  data->vlan.hdr[0].proto = htons(ETH_P_8021Q);
+- }
+- return true;
+-}
+-
+ /* Unsupported per-port policy stays in the software bridge. MST can
+  * have a per-VLAN forwarding state distinct from the port STP state.
+  */
+@@ -2045,90 +1940,89 @@
+         !br_port_flag_is_set(dev, unsupported);
+ }
+ 
+-/* Use actual bridge port membership, PVID and output tag policy. */
+-static bool airoha_ppe_l2_context(struct flow_rule *rule,
+-                                struct net_device *odev,
+-                                struct airoha_flow_data *data,
+-                                struct airoha_l2_flow_key *key)
++/* Validate an owner-published L2 template against the live bridge and derive
++ * the bridge's own egress tagging; no caller-supplied action can widen it.
++ * Untagged ingress must name the ingress PVID; tagged-to-tagged stays in
++ * software because the template cannot preserve per-packet PCP/DEI. MTU,
++ * port policy, MST, per-VLAN state and FDB direction match the software
++ * bridge. Caller holds RTNL (STP state accessor) and RCU.
++ */
++static bool airoha_ppe_l2_validate(struct net_device *indev,
++				   struct net_device *odev, bool tagged,
++				   u16 vid, const u8 *src, const u8 *dst,
++				   struct airoha_flow_data *data,
++				   struct airoha_l2_flow_key *key)
+ {
+- struct flow_match_meta meta;
+- struct net_device *indev, *master;
+- struct bridge_vlan_info info;
+- bool tagged = flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN);
+- bool untagged = true, valid = false;
+- u16 vid = 0, proto;
+-
+- if (!odev || !airoha_ppe_l2_rule_exact(rule))
+-  return false;
+- flow_rule_match_meta(rule, &meta);
+- rcu_read_lock();
+- indev = dev_get_by_index_rcu(dev_net(odev), meta.key->ingress_ifindex);
+- if (!indev || indev == odev || is_vlan_dev(indev) || is_vlan_dev(odev) ||
+-     !netif_is_bridge_port(indev) || !netif_is_bridge_port(odev) ||
+-     !airoha_ppe_l2_port_eligible(indev) ||
+-     !airoha_ppe_l2_port_eligible(odev))
+-  goto out;
+- /* The software bridge drops frames above the egress MTU; a bound flow is
+-  * not known to enforce that limit. Only accept pairs where every frame
+-  * admitted on ingress also fits egress. MTU changes revoke inside
+-  * netdev_fwd_change.
+-  */
+- if (READ_ONCE(odev->mtu) < READ_ONCE(indev->mtu))
+-  goto out;
+- master = airoha_ppe_foe_get_bridge_master_rcu(indev);
+- if (!master || br_mst_enabled(master) ||
+-     !net_eq(dev_net(indev), dev_net(odev)) ||
+-     airoha_ppe_foe_get_bridge_master_rcu(odev) != master)
+-  goto out;
+- if (br_vlan_enabled(master)) {
+-  if (br_vlan_get_proto(master, &proto) || proto != ETH_P_8021Q)
+-   goto out;
+-  if (tagged) {
+-   struct flow_match_vlan vlan;
+-   flow_rule_match_vlan(rule, &vlan);
+-   vid = vlan.key->vlan_id;
+-   if (vlan.mask->vlan_id != VLAN_VID_MASK ||
+-       vlan.key->vlan_tpid != htons(ETH_P_8021Q) ||
+-       vlan.mask->vlan_tpid != htons(0xffff))
+-    goto out;
+-  } else if (br_vlan_get_pvid_rcu(indev, &vid)) {
+-   goto out;
+-  }
+-  if (!vid || vid >= VLAN_VID_MASK ||
+-      br_vlan_get_info_rcu(indev, vid, &info) ||
+-      br_vlan_get_info_rcu(odev, vid, &info) ||
+-      !br_vlan_forwarding_rcu(indev, vid) ||
+-      !br_vlan_forwarding_rcu(odev, vid))
+-   goto out;
+-  untagged = !!(info.flags & BRIDGE_VLAN_INFO_UNTAGGED);
+- } else if (tagged) {
+-  goto out;
+- }
+- /* A normal bridge preserves PCP/DEI on tagged-to-tagged forwarding.
+-  * POP/PUSH with priority zero is a valid explicit TC action, but does not
+-  * preserve that bridge policy for all packets of a MAC-only template.
+-  */
+- if (tagged && !untagged)
+-  goto out;
+- if (!br_fdb_forward_to_rcu(master, indev, data->eth.h_source, vid) ||
+-     !br_fdb_forward_to_rcu(master, odev, data->eth.h_dest, vid))
+-  goto out;
+- if (!airoha_ppe_l2_actions(rule, vid, tagged, untagged, data))
+-  goto out;
+- key->net_cookie = dev_net(indev)->net_cookie;
+- key->ingress_ifindex = indev->ifindex;
+- key->bridge_ifindex = master->ifindex;
+- key->vid = vid;
+- key->vlan_proto = htons(ETH_P_8021Q);
+- key->ingress_tagged = tagged;
+- ether_addr_copy(key->source, data->eth.h_source);
+- ether_addr_copy(key->dest, data->eth.h_dest);
+- valid = true;
+-out:
+- rcu_read_unlock();
+- return valid;
+-}
++	struct bridge_vlan_info in_info, out_info;
++	struct net_device *master;
++	bool untagged = true;
++	u16 proto, pvid;
+ 
++	if (!indev || !odev || indev == odev || is_vlan_dev(indev) ||
++	    is_vlan_dev(odev) || !netif_is_bridge_port(indev) ||
++	    !netif_is_bridge_port(odev) ||
++	    !airoha_ppe_l2_port_eligible(indev) ||
++	    !airoha_ppe_l2_port_eligible(odev))
++		return false;
++	/* The software bridge drops frames above the egress MTU; a bound flow is
++	 * not known to enforce that limit. MTU changes revoke inside
++	 * netdev_fwd_change.
++	 */
++	if (READ_ONCE(odev->mtu) < READ_ONCE(indev->mtu))
++		return false;
++	if (!is_valid_ether_addr(src) || !is_valid_ether_addr(dst) ||
++	    ether_addr_equal(src, dst))
++		return false;
++	master = airoha_ppe_foe_get_bridge_master_rcu(indev);
++	if (!master || br_mst_enabled(master) ||
++	    !net_eq(dev_net(indev), dev_net(odev)) ||
++	    airoha_ppe_foe_get_bridge_master_rcu(odev) != master)
++		return false;
++	/* Frames to the bridge's own address are delivered locally. */
++	if (ether_addr_equal(dst, master->dev_addr) ||
++	    ether_addr_equal(dst, indev->dev_addr))
++		return false;
++	if (br_vlan_enabled(master)) {
++		if (br_vlan_get_proto(master, &proto) || proto != ETH_P_8021Q)
++			return false;
++		if (!vid || vid >= VLAN_VID_MASK)
++			return false;
++		if (!tagged && (br_vlan_get_pvid_rcu(indev, &pvid) || pvid != vid))
++			return false;
++		if (br_vlan_get_info_rcu(indev, vid, &in_info) ||
++		    br_vlan_get_info_rcu(odev, vid, &out_info) ||
++		    !br_vlan_forwarding_rcu(indev, vid) ||
++		    !br_vlan_forwarding_rcu(odev, vid))
++			return false;
++		untagged = !!(out_info.flags & BRIDGE_VLAN_INFO_UNTAGGED);
++	} else if (tagged || vid) {
++		/* Tagged packets on a nonfiltering bridge have no isolated VID. */
++		return false;
++	}
++	if (tagged && !untagged)
++		return false;
++	if (!br_fdb_forward_to_rcu(master, indev, src, vid) ||
++	    !br_fdb_forward_to_rcu(master, odev, dst, vid))
++		return false;
++	memset(&data->vlan, 0, sizeof(data->vlan));
++	if (!untagged) {
++		data->vlan.num = 1;
++		data->vlan.hdr[0].id = vid;
++		data->vlan.hdr[0].proto = htons(ETH_P_8021Q);
++	}
++	ether_addr_copy(data->eth.h_source, src);
++	ether_addr_copy(data->eth.h_dest, dst);
++	memset(key, 0, sizeof(*key));
++	key->net_cookie = dev_net(indev)->net_cookie;
++	key->ingress_ifindex = indev->ifindex;
++	key->bridge_ifindex = master->ifindex;
++	key->vid = vid;
++	key->vlan_proto = htons(ETH_P_8021Q);
++	key->ingress_tagged = tagged;
++	ether_addr_copy(key->source, src);
++	ether_addr_copy(key->dest, dst);
++	return true;
++}
+ 
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+@@ -2137,8 +2031,6 @@
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_gdm_dev *egress_dev;
+ 	struct airoha_flow_data data = {};
+-	struct airoha_l2_flow_key l2_key = {};
+-	u64 l2_generation = 0;
+ 	struct net_device *odev = NULL;
+ 	struct flow_action_entry *act;
+ 	struct airoha_foe_entry hwe;
+@@ -2195,17 +2087,12 @@
+ 
+ 	switch (addr_type) {
+ 	case 0:
+-		offload_type = PPE_PKT_TYPE_BRIDGE;
+-		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+-			struct flow_match_eth_addrs match;
+-
+-			flow_rule_match_eth_addrs(rule, &match);
+-			memcpy(data.eth.h_dest, match.key->dst, ETH_ALEN);
+-			memcpy(data.eth.h_source, match.key->src, ETH_ALEN);
+-		} else {
+-			return -EOPNOTSUPP;
+-		}
+-		break;
++		/* L2 templates have one owner: the xr_ppe_l2 generic netlink
++		 * publisher. TC is software policy and latches L2 binding off.
++		 */
++		NL_SET_ERR_MSG_MOD(f->common.extack,
++				   "PPE bridge templates are published only through xr_ppe_l2");
++		return -EOPNOTSUPP;
+ 	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
+ 		offload_type = PPE_PKT_TYPE_IPV4_HNAPT;
+ 		break;
+@@ -2266,14 +2153,6 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	if (offload_type == PPE_PKT_TYPE_BRIDGE &&
+-	    (!airoha_ppe_l2_snapshot(eth->ppe, &l2_generation) ||
+-	     !airoha_ppe_l2_context(rule, odev, &data, &l2_key))) {
+-		NL_SET_ERR_MSG_MOD(f->common.extack,
+-			"PPE bridge actions do not match exact VLAN/port context");
+-		return -EOPNOTSUPP;
+-	}
+-
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;
+@@ -2358,10 +2237,6 @@
+ 		return -ENOMEM;
+ 
+ 	INIT_LIST_HEAD(&e->gc_node);
+-	if (offload_type == PPE_PKT_TYPE_BRIDGE) {
+-		e->l2_key = l2_key;
+-		e->l2_generation = l2_generation;
+-	}
+ 
+ 	e->cookie = f->cookie;
+ 	e->egress_dev = egress_dev;
+@@ -2712,6 +2587,396 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_ppe_put_dev);
+ 
++/* xr_ppe_l2: the single owner of PPE bridge templates (owner decision
++ * 2026-10-11; TC is software policy and latches L2 binding off).
++ *
++ * PUBLISH validates against the live bridge under the same generation fence
++ * as packet commits: the caller names the generation its plan was computed
++ * at, the template is admitted only if that generation is still current at
++ * commit, and any later bridge/netdevice writer revokes it again. Revoked
++ * entries stay owned (cached=0) until REVOKE, so DUMP shows what the kernel
++ * actually holds. DUMP sets NLM_F_DUMP_INTR when the generation or owner set
++ * changes between parts; collectors retry. Templates are inert while the
++ * boot-only bind permissions are off. All commands need CAP_NET_ADMIN.
++ */
++enum {
++	XR_PPE_L2_CMD_UNSPEC,
++	XR_PPE_L2_CMD_GET_STATE,
++	XR_PPE_L2_CMD_PUBLISH,
++	XR_PPE_L2_CMD_REVOKE,
++	XR_PPE_L2_CMD_DUMP,
++};
++
++enum {
++	XR_PPE_L2_A_UNSPEC,
++	XR_PPE_L2_A_PAD,
++	XR_PPE_L2_A_GENERATION,		/* u64 */
++	XR_PPE_L2_A_WRITERS,		/* u32 */
++	XR_PPE_L2_A_NF_LATCHED,		/* u8 */
++	XR_PPE_L2_A_NETDEV_LATCHED,	/* u8 */
++	XR_PPE_L2_A_BIND_ENABLED,	/* u8 */
++	XR_PPE_L2_A_BRIDGE_BIND_ENABLED,	/* u8 */
++	XR_PPE_L2_A_ENTRIES,		/* u32 */
++	XR_PPE_L2_A_COOKIE,		/* u64, owner-chosen */
++	XR_PPE_L2_A_IN_IFINDEX,		/* u32 */
++	XR_PPE_L2_A_OUT_IFINDEX,	/* u32 */
++	XR_PPE_L2_A_VID,		/* u16, 0 on a nonfiltering bridge */
++	XR_PPE_L2_A_IN_TAGGED,		/* u8 */
++	XR_PPE_L2_A_SRC,		/* ETH_ALEN */
++	XR_PPE_L2_A_DST,		/* ETH_ALEN */
++	XR_PPE_L2_A_PUB_GENERATION,	/* u64 */
++	XR_PPE_L2_A_CACHED,		/* u8 */
++	XR_PPE_L2_A_SUBFLOWS,		/* u32 */
++	XR_PPE_L2_A_EGRESS_TAGGED,	/* u8 */
++	__XR_PPE_L2_A_MAX,
++};
++#define XR_PPE_L2_A_MAX (__XR_PPE_L2_A_MAX - 1)
++#define XR_PPE_L2_MAX_ENTRIES 1024
++
++struct airoha_xr_pub {
++	struct list_head node;
++	u64 cookie;
++	struct airoha_flow_table_entry *e;
++};
++
++static struct airoha_ppe *xr_pub_ppe;
++static u32 xr_pub_seq;
++static struct genl_family airoha_xr_family;
++
++static const struct nla_policy airoha_xr_policy[XR_PPE_L2_A_MAX + 1] = {
++	[XR_PPE_L2_A_GENERATION] = { .type = NLA_U64 },
++	[XR_PPE_L2_A_COOKIE] = { .type = NLA_U64 },
++	[XR_PPE_L2_A_IN_IFINDEX] = NLA_POLICY_MIN(NLA_U32, 1),
++	[XR_PPE_L2_A_OUT_IFINDEX] = NLA_POLICY_MIN(NLA_U32, 1),
++	[XR_PPE_L2_A_VID] = NLA_POLICY_MAX(NLA_U16, VLAN_VID_MASK - 1),
++	[XR_PPE_L2_A_IN_TAGGED] = NLA_POLICY_MAX(NLA_U8, 1),
++	[XR_PPE_L2_A_SRC] = NLA_POLICY_ETH_ADDR,
++	[XR_PPE_L2_A_DST] = NLA_POLICY_ETH_ADDR,
++};
++
++static struct airoha_xr_pub *airoha_xr_find(struct airoha_ppe *ppe, u64 cookie)
++{
++	struct airoha_xr_pub *pub;
++
++	list_for_each_entry(pub, &ppe->xr_pub_entries, node)
++		if (pub->cookie == cookie)
++			return pub;
++	return NULL;
++}
++
++static int airoha_xr_put_state(struct sk_buff *skb, struct airoha_ppe *ppe)
++{
++	bool nf, netdev;
++	u32 writers;
++	u64 gen;
++
++	spin_lock_bh(&ppe_lock);
++	gen = ppe->l2_generation;
++	writers = ppe->l2_bridge_writers;
++	nf = ppe->l2_policy_latched;
++	netdev = ppe->l2_netdev_policy_latched;
++	spin_unlock_bh(&ppe_lock);
++
++	if (nla_put_u64_64bit(skb, XR_PPE_L2_A_GENERATION, gen, XR_PPE_L2_A_PAD) ||
++	    nla_put_u32(skb, XR_PPE_L2_A_WRITERS, writers) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_NF_LATCHED, nf) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_NETDEV_LATCHED, netdev) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_BIND_ENABLED, ppe_bind_enable) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_BRIDGE_BIND_ENABLED,
++		       ppe_bridge_bind_enable) ||
++	    nla_put_u32(skb, XR_PPE_L2_A_ENTRIES, ppe->xr_pub_count))
++		return -EMSGSIZE;
++	return 0;
++}
++
++static int airoha_xr_reply_state(struct genl_info *info, u8 cmd, u64 cookie,
++				 bool with_cookie)
++{
++	struct sk_buff *msg;
++	void *hdr;
++
++	msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++	hdr = genlmsg_put_reply(msg, info, &airoha_xr_family, 0, cmd);
++	if (!hdr ||
++	    airoha_xr_put_state(msg, xr_pub_ppe) ||
++	    (with_cookie && nla_put_u64_64bit(msg, XR_PPE_L2_A_COOKIE, cookie,
++					      XR_PPE_L2_A_PAD))) {
++		nlmsg_free(msg);
++		return -EMSGSIZE;
++	}
++	genlmsg_end(msg, hdr);
++	return genlmsg_reply(msg, info);
++}
++
++static int airoha_xr_get_state(struct sk_buff *skb, struct genl_info *info)
++{
++	return airoha_xr_reply_state(info, XR_PPE_L2_CMD_GET_STATE, 0, false);
++}
++
++static int airoha_xr_publish(struct sk_buff *skb, struct genl_info *info)
++{
++	struct airoha_ppe *ppe = xr_pub_ppe;
++	struct net_device *indev, *odev = NULL;
++	struct airoha_flow_table_entry *e;
++	struct airoha_gdm_dev *egress_dev;
++	struct airoha_flow_data data = {};
++	struct airoha_l2_flow_key key;
++	struct airoha_foe_entry hwe;
++	struct airoha_xr_pub *pub;
++	u64 cookie, gen;
++	bool tagged, ok;
++	u16 vid;
++	int err;
++
++	if (GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_COOKIE) ||
++	    GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_GENERATION) ||
++	    GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_IN_IFINDEX) ||
++	    GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_OUT_IFINDEX) ||
++	    GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_VID) ||
++	    GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_IN_TAGGED) ||
++	    GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_SRC) ||
++	    GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_DST))
++		return -EINVAL;
++	cookie = nla_get_u64(info->attrs[XR_PPE_L2_A_COOKIE]);
++	if (airoha_xr_find(ppe, cookie)) {
++		NL_SET_ERR_MSG(info->extack, "cookie already owns a template; revoke it first");
++		return -EEXIST;
++	}
++	if (ppe->xr_pub_count >= XR_PPE_L2_MAX_ENTRIES)
++		return -ENOSPC;
++	tagged = nla_get_u8(info->attrs[XR_PPE_L2_A_IN_TAGGED]);
++	vid = nla_get_u16(info->attrs[XR_PPE_L2_A_VID]);
++
++	if (!airoha_ppe_l2_snapshot(ppe, &gen)) {
++		NL_SET_ERR_MSG(info->extack, "L2 binding is latched off or a bridge writer is active");
++		return -EBUSY;
++	}
++	if (gen != nla_get_u64(info->attrs[XR_PPE_L2_A_GENERATION])) {
++		NL_SET_ERR_MSG(info->extack, "stale generation; re-collect and re-plan");
++		return -ESTALE;
++	}
++
++	/* br_port_get_stp_state() asserts RTNL; genl_lock -> RTNL is the usual
++	 * order for generic netlink handlers.
++	 */
++	rtnl_lock();
++	rcu_read_lock();
++	indev = dev_get_by_index_rcu(&init_net,
++			nla_get_u32(info->attrs[XR_PPE_L2_A_IN_IFINDEX]));
++	odev = dev_get_by_index_rcu(&init_net,
++			nla_get_u32(info->attrs[XR_PPE_L2_A_OUT_IFINDEX]));
++	ok = airoha_ppe_l2_validate(indev, odev, tagged, vid,
++				    nla_data(info->attrs[XR_PPE_L2_A_SRC]),
++				    nla_data(info->attrs[XR_PPE_L2_A_DST]),
++				    &data, &key);
++	if (ok)
++		dev_hold(odev);
++	rcu_read_unlock();
++	rtnl_unlock();
++	if (!ok) {
++		NL_SET_ERR_MSG(info->extack, "live bridge context does not admit this template");
++		return -EINVAL;
++	}
++
++	err = airoha_ppe_foe_entry_prepare(ppe->eth, &hwe, odev,
++					   PPE_PKT_TYPE_BRIDGE, &data, 0, 0,
++					   &egress_dev);
++	dev_put(odev);
++	if (err) {
++		NL_SET_ERR_MSG(info->extack, "egress cannot be represented by a PPE bridge entry");
++		return err;
++	}
++
++	e = kzalloc(sizeof(*e), GFP_KERNEL);
++	pub = kzalloc(sizeof(*pub), GFP_KERNEL);
++	if (!e || !pub) {
++		kfree(e);
++		kfree(pub);
++		return -ENOMEM;
++	}
++	INIT_LIST_HEAD(&e->gc_node);
++	e->l2_key = key;
++	e->l2_generation = gen;
++	e->egress_dev = egress_dev;
++	memcpy(&e->data, &hwe, sizeof(e->data));
++
++	/* Admits only if no writer/latch happened since the snapshot. */
++	err = airoha_ppe_foe_l2_flow_commit_entry(ppe, e);
++	if (err) {
++		kfree(e);
++		kfree(pub);
++		if (err == -EOPNOTSUPP) {
++			NL_SET_ERR_MSG(info->extack, "bridge state changed during publication; retry");
++			return -EAGAIN;
++		}
++		if (err == -EEXIST)
++			NL_SET_ERR_MSG(info->extack, "an identical template key is already published");
++		return err;
++	}
++	pub->cookie = cookie;
++	pub->e = e;
++	list_add_tail(&pub->node, &ppe->xr_pub_entries);
++	ppe->xr_pub_count++;
++	xr_pub_seq++;
++	return airoha_xr_reply_state(info, XR_PPE_L2_CMD_PUBLISH, cookie, true);
++}
++
++static void airoha_xr_release(struct airoha_ppe *ppe, struct airoha_xr_pub *pub)
++{
++	spin_lock_bh(&ppe_lock);
++	/* Removes the cached template, if still cached, and its subflows. */
++	airoha_ppe_foe_remove_l2_flow(ppe, pub->e);
++	spin_unlock_bh(&ppe_lock);
++	list_del(&pub->node);
++	ppe->xr_pub_count--;
++	xr_pub_seq++;
++	kfree(pub->e);
++	kfree(pub);
++}
++
++static int airoha_xr_revoke(struct sk_buff *skb, struct genl_info *info)
++{
++	struct airoha_ppe *ppe = xr_pub_ppe;
++	struct airoha_xr_pub *pub;
++	u64 cookie;
++
++	if (GENL_REQ_ATTR_CHECK(info, XR_PPE_L2_A_COOKIE))
++		return -EINVAL;
++	cookie = nla_get_u64(info->attrs[XR_PPE_L2_A_COOKIE]);
++	pub = airoha_xr_find(ppe, cookie);
++	if (!pub)
++		return -ENOENT;
++	airoha_xr_release(ppe, pub);
++	return airoha_xr_reply_state(info, XR_PPE_L2_CMD_REVOKE, cookie, true);
++}
++
++static int airoha_xr_fill_entry(struct sk_buff *skb, struct airoha_xr_pub *pub,
++				u64 gen)
++{
++	struct airoha_flow_table_entry *e = pub->e, *f;
++	const struct airoha_l2_flow_key *k = &e->l2_key;
++	u32 subflows = 0;
++
++	lockdep_assert_held(&ppe_lock);
++	if (e->l2_cached)
++		hlist_for_each_entry(f, &e->l2_flows, l2_subflow_node)
++			subflows++;
++	if (nla_put_u64_64bit(skb, XR_PPE_L2_A_COOKIE, pub->cookie, XR_PPE_L2_A_PAD) ||
++	    nla_put_u64_64bit(skb, XR_PPE_L2_A_GENERATION, gen, XR_PPE_L2_A_PAD) ||
++	    nla_put_u64_64bit(skb, XR_PPE_L2_A_PUB_GENERATION, e->l2_generation,
++			      XR_PPE_L2_A_PAD) ||
++	    nla_put_u32(skb, XR_PPE_L2_A_IN_IFINDEX, k->ingress_ifindex) ||
++	    nla_put_u16(skb, XR_PPE_L2_A_VID, k->vid) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_IN_TAGGED, !!k->ingress_tagged) ||
++	    nla_put(skb, XR_PPE_L2_A_SRC, ETH_ALEN, k->source) ||
++	    nla_put(skb, XR_PPE_L2_A_DST, ETH_ALEN, k->dest) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_CACHED, e->l2_cached) ||
++	    nla_put_u32(skb, XR_PPE_L2_A_SUBFLOWS, subflows) ||
++	    nla_put_u8(skb, XR_PPE_L2_A_EGRESS_TAGGED,
++		       FIELD_GET(AIROHA_FOE_IB1_BIND_VLAN_LAYER, e->data.ib1) != 0))
++		return -EMSGSIZE;
++	return 0;
++}
++
++static int airoha_xr_dump(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	struct airoha_ppe *ppe = xr_pub_ppe;
++	struct airoha_xr_pub *pub;
++	long idx = 0, start = cb->args[0];
++	u64 gen;
++	void *hdr;
++
++	spin_lock_bh(&ppe_lock);
++	gen = ppe->l2_generation;
++	/* Changes of either the generation or the owner set mark the dump. */
++	cb->seq = (u32)gen + xr_pub_seq;
++	list_for_each_entry(pub, &ppe->xr_pub_entries, node) {
++		if (idx < start) {
++			idx++;
++			continue;
++		}
++		hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid,
++				  cb->nlh->nlmsg_seq, &airoha_xr_family,
++				  NLM_F_MULTI, XR_PPE_L2_CMD_DUMP);
++		if (!hdr)
++			break;
++		genl_dump_check_consistent(cb, hdr);
++		if (airoha_xr_fill_entry(skb, pub, gen)) {
++			genlmsg_cancel(skb, hdr);
++			break;
++		}
++		genlmsg_end(skb, hdr);
++		idx++;
++	}
++	spin_unlock_bh(&ppe_lock);
++	cb->args[0] = idx;
++	return skb->len;
++}
++
++static const struct genl_small_ops airoha_xr_ops[] = {
++	{
++		.cmd = XR_PPE_L2_CMD_GET_STATE,
++		.doit = airoha_xr_get_state,
++		.flags = GENL_ADMIN_PERM,
++	}, {
++		.cmd = XR_PPE_L2_CMD_PUBLISH,
++		.doit = airoha_xr_publish,
++		.flags = GENL_ADMIN_PERM,
++	}, {
++		.cmd = XR_PPE_L2_CMD_REVOKE,
++		.doit = airoha_xr_revoke,
++		.flags = GENL_ADMIN_PERM,
++	}, {
++		.cmd = XR_PPE_L2_CMD_DUMP,
++		.dumpit = airoha_xr_dump,
++		.flags = GENL_ADMIN_PERM,
++	},
++};
++
++/* Not __ro_after_init: a built-in driver may probe after init memory is
++ * sealed, and registration writes the family id.
++ */
++static struct genl_family airoha_xr_family = {
++	.name = "xr_ppe_l2",
++	.version = 1,
++	.maxattr = XR_PPE_L2_A_MAX,
++	.policy = airoha_xr_policy,
++	.module = THIS_MODULE,
++	.small_ops = airoha_xr_ops,
++	.n_small_ops = ARRAY_SIZE(airoha_xr_ops),
++	.resv_start_op = XR_PPE_L2_CMD_DUMP + 1,
++};
++
++static void airoha_xr_publisher_init(struct airoha_ppe *ppe)
++{
++	int err;
++
++	INIT_LIST_HEAD(&ppe->xr_pub_entries);
++	if (xr_pub_ppe)
++		return;
++	xr_pub_ppe = ppe;
++	err = genl_register_family(&airoha_xr_family);
++	if (err) {
++		xr_pub_ppe = NULL;
++		dev_warn(ppe->eth->dev, "xr_ppe_l2 publisher unavailable: %d\n", err);
++	}
++}
++
++/* Unregistering waits for running operations; then release owner entries. */
++static void airoha_xr_publisher_deinit(struct airoha_ppe *ppe)
++{
++	struct airoha_xr_pub *pub, *tmp;
++
++	if (xr_pub_ppe != ppe)
++		return;
++	genl_unregister_family(&airoha_xr_family);
++	list_for_each_entry_safe(pub, tmp, &ppe->xr_pub_entries, node)
++		airoha_xr_release(ppe, pub);
++	xr_pub_ppe = NULL;
++}
++
+ int airoha_ppe_init(struct airoha_eth *eth)
+ {
+ 	int foe_size, err, ppe_num_stats_entries;
+@@ -2827,6 +3092,7 @@
+ 			   &ppe->l2_generation);
+ 	debugfs_create_u64("xr_l2_invalidations", 0400, ppe->debugfs_dir,
+ 			   &ppe->l2_invalidations);
++	airoha_xr_publisher_init(ppe);
+ 	return 0;
+ 
+ error_l2_flow_table_destroy:
+@@ -2841,6 +3107,7 @@
+ {
+ 	struct airoha_npu *npu;
+ 
++	airoha_xr_publisher_deinit(eth->ppe);
+ 	/* Quiesce L2 binding before detaching its policy notifiers. A racing
+ 	 * packet or TC callback must not republish during observer teardown.
+ 	 */

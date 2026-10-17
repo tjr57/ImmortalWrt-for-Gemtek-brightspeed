@@ -1,0 +1,35 @@
+{
+  "at": "2026-10-11T01:31:21.544753+08:00",
+  "stage": "integrated, full image qualification pending",
+  "baseline": "20261011-ap31-d331711d",
+  "version": "20261011-ap32-d331711d",
+  "candidateSHA256": "3b769345430966ea6704c5994a906537cb6e62a8c62634cbfeb4eb81f6dd01e1",
+  "patch": "target/linux/airoha/patches-6.18/99999h-XR-PPE-bridge-mutation-fence.patch",
+  "patchSHA256": "626fec4d9e22c7ae54dd92d771aeabf5785ff6429e603c2ea56f9f0c51276858",
+  "qa": "development/ap32/packet-fence/qa.json",
+  "ARMObjectBuild": "development/ap32/packet-fence/kernel-object-build.json",
+  "realKernelVM": "development/ap32/bridge-transaction/vm-result.json",
+  "checksEachNativeSanitizedAndARM": 1050,
+  "realKernelChecks": 22,
+  "realKernelEvents": 47,
+  "implemented": [
+    "synchronous BEGIN/END around FDB create/delete/move/admin flags and STP changes",
+    "absolute active-writer count with registration INIT and nested/concurrent writer fencing",
+    "PPE template revoke before mutation, busy/stale publication rejection",
+    "packet-key epoch captured before context read and checked before L2 subflow bind",
+    "read-only active-writer telemetry; policy latch remains independent"
+  ],
+  "realVMContainsNoPPEHardware": true,
+  "oldCodeRacesReproducedInModeledCache": true,
+  "VMFixtureFirstRunRetained": "development/ap32/bridge-transaction/vm-20261011-012519.json",
+  "VMFixtureRepair": "Wait for asynchronous port states and disable unrelated IPv6 chatter before phase labels; all original checks retained",
+  "productionSourceIntegrated": true,
+  "flashed": false,
+  "NpuPpeDefaultOff": true,
+  "remaining": [
+    "other bridge/VLAN/netdevice/TC policy transition coverage",
+    "coherent collector and actual rule execution under qualified kernel policy control",
+    "full image/ABI validation and AP2 then AP1 preserve-config upgrade",
+    "applicable hardware qualification with new-version recovery/ABI manifests"
+  ]
+}

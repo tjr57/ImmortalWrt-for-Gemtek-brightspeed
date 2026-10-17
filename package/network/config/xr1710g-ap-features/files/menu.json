@@ -1,0 +1,15 @@
+{
+  "admin/network/xr1710g_features": {
+    "title": "XR1710G 无线功能",
+    "order": 85,
+    "action": {
+      "type": "view",
+      "path": "xr1710g/features"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-xr1710g-features"
+      ]
+    }
+  }
+}

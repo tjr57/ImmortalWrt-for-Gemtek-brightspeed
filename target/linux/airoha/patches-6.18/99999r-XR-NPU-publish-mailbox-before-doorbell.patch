@@ -1,0 +1,121 @@
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -221,52 +221,77 @@
+ 				 u16 reply_len)
+ {
+ 	struct airoha_npu_core *core = &npu->cores[0]; /* FIXME: core */
+-	u32 val, offset = 0;
++	u32 val = 0, seq = 0, offset = 0;
++	bool broken = false;
+ 	int ret;
+ 
+-	if (len > AIROHA_NPU_MBOX_SIZE)
++	if (!data || len <= 0 || len > AIROHA_NPU_MBOX_SIZE ||
++	    func_id < 0 || !FIELD_FIT(MBOX_MSG_FUNC_ID, func_id) ||
++	    reply_len > len || (reply_len && !reply))
+ 		return -EINVAL;
+ 
+-	if (reply && reply_len > len)
+-		return -EINVAL;
+-
+-	/*
+-	 * Mailbox payloads are bidirectional (CPU request, NPU response).
+-	 * On EN7581+MT7996, streaming DMA_BIDIRECTIONAL against the
+-	 * caller kzalloc() buffer can leave WLAN_FUNC_GET_WAIT_NPU_VERSION
+-	 * reading as 0.0 despite MBOX success. Reuse a probe-time coherent
+-	 * bounce buffer under the per-core lock (also used from PPE
+-	 * foe_commit under atomic context).
++	/* Serialize both the coherent request/reply buffer and mailbox registers.
++	 * An uncertain completion must not let a later call overwrite a buffer
++	 * that the NPU may still be reading/writing. Recovery requires NPU reset.
+ 	 */
+ 	spin_lock_bh(&core->lock);
+-
++	if (core->mbox_broken) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ret = regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &seq);
++	if (ret)
++		goto failed;
+ 	memcpy(core->buf, data, len);
+-
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
+-	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
++	dma_wmb();
++
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
++	if (ret)
++		goto failed;
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
++	if (ret)
++		goto failed;
+ 	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
+-
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
++	if (ret)
++		goto failed;
++	/* The sequence write notifies the firmware. Publish the complete command
++	 * first, including clearing stale DONE/status, then ring the doorbell.
++	 * This regmap uses ordered MMIO (not relaxed accessors).
++	 */
++	ret = regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, seq + 1);
++	if (ret)
++		goto failed;
+ 	ret = regmap_read_poll_timeout_atomic(npu->regmap,
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
+ 					      val, (val & MBOX_MSG_DONE),
+ 					      100, AIROHA_NPU_MBOX_TIMEOUT_US);
+-	if (!ret && FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
++	if (ret)
++		goto failed;
++	if (FIELD_GET(MBOX_MSG_FUNC_ID, val) != func_id) {
++		ret = -EPROTO;
++		goto failed;
++	}
++	if (FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS) {
+ 		ret = -EINVAL;
+-
+-	/* Copy the trailing reply_len bytes of the response. */
+-	if (!ret && reply)
++		goto unlock;
++	}
++
++	/* Only a matching completed response transfers buffer ownership back. */
++	dma_rmb();
++	if (reply && reply_len)
+ 		memcpy(reply, core->buf + len - reply_len, reply_len);
+-
++	goto unlock;
++failed:
++	core->mbox_broken = true;
++	broken = true;
++unlock:
+ 	spin_unlock_bh(&core->lock);
+-
+-	if (ret == -ETIMEDOUT)
++	if (broken)
+ 		dev_err_ratelimited(npu->dev,
+-				    "mailbox function %d timed out\n",
+-				    func_id);
+-
++			"mailbox disabled: function=%d sequence=%u status=%#x error=%d\n",
++			func_id, seq + 1, val, ret);
+ 	return ret;
+ }
+ 
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -176,6 +176,8 @@
+ 		/* Coherent bounce buffer for mailbox cmd/rsp */
+ 		void *buf;
+ 		dma_addr_t addr;
++		/* Protected by lock; no reuse after uncertain completion. */
++		bool mbox_broken;
+ 	} cores[NPU_NUM_CORES];
+ 
+ 	int irqs[NPU_NUM_IRQ];

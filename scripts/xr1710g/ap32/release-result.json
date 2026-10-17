@@ -1,0 +1,40 @@
+{
+  "at": "2026-10-11T01:40:20.619956+08:00",
+  "version": "20261011-ap32-d331711d",
+  "imageSHA256": "a0e137d15c07b5b288f19529e6361a3dbc77ac8889496b619f3512b9d78dcbfd",
+  "bothAPsDeployed": true,
+  "deploymentOrder": [
+    2,
+    1
+  ],
+  "configurationPreserved": true,
+  "healthChecksEach": 15,
+  "bootIDs": {
+    "1": "2c769495-0261-468b-802d-1ae36216f0be",
+    "2": "183342be-9215-4a57-bef2-b84d0948c055"
+  },
+  "sourceEvidence": "development/ap32/source-progress.json",
+  "imageEvidence": "development/ap32/packed-files-qa.json",
+  "implemented": [
+    "FDB/STP mutation fence with nested and concurrent writer tracking",
+    "PPE template publication and packet binding reject busy or stale bridge epochs"
+  ],
+  "nativeSanitizedAndARMChecksEach": 1050,
+  "realKernelVMChecks": 22,
+  "liveWriterCountReturnsZero": true,
+  "NpuPpeEnabled": false,
+  "policyLatchRetained": true,
+  "automaticRulePublisherShipped": false,
+  "hardwareBindingProven": false,
+  "phoneTested": false,
+  "newThroughputOrLongTermQualification": false,
+  "softwarePostflight": "development/ap32/postflight.json",
+  "APBidirectionalProbes": "60/60",
+  "wiredPCtoAP2Probes": "10/10",
+  "remaining": [
+    "other bridge/VLAN/netdevice and TC policy transition coverage",
+    "actual rule execution with coherent live collection and qualified policy control",
+    "applicable hardware qualification with fresh AP32 ABI/address/recovery manifests"
+  ],
+  "mainRouterSwitchPCNetworkChanged": false
+}

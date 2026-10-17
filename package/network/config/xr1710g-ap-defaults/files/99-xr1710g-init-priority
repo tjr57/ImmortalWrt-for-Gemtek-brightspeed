@@ -1,0 +1,15 @@
+#!/bin/sh
+# Normalize only obsolete links to this package-owned service.
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = gemtek,xr1710g ] || exit 0
+# Refuse a foreign canonical entry before mutating any legacy link.
+for link in /etc/rc.d/S09xr1710g_npu_audit /etc/rc.d/K01xr1710g_npu_audit; do
+ if [ -e "$link" ] || [ -L "$link" ]; then
+  [ -L "$link" ] && [ "$(readlink "$link")" = ../init.d/xr1710g_npu_audit ] || exit 1
+ fi
+done
+for link in /etc/rc.d/S9xr1710g_npu_audit /etc/rc.d/K1xr1710g_npu_audit; do
+ [ -L "$link" ] || continue
+ [ "$(readlink "$link")" = ../init.d/xr1710g_npu_audit ] || continue
+ rm -f -- "$link" || exit 1
+done
+/etc/init.d/xr1710g_npu_audit enable

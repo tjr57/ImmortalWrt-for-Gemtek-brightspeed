@@ -1,0 +1,197 @@
+Subject: [PATCH] cfg80211: compare all CAC subchannels and retire cancelled work
+
+XR AP22 local correction to the AP20/21 SDK handoff adaptation.
+Compare both unpunctured subchannel sets, including 80+80's second segment,
+using the same iterator as CAC/DFS state accounting. Preserve foreground
+driver failure and abort-before-publish ordering.
+
+cancel_delayed_work() cannot stop a completion already waiting on the wiphy
+mutex. Track the work's active lifetime separately from its pending bit,
+ignore revoked ownership, and prevent reuse until old completion and queued
+abort have retired. Do not wait synchronously while holding the wiphy mutex.
+Notify an owned abort even if the timer was cancelled by a radar indication.
+This does not enable background radar or change regulatory requirements.
+
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -1177,6 +1177,28 @@
+ 	return false;
+ }
+ 
++/* Use the same unpunctured 20 MHz subchannels as CAC state accounting.
++ * Both channel definitions have already passed the CAC request validation.
++ * Testing only either primary channel misses partial and 80+80 overlap.
++ */
++bool cfg80211_cac_chandefs_overlap(const struct cfg80211_chan_def *a,
++                                 const struct cfg80211_chan_def *b)
++{
++	if (!a->chan || !b->chan || a->chan->band != b->chan->band ||
++	    cfg80211_chandef_get_width(a) <= 0 ||
++	    cfg80211_chandef_get_width(b) <= 0)
++		return false;
++
++	for_each_subchan(a, freq_a, cf_a) {
++		for_each_subchan(b, freq_b, cf_b) {
++			if (freq_a == freq_b)
++				return true;
++		}
++	}
++
++	return false;
++}
++
+ bool cfg80211_beaconing_iface_active(struct wireless_dev *wdev)
+ {
+ 	unsigned int link;
+--- a/net/wireless/core.h
++++ b/net/wireless/core.h
+@@ -95,6 +95,9 @@
+ 	struct cfg80211_chan_def background_radar_chandef;
+ 	struct delayed_work background_cac_done_wk;
+ 	struct work_struct background_cac_abort_wk;
++	/* IRQ cancellation may clear active; ownership stays wiphy-locked. */
++	atomic_t background_cac_done_active;
++	atomic_t background_cac_abort_pending;
+ 
+ 	/* netlink port which started critical protocol (0 means not started) */
+ 	u32 crit_proto_nlportid;
+@@ -513,6 +516,9 @@
+ 				  struct ieee80211_channel *chan);
+ 
+ bool cfg80211_beaconing_iface_active(struct wireless_dev *wdev);
++
++bool cfg80211_cac_chandefs_overlap(const struct cfg80211_chan_def *a,
++                                 const struct cfg80211_chan_def *b);
+ 
+ bool cfg80211_is_sub_chan(struct cfg80211_chan_def *chandef,
+ 			  struct ieee80211_channel *chan,
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -684,6 +684,8 @@
+ 	INIT_WORK(&rdev->rfkill_block, cfg80211_rfkill_block_work);
+ 	INIT_WORK(&rdev->conn_work, cfg80211_conn_work);
+ 	INIT_WORK(&rdev->event_work, cfg80211_event_work);
++	atomic_set(&rdev->background_cac_done_active, 0);
++	atomic_set(&rdev->background_cac_abort_pending, 0);
+ 	INIT_WORK(&rdev->background_cac_abort_wk,
+ 		  cfg80211_background_cac_abort_wk);
+ 	INIT_DELAYED_WORK(&rdev->background_cac_done_wk,
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -1153,6 +1153,18 @@
+ }
+ 
+ 
++/* No synchronous wait here: the worker takes the wiphy mutex. If it has
++ * already started, retain the active token until it observes revoked ownership
++ * under that mutex. A new CAC cannot reuse the work/chandef in the meantime.
++ * Successful IRQ-context cancellation also releases the token atomically.
++ */
++static void
++cfg80211_cancel_background_cac(struct cfg80211_registered_device *rdev)
++{
++	if (cancel_delayed_work(&rdev->background_cac_done_wk))
++		atomic_set(&rdev->background_cac_done_active, 0);
++}
++
+ void __cfg80211_radar_event(struct wiphy *wiphy,
+ 			    struct cfg80211_chan_def *chandef,
+ 			    bool offchan, gfp_t gfp)
+@@ -1167,10 +1179,8 @@
+ 	 */
+ 	cfg80211_set_dfs_state(wiphy, chandef, NL80211_DFS_UNAVAILABLE);
+ 
+-	if (offchan) {
+-		cancel_delayed_work(&rdev->background_cac_done_wk);
+-		queue_work(cfg80211_wq, &rdev->background_cac_abort_wk);
+-	}
++	if (offchan)
++		cfg80211_background_cac_abort(wiphy);
+ 
+ 	cfg80211_sched_dfs_chan_update(rdev);
+ 
+@@ -1253,8 +1263,7 @@
+ 		break;
+ 	case NL80211_RADAR_CAC_ABORTED:
+ 		cfg80211_set_cac_state(wiphy, chandef, false);
+-		if (!cancel_delayed_work(&rdev->background_cac_done_wk))
+-			return;
++		cfg80211_cancel_background_cac(rdev);
+ 		break;
+ 	case NL80211_RADAR_CAC_STARTED:
+ 		cfg80211_set_cac_state(wiphy, chandef, true);
+@@ -1277,6 +1286,16 @@
+ 
+ 	guard(wiphy)(&rdev->wiphy);
+ 
++	atomic_set(&rdev->background_cac_done_active, 0);
++	if (!rdev->background_radar_wdev)
++		return;
++
++	if (atomic_read(&rdev->background_cac_abort_pending)) {
++		cfg80211_stop_background_radar_detection(
++			rdev->background_radar_wdev);
++		return;
++	}
++
+ 	rdev_set_radar_background(rdev, NULL);
+ 
+ 	__cfg80211_background_cac_event(rdev, rdev->background_radar_wdev,
+@@ -1299,12 +1318,15 @@
+ 	wdev = rdev->background_radar_wdev;
+ 	if (wdev)
+ 		cfg80211_stop_background_radar_detection(wdev);
++	atomic_set(&rdev->background_cac_abort_pending, 0);
+ }
+ 
+ void cfg80211_background_cac_abort(struct wiphy *wiphy)
+ {
+ 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+ 
++	atomic_set(&rdev->background_cac_abort_pending, 1);
++	cfg80211_cancel_background_cac(rdev);
+ 	queue_work(cfg80211_wq, &rdev->background_cac_abort_wk);
+ }
+ EXPORT_SYMBOL(cfg80211_background_cac_abort);
+@@ -1323,13 +1345,13 @@
+ 				     NL80211_EXT_FEATURE_RADAR_BACKGROUND))
+ 		return -EOPNOTSUPP;
+ 
+-	/* Offchannel chain already locked by another wdev */
+-	if (rdev->background_radar_wdev && rdev->background_radar_wdev != wdev)
+-		return -EBUSY;
+-
+-	/* CAC already in progress on the offchannel chain */
+-	if (rdev->background_radar_wdev == wdev &&
+-	    delayed_work_pending(&rdev->background_cac_done_wk))
++	/* Ownership includes completion waiting for this mutex, even when the
++	 * delayed-work pending bit has already cleared. After a stop, also wait
++	 * for that old completion/abort to retire before reusing its chandef.
++	 */
++	if (rdev->background_radar_wdev ||
++	    atomic_read(&rdev->background_cac_done_active) ||
++	    atomic_read(&rdev->background_cac_abort_pending))
+ 		return -EBUSY;
+ 
+ 	err = rdev_set_radar_background(rdev, chandef);
+@@ -1345,6 +1367,7 @@
+ 
+ 	__cfg80211_background_cac_event(rdev, wdev, chandef,
+ 					NL80211_RADAR_CAC_STARTED);
++	atomic_set(&rdev->background_cac_done_active, 1);
+ 	queue_delayed_work(cfg80211_wq, &rdev->background_cac_done_wk,
+ 			   msecs_to_jiffies(cac_time_ms));
+ 
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -11966,8 +11966,8 @@
+ 	 */
+ 	if (rdev->background_radar_wdev &&
+ 	    rdev->background_radar_chandef.chan &&
+-	    cfg80211_is_sub_chan(&chandef,
+-				rdev->background_radar_chandef.chan, false))
++	    cfg80211_cac_chandefs_overlap(&chandef,
++					  &rdev->background_radar_chandef))
+ 		cfg80211_stop_background_radar_detection(
+ 			rdev->background_radar_wdev);
+ 

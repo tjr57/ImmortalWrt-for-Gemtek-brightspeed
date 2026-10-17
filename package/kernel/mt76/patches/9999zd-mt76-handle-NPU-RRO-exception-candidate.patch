@@ -1,0 +1,107 @@
+--- a/npu.c
++++ b/npu.c
+@@ -31,6 +31,62 @@
+ static bool npu_rx_audit;
+ module_param_named(npu_rx_audit, npu_rx_audit, bool, 0400);
+ MODULE_PARM_DESC(npu_rx_audit, "Rate-limited TXFREE descriptor scalar diagnostics (boot-only)");
++
++/* MT7996 NPU RRO exception metadata, before the 128-byte RXD offset.
++ * The installed RV32 firmware copies indication reason[31:28] to desc.data,
++ * then delivers REPEAT/OLDPKT through the CPU queue with PPE reason/FOE zero.
++ * This is not the generic SID/fragment layout and not 802.11 Retry.
++ */
++static bool npu_rro_drop;
++module_param_named(npu_rro_drop, npu_rro_drop, bool, 0600);
++MODULE_PARM_DESC(npu_rro_drop, "MT7996 NPU explicit RRO duplicate/old exception discard");
++static bool npu_rro_audit;
++module_param_named(npu_rro_audit, npu_rro_audit, bool, 0600);
++static atomic_t npu_rro_counts[16];
++static atomic_t npu_rro_dropped;
++static atomic_t npu_rro_logs;
++static int npu_rro_stats_get(char *buf, const struct kernel_param *kp)
++{
++ int i, n = scnprintf(buf, PAGE_SIZE, "drop=%u dropped=%d reasons=",
++                     READ_ONCE(npu_rro_drop), atomic_read(&npu_rro_dropped));
++ for (i = 0; i < 16; i++)
++  n += scnprintf(buf+n, PAGE_SIZE-n, "%s%d", i ? "," : "", atomic_read(&npu_rro_counts[i]));
++ return n + scnprintf(buf+n, PAGE_SIZE-n, "\n");
++}
++static const struct kernel_param_ops npu_rro_stats_ops = { .get = npu_rro_stats_get };
++module_param_cb(npu_rro_stats, &npu_rro_stats_ops, NULL, 0400);
++
++static bool mt76_npu_rro_exception(u16 chip, u32 info, u32 data, u32 rxd0)
++{
++ u32 reason = data >> 28;
++ return chip == 0x7990 && (reason == 1 || reason == 2) &&
++        !(info & (NPU_RX_DMA_CRSN_MASK | NPU_RX_DMA_FOE_ID_MASK)) &&
++        FIELD_GET(GENMASK(31, 27), rxd0) == 2;
++}
++
++static bool mt76_npu_rro_discard(struct mt76_dev *dev, struct sk_buff *skb,
++                               u32 info, u32 data, u32 qid)
++{
++ bool exception, drop;
++ u32 rxd0, reason = data >> 28;
++ if (skb_headlen(skb) < 32)
++  return false;
++ rxd0 = get_unaligned_le32(skb->data);
++ exception = mt76_npu_rro_exception(mt76_chip(dev), info, data, rxd0);
++ drop = exception && READ_ONCE(npu_rro_drop);
++ if (drop)
++  atomic_inc(&npu_rro_dropped);
++ if (unlikely(READ_ONCE(npu_rro_audit))) {
++  atomic_inc(&npu_rro_counts[reason]);
++  if ((exception || atomic_read(&npu_rro_logs) < 16) &&
++      atomic_inc_return(&npu_rro_logs) <= 512)
++   dev_info(dev->dev, "NPU RRO q=%u data=%08x info=%08x rxd0=%08x rxd1=%08x g4fc=%08x g4sq=%08x discard=%u\n",
++    qid, data, info, rxd0, get_unaligned_le32(skb->data+4),
++    (skb_headlen(skb) >= 44 && (get_unaligned_le32(skb->data+4) & BIT(19))) ? get_unaligned_le32(skb->data+32) : 0,
++    (skb_headlen(skb) >= 44 && (get_unaligned_le32(skb->data+4) & BIT(19))) ? get_unaligned_le32(skb->data+40) : 0, drop);
++ }
++ return drop;
++}
+ 
+ /* Guard both kernel-native and compatibility header descriptor contracts. */
+ static_assert(!(NPU_RX_DMA_PKT_COUNT_MASK & NPU_RX_DMA_PKT_ID_MASK));
+@@ -281,7 +337,7 @@
+ 
+ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+ 					struct mt76_queue *q,
+-					u32 *info)
++					u32 *info, u32 *data)
+ {
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 	int i, nframes, start = q->tail, index = q->tail;
+@@ -325,6 +381,7 @@
+ 	 * fragment metadata must not replace the packet's PPE/RX classification.
+ 	 */
+ 	*info = first_info;
++	*data = READ_ONCE(desc[start].data);
+ 	index = q->tail;
+ 	for (i = 0; i < nframes; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+@@ -428,12 +485,21 @@
+ 
+ 	while (done < budget) {
+ 		struct sk_buff *skb;
+-		u32 info = 0;
+-
+-		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
++		u32 info = 0, data = 0;
++
++		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info, &data);
+ 		if (!skb)
+ 			break;
+ 
++		/* Dequeue already consumed the complete chain. Recycle through skb
++		 * ownership and charge NAPI budget, so exception bursts cannot stall
++		 * refill or create an unbounded poll loop. Never return NULL here.
++		 */
++		if (mt76_npu_rro_discard(dev, skb, info, data, qid)) {
++			dev_kfree_skb_any(skb);
++			done++;
++			continue;
++		}
+ 		dev->drv->rx_skb(dev, qid, skb, &info);
+ 		mt76_rx_poll_complete(dev, qid, napi);
+ 		done++;

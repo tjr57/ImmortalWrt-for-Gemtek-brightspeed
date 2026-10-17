@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "fixture": "/home/xrdev/artifacts/xr1710g/qa/1791651163678163341",
+  "runtime": "shipped ARM UCI/ucode under QEMU, native static shell",
+  "checks": [
+    "first boot bridge/static 192.168.10.3/main gateway and DNS/no DHCP or DNS server",
+    "reordered radio bands/AU country",
+    "upgrade preserves VLAN/address/wireless/offload",
+    "other board untouched",
+    "recovery RPC and ACL present; unavailable boot environment blocks recovery",
+    "wireless generator compiles with shipped modules",
+    "factory root hash verifies against private owner input",
+    "Simplified Chinese default and six nonempty catalogs",
+    "credential/language upgrade preservation and locked-account protection",
+    "admin defaults leave other board untouched and reject missing root record",
+    "same image AP2 factory/reset restores192.168.10.4 and independent hostname",
+    "factory identity is read-only and NIC MAC override ignored",
+    "AP2 upgrade preserves private mesh keys and configuration",
+    "unknown missing ambiguous truncated factory identity selects addressless DHCP client with radios off"
+  ],
+  "hardwareWirelessTest": false
+}

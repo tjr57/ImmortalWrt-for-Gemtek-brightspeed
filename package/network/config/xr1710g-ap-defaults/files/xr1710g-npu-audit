@@ -1,0 +1,9 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+. "${XR_NPU_AUDIT_LIB:-/usr/lib/xr1710g/npu-audit.sh}"
+case "$1" in
+    status) audit_status ;;
+    arm) audit_arm ;;
+    disarm) audit_disarm ;;
+    *) printf 'Usage: xr1710g-npu-audit status|arm|disarm\n' >&2; exit 2 ;;
+esac

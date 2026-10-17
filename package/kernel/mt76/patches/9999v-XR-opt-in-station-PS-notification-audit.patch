@@ -1,0 +1,211 @@
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -9,6 +9,7 @@
+ #include "mcu.h"
+ #include "mac.h"
+ #include "eeprom.h"
++#include "xr_ps_audit.h"
+ 
+ #define fw_name(_dev, name, ...)	({			\
+ 	char *_fw;						\
+@@ -898,7 +899,7 @@
+ }
+ 
+ static void
+-mt7996_mcu_ps_transition(struct mt7996_dev *dev, u16 wcid_idx, bool ps)
++mt7996_mcu_ps_transition(struct mt7996_dev *dev, u16 wcid_idx, bool ps, u8 tag)
+ {
+ 	struct mt76_wcid *wcid;
+ 
+@@ -906,7 +907,15 @@
+ 	if (!wcid || !wcid_to_sta(wcid))
+ 		return;
+ 
+-	mt76_sta_ps_transition(&dev->mt76, wcid, ps);
++	if (READ_ONCE(xr_ps_audit_wcid) == wcid_idx) {
++		bool before = test_bit(MT_WCID_FLAG_PS, &wcid->flags);
++
++		mt76_sta_ps_transition(&dev->mt76, wcid, ps);
++		xr_ps_audit_record(wcid_idx, tag, ps, before,
++				   test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	} else {
++		mt76_sta_ps_transition(&dev->mt76, wcid, ps);
++	}
+ }
+ 
+ static void
+@@ -941,7 +950,7 @@
+ 
+ 			mt7996_mcu_ps_transition(dev,
+ 						 le16_to_cpu(info->wlan_idx),
+-						 info->ps_bit);
++						 info->ps_bit, tag);
+ 			break;
+ 		}
+ 		case UNI_PS_MULTI_CLIENT_INFO: {
+@@ -959,7 +968,7 @@
+ 
+ 				mt7996_mcu_ps_transition(dev,
+ 					FIELD_GET(MT7996_PS_MULTI_WCID, entry),
+-					!!(entry & MT7996_PS_MULTI_PS_BIT));
++					!!(entry & MT7996_PS_MULTI_PS_BIT), tag);
+ 			}
+ 			break;
+ 		}
+@@ -970,7 +979,7 @@
+ 
+ 			for (i = 0; i < bitmap_len * 8; i++)
+ 				mt7996_mcu_ps_transition(dev, i,
+-					!!(bitmap[i / 8] & BIT(i % 8)));
++					!!(bitmap[i / 8] & BIT(i % 8)), tag);
+ 			break;
+ 		}
+ 		}
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -905,6 +905,36 @@
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_vow_atf, mt7996_vow_atf_get, mt7996_vow_atf_set,
+ 			 "%lld\n");
+ 
++/* Read-only per-link WCID/PS mapping; no hardware register access. */
++static void mt7996_xr_ps_sta_read(void *data, struct ieee80211_sta *sta)
++{
++ struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
++ struct mt7996_vif *mvif = msta->vif;
++ struct ieee80211_vif *vif = container_of((void *)mvif, struct ieee80211_vif, drv_priv);
++ struct ieee80211_link_sta *link_sta;
++ struct seq_file *s = data;
++ unsigned int link_id;
++
++ rcu_read_lock();
++ for_each_sta_active_link(vif, sta, link_sta, link_id) {
++  struct mt7996_sta_link *link = mt7996_sta_link(msta, link_id);
++  if (!link)
++   continue;
++  seq_printf(s, "mac=%pM link=%u wcid=%u phy=%u ps=%u\n", sta->addr,
++             link_id, link->wcid.idx, link->wcid.phy_idx,
++             test_bit(MT_WCID_FLAG_PS, &link->wcid.flags));
++ }
++ rcu_read_unlock();
++}
++
++static int mt7996_xr_ps_state_read(struct seq_file *s, void *data)
++{
++ struct mt7996_dev *dev = dev_get_drvdata(s->private);
++ seq_puts(s, "schema=1 snapshot=approximate\n");
++ ieee80211_iterate_stations_atomic(mt76_hw(dev), mt7996_xr_ps_sta_read, s);
++ return 0;
++}
++
+ /* Based on Ryan Chen's token_info diagnostics; capture token fields while
+  * locked, format afterwards, and mark queue scalars as approximate snapshots.
+  * No raw DMA, frame contents, keys or register writes are exposed.
+@@ -1028,6 +1058,8 @@
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "rdd_monitor", dir,
+ 				    mt7996_rdd_monitor);
+ 
++	debugfs_create_devm_seqfile(dev->mt76.dev, "xr_ps_state", dir,
++				    mt7996_xr_ps_state_read);
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "xr_token_info", dir,
+ 				    mt7996_xr_token_info_read);
+ 
+--- /dev/null
++++ b/mt7996/xr_ps_audit.h
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/* Opt-in scalar PS notification audit; no firmware commands or packet data. */
++#ifndef __XR_PS_AUDIT_H
++#define __XR_PS_AUDIT_H
++#include <linux/moduleparam.h>
++#include <linux/ktime.h>
++#include <linux/spinlock.h>
++
++#define XR_PS_AUDIT_DISABLED 65535
++#define XR_PS_AUDIT_SIZE 32
++struct xr_ps_audit_event {
++ u64 seq, ns;
++ u16 wcid;
++ u8 tag, requested, before, after;
++};
++static DEFINE_SPINLOCK(xr_ps_audit_lock);
++static u16 xr_ps_audit_wcid = XR_PS_AUDIT_DISABLED;
++static u64 xr_ps_audit_total;
++static struct xr_ps_audit_event xr_ps_audit_ring[XR_PS_AUDIT_SIZE];
++
++static int xr_ps_audit_select_set(const char *val, const struct kernel_param *kp)
++{
++ unsigned long flags;
++ u16 selected;
++ int ret = kstrtou16(val, 0, &selected);
++ if (ret)
++  return ret;
++ if (selected >= 2048 && selected != XR_PS_AUDIT_DISABLED)
++  return -ERANGE;
++ spin_lock_irqsave(&xr_ps_audit_lock, flags);
++ WRITE_ONCE(xr_ps_audit_wcid, selected);
++ xr_ps_audit_total = 0;
++ memset(xr_ps_audit_ring, 0, sizeof(xr_ps_audit_ring));
++ spin_unlock_irqrestore(&xr_ps_audit_lock, flags);
++ return 0;
++}
++
++static int xr_ps_audit_select_get(char *buf, const struct kernel_param *kp)
++{
++ return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(xr_ps_audit_wcid));
++}
++
++static void xr_ps_audit_record(u16 wcid, u8 tag, bool ps, bool before, bool after)
++{
++ struct xr_ps_audit_event *e;
++ unsigned long flags;
++ if (wcid >= 2048 || READ_ONCE(xr_ps_audit_wcid) != wcid)
++  return;
++ spin_lock_irqsave(&xr_ps_audit_lock, flags);
++ if (xr_ps_audit_wcid != wcid)
++  goto out;
++ e = &xr_ps_audit_ring[xr_ps_audit_total % XR_PS_AUDIT_SIZE];
++ *e = (struct xr_ps_audit_event) {
++  .seq = ++xr_ps_audit_total, .ns = ktime_get_mono_fast_ns(),
++  .wcid = wcid, .tag = tag, .requested = ps, .before = before, .after = after,
++ };
++out:
++ spin_unlock_irqrestore(&xr_ps_audit_lock, flags);
++}
++
++static int xr_ps_audit_events_get(char *buf, const struct kernel_param *kp)
++{
++ struct xr_ps_audit_event events[XR_PS_AUDIT_SIZE];
++ unsigned long flags;
++ u64 total;
++ u16 selected;
++ unsigned int count, i, length;
++ spin_lock_irqsave(&xr_ps_audit_lock, flags);
++ total = xr_ps_audit_total;
++ selected = xr_ps_audit_wcid;
++ count = min_t(u64, total, XR_PS_AUDIT_SIZE);
++ for (i = 0; i < count; i++)
++  events[i] = xr_ps_audit_ring[(total - count + i) % XR_PS_AUDIT_SIZE];
++ spin_unlock_irqrestore(&xr_ps_audit_lock, flags);
++ length = scnprintf(buf, PAGE_SIZE, "schema=1 selected=%u total=%llu retained=%u\n",
++                    selected, (unsigned long long)total, count);
++ for (i = 0; i < count; i++) {
++  struct xr_ps_audit_event *e = &events[i];
++  length += scnprintf(buf + length, PAGE_SIZE - length,
++      "seq=%llu ns=%llu wcid=%u tag=%u requested=%u before=%u after=%u\n",
++      (unsigned long long)e->seq, (unsigned long long)e->ns,
++      e->wcid, e->tag, e->requested, e->before, e->after);
++ }
++ return length;
++}
++
++static const struct kernel_param_ops xr_ps_audit_select_ops = {
++ .set = xr_ps_audit_select_set, .get = xr_ps_audit_select_get,
++};
++static const struct kernel_param_ops xr_ps_audit_events_ops = {
++ .get = xr_ps_audit_events_get,
++};
++module_param_cb(ps_audit_wcid, &xr_ps_audit_select_ops, NULL, 0600);
++MODULE_PARM_DESC(ps_audit_wcid, "PS event audit WCID 0..2047; 65535 disables; each write resets scalar ring");
++module_param_cb(ps_audit_events, &xr_ps_audit_events_ops, NULL, 0400);
++MODULE_PARM_DESC(ps_audit_events, "Bounded PS notification records for selected WCID; no frame data");
++#endif

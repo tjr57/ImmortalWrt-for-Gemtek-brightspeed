@@ -1,0 +1,16 @@
+--- a/mt76.h
++++ b/mt76.h
+@@ -1487,6 +1487,13 @@
+ 	BUILD_BUG_ON(sizeof(struct ieee80211_radiotap_he_mu) % 4);
+ 
+ 	mstat = *((struct mt76_rx_status *)skb->cb);
++
++	/* TLV RX metadata precedes the 802.11 header. The producer saves
++	 * mac_header before pushing it, as required by the mac80211 API.
++	 * In particular, EHT U-SIG type33 is not a frame-control field.
++	 */
++	if (mstat.flag & RX_FLAG_RADIOTAP_TLV_AT_END)
++		return skb_mac_header(skb);
+ 
+ 	if (mstat.flag & RX_FLAG_RADIOTAP_HE)
+ 		data += sizeof(struct ieee80211_radiotap_he);

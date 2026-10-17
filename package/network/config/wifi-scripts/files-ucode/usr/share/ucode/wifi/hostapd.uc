@@ -463,6 +463,7 @@ function device_htmode_append(config) {
 
 		if (config.hw_mode == 'a')
 			append_vars(config, [ 'eht_oper_chwidth', 'eht_oper_centr_freq_seg0_idx' ]);
+			append_vars(config, [ 'punct_bitmap', 'xr_pp_mode' ]);
 	}
 
 	append_vars(config, [ 'tx_queue_data2_burst', 'stationary_ap' ]);

@@ -1,0 +1,62 @@
+{
+  "passed": true,
+  "version": "20261011-ap31-d331711d",
+  "version_code": "20261011-ap31-d331711d",
+  "manifest": "/home/xrdev/projects/xr1710g/openwrt/bin/targets/airoha/an7581/xr1710g-ap-20261011-ap31-d331711d-airoha-an7581-gemtek_xr1710g.manifest",
+  "sysupgrade": "/home/xrdev/projects/xr1710g/openwrt/bin/targets/airoha/an7581/xr1710g-ap-20261011-ap31-d331711d-airoha-an7581-gemtek_xr1710g-squashfs-sysupgrade.itb",
+  "recovery": "/home/xrdev/projects/xr1710g/openwrt/bin/targets/airoha/an7581/xr1710g-ap-20261011-ap31-d331711d-airoha-an7581-gemtek_xr1710g-initramfs-recovery.itb",
+  "checks": [
+    {
+      "name": "effective PPE default off and WLAN NPU support compiled",
+      "passed": true
+    },
+    {
+      "name": "compiled boot policy has default0 and read-only0400",
+      "passed": true
+    },
+    {
+      "name": "compiled exact boot parameter name",
+      "passed": true
+    },
+    {
+      "name": "packed I2C binding fixed",
+      "passed": true
+    },
+    {
+      "name": "packed DTB is current generated DTB",
+      "passed": true
+    },
+    {
+      "name": "packed normal kernel is current saved Image",
+      "passed": true
+    },
+    {
+      "name": "compiled WLAN NPU attach default0 and read-only0400",
+      "passed": true
+    },
+    {
+      "name": "compiled WLAN NPU boot parameter name",
+      "passed": true
+    },
+    {
+      "name": "shipped TXFREE boundary and layout diagnostics",
+      "passed": true
+    },
+    {
+      "name": "NPU ownership preflight and refill present",
+      "passed": true
+    },
+    {
+      "name": "current version manifest contains AP safety packages",
+      "passed": true
+    },
+    {
+      "name": "current rootfs preinit address10.3",
+      "passed": true
+    }
+  ],
+  "warnings": [
+    "version.buildinfo is an upstream/stale generic label; do not present it as the AP artifact version. Exact version was validated via .config/profiles.json and unique prefix."
+  ],
+  "hardware_verified": false
+}

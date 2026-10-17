@@ -1,0 +1,9 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+. /lib/functions/system.sh
+[ "$(board_name)" = gemtek,xr1710g ] || exit 1
+[ "$#" = 0 ] || exit 2
+. /usr/lib/xr1710g/ap-role.sh
+xr1710g_detect_ap_role
+printf '{"role":"%s","management_address":"%s","hostname":"%s","factory_mac":"%s","identity_state":"%s","identity_source":"factory-nvmem"}\n' \
+ "$ap_role" "$ap_address" "$ap_hostname" "$ap_factory_mac" "$ap_identity_state"

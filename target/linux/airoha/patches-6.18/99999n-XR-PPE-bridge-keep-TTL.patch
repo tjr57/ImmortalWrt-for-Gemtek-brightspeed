@@ -1,0 +1,25 @@
+Subject: [PATCH] XR: PPE bridge templates must not decrement the IP TTL
+
+AP37 bounded trial 1 captured TTL 64 forwarded as 63 once bridge subflows were
+bound (software bridge kept 64). Bridge templates no longer set
+AIROHA_FOE_IB1_BIND_TTL; routed flow types keep it. L2 subflows inherit the
+template ib1 except packet type and UDP, so the bit is gone for them too.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -471,8 +471,13 @@
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_UDP, l4proto == IPPROTO_UDP) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, data->vlan.num) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, data->vlan.num) |
+-	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num) |
+-	      AIROHA_FOE_IB1_BIND_TTL;
++	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num);
++	/* A bridge never changes the IP TTL. AP37 trial 1 measured bound bridge
++	 * subflows forwarding TTL 64 as 63 with this bit set; L2 subflows inherit
++	 * every ib1 bit except packet type/UDP from this template.
++	 */
++	if (type != PPE_PKT_TYPE_BRIDGE)
++		val |= AIROHA_FOE_IB1_BIND_TTL;
+ 	hwe->ib1 = val;
+ 
+ 	val = FIELD_PREP(AIROHA_FOE_IB2_PORT_AG, 0x1f);

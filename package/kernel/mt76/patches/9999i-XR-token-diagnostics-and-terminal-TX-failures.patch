@@ -1,0 +1,151 @@
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1353,6 +1353,22 @@
+ 	mt76_put_txwi(mdev, t);
+ }
+ 
++/* Counters describe transport lengths, they do not clamp counts or
++ * declare a firmware format invalid merely because lengths differ.
++ */
++static bool mt7996_txfree_record_length(struct mt7996_dev *dev,
++                                      const void *data, int len)
++{
++ atomic64_inc(&dev->txfree_messages);
++ if (len < 2 * (int)sizeof(__le32)) {
++  atomic64_inc(&dev->txfree_short_headers);
++  return false;
++ }
++ if (FIELD_GET(MT_TXFREE0_RX_BYTE, get_unaligned_le32(data)) != len)
++  atomic64_inc(&dev->txfree_length_mismatches);
++ return true;
++}
++
+ static void
+ mt7996_mac_tx_free(struct mt7996_dev *dev, void *data, int len)
+ {
+@@ -1370,7 +1386,7 @@
+ 	u16 total, count = 0;
+ 	u8 ver;
+ 
+-	if (unlikely(len < 2 * (int)sizeof(*tx_free))) {
++	if (unlikely(!mt7996_txfree_record_length(dev, data, len))) {
+ 		dev_warn_ratelimited(dev->mt76.dev,
+ 			"TXFREE short header: len=%d\n", len);
+ 		return;
+@@ -1400,6 +1416,7 @@
+ 		u8 i;
+ 
+ 		if (WARN_ON_ONCE(end - (u8 *)cur_info < sizeof(*cur_info))) {
++			atomic64_inc(&dev->txfree_truncations);
+ 			dev_warn_ratelimited(dev->mt76.dev,
+ 				"TXFREE truncated: len=%d rx_bytes=%u type=%u ver=%u completed=%u total=%u offset=%zu\n",
+ 				len, (u32)le32_get_bits(tx_free[0], MT_TXFREE0_RX_BYTE),
+@@ -1460,8 +1477,8 @@
+ 
+ 			count = FIELD_GET(MT_TXFREE_INFO_COUNT, info);
+ 			tx_retries = count ? count - 1 : 0;
+-			tx_failed = tx_retries +
+-				!!FIELD_GET(MT_TXFREE_INFO_STAT, info);
++			/* Successful retries are retries, not terminal TX failures. */
++			tx_failed = !!FIELD_GET(MT_TXFREE_INFO_STAT, info);
+ 
+ 			wcid->stats.tx_retries += tx_retries;
+ 			wcid->stats.tx_failed += tx_failed;
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -456,6 +456,13 @@
+ 		struct mt76_dev mt76;
+ 		struct mt76_phy mphy;
+ 	};
++
++	/* Lifetime diagnostics; zeroed allocation, no packet contents. */
++	atomic64_t txfree_messages;
++	atomic64_t txfree_short_headers;
++	atomic64_t txfree_length_mismatches;
++	atomic64_t txfree_truncations;
++
+ 
+ 	struct mt7996_phy *radio_phy[MT7996_MAX_RADIOS];
+ 	struct wiphy_radio radios[MT7996_MAX_RADIOS];
+@@ -572,6 +579,9 @@
+ 
+ 	bool vow_atf_en;
+ };
++
++/* mt76_alloc_device and mphy/mt76 aliases require this layout. */
++static_assert(offsetof(struct mt7996_dev, mt76) == 0);
+ 
+ enum {
+ 	WFDMA0 = 0x0,
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -905,6 +905,59 @@
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_vow_atf, mt7996_vow_atf_get, mt7996_vow_atf_set,
+ 			 "%lld\n");
+ 
++/* Based on Ryan Chen's token_info diagnostics; capture token fields while
++ * locked, format afterwards, and mark queue scalars as approximate snapshots.
++ * No raw DMA, frame contents, keys or register writes are exposed.
++ */
++static int mt7996_xr_token_info_read(struct seq_file *s, void *data)
++{
++ struct mt7996_dev *dev = dev_get_drvdata(s->private);
++ struct mt76_dev *mdev = &dev->mt76;
++ unsigned int tokens, size, first, wed, rx;
++ bool npu;
++ int i, ret;
++
++ ret = mutex_lock_interruptible(&mdev->mutex);
++ if (ret)
++  return ret;
++ npu = mt76_npu_device_active(mdev);
++ spin_lock_bh(&mdev->token_lock);
++ tokens = mdev->token_count; size = mdev->token_size;
++ first = mdev->token_start; wed = mdev->wed_token_count;
++ spin_unlock_bh(&mdev->token_lock);
++ spin_lock_bh(&mdev->rx_token_lock);
++ rx = mdev->rx_token_size;
++ spin_unlock_bh(&mdev->rx_token_lock);
++ seq_printf(s, "tokens=%u size=%u start=%u wed=%u rx_size=%u npu_active=%u\n",
++            tokens, size, first, wed, rx, npu);
++ seq_printf(s, "txfree_messages=%lld short_headers=%lld length_mismatches=%lld truncations=%lld\n",
++            atomic64_read(&dev->txfree_messages),
++            atomic64_read(&dev->txfree_short_headers),
++            atomic64_read(&dev->txfree_length_mismatches),
++            atomic64_read(&dev->txfree_truncations));
++ seq_puts(s, "queue_counters=approximate\n");
++ for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++) {
++  struct mt76_queue *q = &mdev->q_rx[i];
++  seq_printf(s, "npu_rx%d ndesc=%u queued=%u head=%u tail=%u napi_registered=%u napi_enabled=%u irq_registered=%u\n",
++             i - MT_RXQ_NPU0, READ_ONCE(q->ndesc), READ_ONCE(q->queued),
++             READ_ONCE(q->head), READ_ONCE(q->tail),
++             q->npu_napi_registered, q->npu_napi_enabled,
++             q->npu_irq_registered);
++ }
++ for (i = 0; i < __MT_MAX_BAND; i++) {
++  struct mt76_phy *phy = mdev->phys[i];
++  struct mt76_queue *q;
++  if (!phy || !phy->q_tx[0])
++   continue;
++  q = phy->q_tx[0];
++  seq_printf(s, "band=%d path=%s ndesc=%u queued=%u head=%u tail=%u\n", i,
++             mt76_queue_is_npu_tx(q) ? "npu" : "dma", READ_ONCE(q->ndesc),
++             READ_ONCE(q->queued), READ_ONCE(q->head), READ_ONCE(q->tail));
++ }
++ mutex_unlock(&mdev->mutex);
++ return 0;
++}
++
+ int mt7996_init_debugfs(struct mt7996_dev *dev)
+ {
+ 	struct dentry *dir;
+@@ -937,6 +990,9 @@
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "rdd_monitor", dir,
+ 				    mt7996_rdd_monitor);
+ 
++	debugfs_create_devm_seqfile(dev->mt76.dev, "xr_token_info", dir,
++				    mt7996_xr_token_info_read);
++
+ 	dev->debugfs_dir = dir;
+ 
+ 	return 0;

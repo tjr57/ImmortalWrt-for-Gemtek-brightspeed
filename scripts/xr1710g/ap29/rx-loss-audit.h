@@ -1,0 +1,133 @@
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
+/* Private, default-off 6 GHz RX metadata. Never copies packet/key bytes. */
+#ifndef XR_RX_LOSS_AUDIT_H
+#define XR_RX_LOSS_AUDIT_H
+#include <linux/ktime.h>
+#include <linux/moduleparam.h>
+#define XR_RX_EVENTS 16
+#define XR_RX_STREAMS 64
+struct xr_rx_event {
+	u64 serial, us, previous_us;
+	s64 pn_delta;
+	u32 reason, length, flags, wcid, phy, tid, seq, previous_seq;
+	u32 context, previous_context, aggregation;
+};
+struct xr_rx_stream {
+	/* Opaque equality token only, never dereferenced or exported. */
+	const void *wcid;
+	u64 pn, us;
+	u32 tid, seq, context;
+};
+static bool xr_rx_loss_audit;
+module_param_named(rx_loss_audit, xr_rx_loss_audit, bool, 0600);
+MODULE_PARM_DESC(rx_loss_audit, "Opt-in bounded 6GHz RX rejection metadata");
+static DEFINE_SPINLOCK(xr_rx_loss_lock);
+static struct xr_rx_event xr_rx_events[XR_RX_EVENTS];
+static struct xr_rx_stream xr_rx_streams[XR_RX_STREAMS];
+static u64 xr_rx_loss_total;
+static u32 xr_rx_next_stream;
+
+static u64 xr_rx_pn_value(const u8 *p)
+{
+	u64 value = 0;
+	int i;
+	for (i = 0; i < 6; i++)
+		value = (value << 8) | p[i];
+	return value;
+}
+
+/* reason 0 updates only last accepted PN metadata, 1 means pre-existing
+ * driver ONLY_MONITOR, 2 means mt76 PN comparison rejected this frame.
+ * Called under dev->rx_lock; our separate lock also protects sysfs readers.
+ * The decision and all receive flags remain the caller's responsibility.
+ */
+static void xr_rx_loss_record(struct sk_buff *skb, u32 reason, int tid,
+			      bool napi)
+{
+	struct mt76_rx_status *s = (struct mt76_rx_status *)skb->cb;
+	struct xr_rx_stream *prior = NULL;
+	struct xr_rx_event *e;
+	unsigned long flags;
+	u64 now, pn = 0, previous_pn = 0, serial;
+	int i;
+
+	if (!READ_ONCE(xr_rx_loss_audit) || s->band != NL80211_BAND_6GHZ ||
+	    !s->wcid || tid < 0 || tid > IEEE80211_NUM_TIDS || reason > 2)
+		return;
+	if (reason != 1) {
+		pn = xr_rx_pn_value(s->iv);
+		previous_pn = xr_rx_pn_value(s->wcid->rx_key_pn[tid]);
+	}
+	spin_lock_irqsave(&xr_rx_loss_lock, flags);
+	now = div_u64(ktime_get_mono_fast_ns(), 1000);
+	for (i = 0; i < XR_RX_STREAMS; i++) {
+		if (xr_rx_streams[i].wcid == s->wcid &&
+		    xr_rx_streams[i].tid == tid) {
+			prior = &xr_rx_streams[i];
+			break;
+		}
+	}
+	if (!reason) {
+		if (!prior)
+			prior = &xr_rx_streams[xr_rx_next_stream++ % XR_RX_STREAMS];
+		*prior = (struct xr_rx_stream) {
+			.wcid = s->wcid, .tid = tid, .pn = pn, .us = now,
+			.seq = s->seqno, .context = napi ? 1 : 2,
+		};
+		goto out;
+	}
+	serial = ++xr_rx_loss_total;
+	e = &xr_rx_events[(serial - 1) % XR_RX_EVENTS];
+	*e = (struct xr_rx_event) {
+		.serial = serial, .us = now, .reason = reason,
+		.length = skb->len, .flags = s->flag, .wcid = s->wcid->idx,
+		.phy = s->phy_idx, .tid = tid, .seq = s->seqno,
+		.context = napi ? 1 : 2, .previous_seq = 65535,
+		.pn_delta = reason == 2 ? (s64)pn - (s64)previous_pn : 0,
+		.aggregation = s->aggr | (s->amsdu << 1) |
+			      (s->first_amsdu << 2) | (s->last_amsdu << 3),
+	};
+	/* Require an unchanged counter, so key setup or unobserved updates do
+ * not get attributed to an unrelated previous accepted record. */
+	if (reason == 2 && prior && prior->pn == previous_pn) {
+		e->previous_seq = prior->seq;
+		e->previous_us = prior->us;
+		e->previous_context = prior->context;
+	}
+out:
+	spin_unlock_irqrestore(&xr_rx_loss_lock, flags);
+}
+
+static int xr_rx_loss_get(char *buffer, const struct kernel_param *kp)
+{
+	struct xr_rx_event snapshot[XR_RX_EVENTS];
+	unsigned long flags;
+	u64 total, first, serial;
+	int used;
+	(void)kp;
+	spin_lock_irqsave(&xr_rx_loss_lock, flags);
+	total = xr_rx_loss_total;
+	memcpy(snapshot, xr_rx_events, sizeof(snapshot));
+	spin_unlock_irqrestore(&xr_rx_loss_lock, flags);
+	first = total > XR_RX_EVENTS ? total - XR_RX_EVENTS + 1 : 1;
+	used = scnprintf(buffer, PAGE_SIZE,
+		"schema=1 enabled=%u total=%llu retained=%u\n"
+		"serial us reason len flags wcid phy tid seq agg ctx pn_delta prev_seq prev_us prev_ctx\n",
+		READ_ONCE(xr_rx_loss_audit), (unsigned long long)total,
+		(unsigned int)min_t(u64, total, XR_RX_EVENTS));
+	for (serial = first; serial <= total && used < PAGE_SIZE - 220; serial++) {
+		const struct xr_rx_event *e = &snapshot[(serial - 1) % XR_RX_EVENTS];
+		used += scnprintf(buffer + used, PAGE_SIZE - used,
+			"%llu %llu %u %u 0x%08x %u %u %u %u %u %u %lld %u %llu %u\n",
+			(unsigned long long)e->serial, (unsigned long long)e->us,
+			e->reason, e->length, e->flags, e->wcid, e->phy, e->tid,
+			e->seq, e->aggregation, e->context, (long long)e->pn_delta,
+			e->previous_seq, (unsigned long long)e->previous_us,
+			e->previous_context);
+	}
+	return used;
+}
+static const struct kernel_param_ops xr_rx_loss_ops = { .get = xr_rx_loss_get };
+module_param_cb(rx_loss_events, &xr_rx_loss_ops, NULL, 0400);
+MODULE_PARM_DESC(rx_loss_events, "Last16 6GHz RX rejections;1=driver flag,2=PN;ctx1=NAPI,2=timer");
+#endif

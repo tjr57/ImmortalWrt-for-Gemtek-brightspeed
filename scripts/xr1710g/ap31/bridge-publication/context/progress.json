@@ -1,0 +1,51 @@
+{
+  "at": "2026-10-11T00:45:27.040302+08:00",
+  "stage": "private bridge-context and publisher-planner qualification",
+  "patch": "development/ap31/ppe-context/99999g-XR-exact-PPE-bridge-publication.patch",
+  "candidateSHA256": "7188f4e44e313ee4be7d6b3fbf148b2b966c8210538d4456080a918c200ce57e",
+  "qa": "development/ap31/ppe-context/qa.json",
+  "kernelObjectBuild": "development/ap31/ppe-context/kernel-object-build.json",
+  "publisherSource": "development/ap31/publisher/xr_ppe_rules.py",
+  "publisherUnitQA": "development/ap31/publisher/unit-qa.json",
+  "publisherReadbackQA": "development/ap31/publisher/readback-qa.json",
+  "realKernelVM": "development/ap31/publisher/vm-result.json",
+  "tcTinyBuild": "development/ap31/publisher/tc-tiny-build.json",
+  "implemented": [
+    "inherit exact redirect/VLAN actions, tagged ingress key and generation revocation",
+    "reject non-forwarding/down/carrierless ports and unsupported bridge port policies/MST",
+    "RCU FDB API rejects missing, local, locked, expired and wrong-port forwarding entries",
+    "MAC bridge templates reject tagged-to-tagged PCP/DEI loss; TC nonzero chains rejected",
+    "expose revocation generation for future publisher reconciliation",
+    "host planner builds hardware-only TC argv and exact-owned delete/re-add plans",
+    "strict TC JSON selector/action/cookie readback; no adoption of software-only filters",
+    "tc-tiny dependency chosen and privately compiled with flower/mirred/VLAN/clsact parsers"
+  ],
+  "validation": {
+    "nativeASanUBSanAndARMContextChecksEach": 65734,
+    "plannerCases": 96,
+    "readbackCases": 57,
+    "realKernelBridgeProbeCases": 14,
+    "realKernelTCPrograms": 3,
+    "actualARMKernelObjects": [
+      "airoha_ppe",
+      "br_fdb"
+    ],
+    "jobs": 12,
+    "hardwarePositiveReadbackFlagsModeled": true
+  },
+  "previousActionPacketEvidence": "development/ap31/ppe-vlan/packet-qa.json",
+  "previousRevocationEvidence": "development/ap31/ppe-revocation/qa.json",
+  "contextTestsSupersedePreviousContextAcceptance": true,
+  "previousFailedVMFixtureRunsRetained": true,
+  "productionSourceConfigImageChanged": false,
+  "deviceChangedOrFlashed": false,
+  "actualRuleExecutionImplemented": false,
+  "policyLatchBypassed": false,
+  "hardwareBindingProven": false,
+  "remaining": [
+    "synchronous TC/bridge policy handoff before enabling a conflicting policy; userspace polling is insufficient",
+    "FDB pre-notify/mutate/post-notify concurrency beyond the generation check",
+    "rule executor plus coherent live collector and transaction cleanup under a qualified kernel policy lease",
+    "full firmware dependency integration, ARM image/ABI build, AP2 then AP1 upgrade and hardware qualification"
+  ]
+}

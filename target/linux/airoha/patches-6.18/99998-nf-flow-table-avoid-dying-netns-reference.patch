@@ -1,0 +1,31 @@
+Subject: [PATCH] netfilter: nf_flow_table: do not resurrect a dying network namespace
+SPDX-License-Identifier: GPL-2.0-only
+
+The platform FDB roaming notifier can be called from cleanup_net after
+the namespace active reference count has reached zero. get_net() then
+triggers addition-on-zero, and the deferred worker later underflows the
+saturated count with put_net().
+
+Use maybe_get_net() to atomically acquire only a live namespace. If it
+fails, release the unqueued cleanup object. A successful acquisition is
+still balanced by the existing cleanup worker put_net().
+
+Applies after 990-01-smartrg-netfilter-nf_flow_table-invalidate-flows-on-
+bridge-FDB-roaming.patch. No PPE policy, bridge VLAN or mt76 changes.
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -850,7 +850,12 @@
+ 	if (!cleanup)
+ 		return;
+ 
+-	cleanup->net = get_net(net);
++	/* FDB deletion also runs while a network namespace is exiting. */
++	cleanup->net = maybe_get_net(net);
++	if (!cleanup->net) {
++		kfree(cleanup);
++		return;
++	}
+ 	memcpy(cleanup->mac, mac, ETH_ALEN);
+ 	INIT_WORK(&cleanup->work, nf_flow_table_mac_cleanup_work);
+ 	queue_work(flow_mac_cleanup_wq, &cleanup->work);

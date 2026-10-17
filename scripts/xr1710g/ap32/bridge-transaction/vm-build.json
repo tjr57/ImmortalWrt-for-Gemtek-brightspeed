@@ -1,0 +1,46 @@
+{
+  "passed": true,
+  "jobs": 12,
+  "kernel": "/home/xrdev/projects/xr1710g/boot-lab/ap32-bridge-transaction/linux-6.18.54/arch/x86/boot/bzImage",
+  "kernelSHA256": "05f6a4cd9af0507c9cd4babb4cea83700196d89cf157561cf093a8d61c54d0cd",
+  "configSHA256": "1fc611f2d9c237eb244454741371ee558918eb0186a5de42ef043fd067243776",
+  "module": "/home/xrdev/projects/xr1710g/boot-lab/ap32-bridge-transaction/module/xr_fence_probe.ko",
+  "moduleSHA256": "905df83d9c5231d42b5cbe270204023d13eb9fabcc1c168769c29a81a94f024b",
+  "privateSelftestSHA256": "9724b989d493940ee83d3bd43b56e2eade2c95c5ce0b4ac78d709881d0948122",
+  "candidate": {
+    "drivers/net/ethernet/airoha/airoha_ppe.c": {
+      "before": "7188f4e44e313ee4be7d6b3fbf148b2b966c8210538d4456080a918c200ce57e",
+      "after": "f139ce08b1678ac910974b0aef9f1c071cb709545061e1164cc13ca3aee1321e"
+    },
+    "drivers/net/ethernet/airoha/airoha_eth.h": {
+      "before": "fb5e961a1380cd7bf05272a5e0e5f12ec97b75e17ada389be6f1de7d613b615c",
+      "after": "4547e0936f336c1361aff4eea110bb505ad85ee000c7935578cd20a974ff5453"
+    },
+    "include/linux/if_bridge.h": {
+      "before": "2612218bec087334417016472ee8cce769d7ee56aaa36fc5f885d7b34d1e26d9",
+      "after": "7a7ffcdd224e42a52be6488924ce6fae2d6b288d5cd0c349416461b538da1836"
+    },
+    "net/bridge/br_fdb.c": {
+      "before": "fc2346556bbc822641bd4ca461cdd49fd3057bb00bf0263c821fd7c1a53aee30",
+      "after": "f383f9fc5fe1ca2825990776ee14b12d0228880afa52ccc46bf2266a9fdb0f4a"
+    },
+    "net/bridge/br_stp.c": {
+      "before": "1e6424579c68665a7af5012078c2a4357036b92fc7f332b661fe8bdcc1d4a89b",
+      "after": "5a92a09df0f138144a45aafd8d12491508aaf4115ce607fe99d201c7f37a761d"
+    },
+    "net/bridge/br_private.h": {
+      "before": "a55a91490ca4f973e5d423ab75530ac6ed44d4a73b99c0d775c5a5b753cfdf7e",
+      "after": "a6243dd22facbf2477e7e53297b7da3ebaa4cb13f1a19db3535dd4603cca101f"
+    },
+    "net/bridge/Makefile": {
+      "before": "2b10bdfd663ffc24d266d8691b01a321d15bf3ae8f05a4a1b55a69c74a576de5",
+      "after": "ea1622713c6a959bc0752c4189949c44aded3300dbec32f5eee2c2ca7597586f"
+    },
+    "net/bridge/br_fwd_policy.c": {
+      "before": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after": "872d22f1b0624a43df9c72a0315bc86f3a70497d56f8d71401dbe75880d4fef0"
+    }
+  },
+  "baselineVMUnchanged": true,
+  "productionOrDeviceChanged": false
+}

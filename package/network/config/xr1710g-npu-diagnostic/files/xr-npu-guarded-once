@@ -1,0 +1,39 @@
+#!/bin/sh
+[ "${1:-}" = boot ] || exit 2
+request=/etc/xr-npu-guarded.once
+[ -e "$request" ] || [ -L "$request" ] || exit 0
+[ -f "$request" ] && [ ! -L "$request" ] || exit 1
+permissions=$(ls -nd "$request") || exit 1
+set -- $permissions
+[ "$1:$3" = -rw-------:0 ] || exit 1
+[ "$(wc -c < "$request")" -le 128 ] || exit 1
+line=$(cat "$request") || exit 1
+old=${line#xr-npu-guarded-v1 }
+[ "$line" = "xr-npu-guarded-v1 $old" ] && [ "${#old}" = 36 ] || exit 1
+printf '%s\n' "$old" | grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' || exit 1
+boot=$(cat /proc/sys/kernel/random/boot_id) || exit 1
+[ "${#boot}" = 36 ] || exit 1
+printf '%s\n' "$boot" | grep -Eq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' || exit 1
+[ "$old" != "$boot" ] || exit 0
+[ "$(cat /tmp/sysinfo/board_name)" = gemtek,xr1710g ] || exit 1
+/usr/sbin/xr1710g-ap-role | grep -q '"role"[[:space:]]*:[[:space:]]*"ap1"' || exit 1
+[ -x /usr/libexec/xr-diag-activate ] && [ ! -L /usr/libexec/xr-diag-activate ] || exit 1
+rm -f "$request" || exit 1
+sync
+# S08 precedes OpenWrt S10boot, which normally mounts debugfs. Do not confuse
+# a missing mount with a failed firmware fingerprint. Reject a wrong filesystem
+# instead of hiding it under another mount; bound any new mount operation.
+[ -d /sys/kernel/debug ] && [ ! -L /sys/kernel/debug ] || exit 1
+if ! grep -q '^[^ ]* /sys/kernel/debug debugfs ' /proc/mounts; then
+ [ -f /proc/mounts ] || exit 1
+ if grep -q '^[^ ]* /sys/kernel/debug ' /proc/mounts; then exit 1; fi
+ timeout 3 mount -t debugfs -o nosuid,nodev,noexec,noatime debugfs /sys/kernel/debug || exit 1
+ grep -q '^[^ ]* /sys/kernel/debug debugfs ' /proc/mounts || exit 1
+fi
+# Failed observer loading consumes this request and leaves NPU disabled.
+# Module init creates the read-only endpoint without touching hardware.
+[ -f /usr/libexec/xr_npu_addresses.ko ] && [ ! -L /usr/libexec/xr_npu_addresses.ko ] || exit 1
+timeout 5 insmod /usr/libexec/xr_npu_addresses.ko || exit 1
+[ -f /usr/libexec/xr_npu_producer.ko ] && [ ! -L /usr/libexec/xr_npu_producer.ko ] || exit 1
+timeout 5 insmod /usr/libexec/xr_npu_producer.ko || exit 1
+exec /usr/libexec/xr-diag-activate

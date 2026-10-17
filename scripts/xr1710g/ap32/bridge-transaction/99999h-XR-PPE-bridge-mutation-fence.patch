@@ -1,0 +1,313 @@
+Subject: [PATCH] XR: fence PPE publication across FDB and STP mutations
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1201,20 +1201,42 @@
+ 		airoha_ppe_foe_remove_flow(ppe, e);
+ }
+ 
+-static void airoha_ppe_l2_revoke(struct airoha_ppe *ppe)
++static void airoha_ppe_l2_revoke_locked(struct airoha_ppe *ppe)
+ {
+ 	struct airoha_flow_table_entry *e, *tmp;
+ 	/* Conservative global revocation is intentional: do not keep a hardware
+ 	 * subflow alive after bridge membership, ifindex lifetime or bearer change.
+ 	 * No flow_offload_mutex acquisition under RTNL; the cache has one spinlock.
+ 	 */
+-	spin_lock_bh(&ppe_lock);
++	lockdep_assert_held(&ppe_lock);
+ 	ppe->l2_generation++;
+ 	list_for_each_entry_safe(e, tmp, &ppe->l2_templates, l2_gc_node) {
+ 		airoha_ppe_foe_remove_l2_flow(ppe, e);
+ 		ppe->l2_invalidations++;
+ 	}
++}
++
++static void airoha_ppe_l2_revoke(struct airoha_ppe *ppe)
++{
++	spin_lock_bh(&ppe_lock);
++	airoha_ppe_l2_revoke_locked(ppe);
+ 	spin_unlock_bh(&ppe_lock);
++}
++
++static int airoha_ppe_l2_bridge_event(struct notifier_block *nb,
++				      unsigned long event, void *ptr)
++{
++	struct airoha_ppe *ppe = container_of(nb, struct airoha_ppe, l2_bridge_nb);
++	const struct br_fwd_policy_state *state = ptr;
++
++	spin_lock_bh(&ppe_lock);
++	ppe->l2_bridge_writers = state->writers;
++	/* INIT also invalidates any pre-registration snapshot. END advances the
++	 * generation so a snapshot from inside the mutation cannot be reused.
++	 */
++	airoha_ppe_l2_revoke_locked(ppe);
++	spin_unlock_bh(&ppe_lock);
++	return NOTIFY_OK;
+ }
+ 
+ /* Any bridge filtering policy requires software inspection unless a
+@@ -1607,7 +1629,7 @@
+ 		goto unlock;
+ 
+ l2_lookup:
+-	if (ppe->l2_policy_latched || !bridge_eligible)
++	if (ppe->l2_policy_latched || ppe->l2_bridge_writers || !bridge_eligible)
+ 		goto unlock;
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &key,
+ 				   airoha_l2_flow_table_params);
+@@ -1628,7 +1650,8 @@
+ 	e->type = FLOW_TYPE_L2;
+ 	INIT_LIST_HEAD(&e->l2_gc_node);
+ 	spin_lock_bh(&ppe_lock);
+-	if (ppe->l2_policy_latched || e->l2_generation != ppe->l2_generation) {
++	if (ppe->l2_policy_latched || ppe->l2_bridge_writers ||
++	    e->l2_generation != ppe->l2_generation) {
+ 		spin_unlock_bh(&ppe_lock);
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -2062,7 +2085,7 @@
+ {
+  bool allowed;
+  spin_lock_bh(&ppe_lock);
+- allowed = !ppe->l2_policy_latched;
++ allowed = !ppe->l2_policy_latched && !ppe->l2_bridge_writers;
+  *generation = ppe->l2_generation;
+  spin_unlock_bh(&ppe_lock);
+  return allowed;
+@@ -2742,11 +2765,23 @@
+ 		debugfs_remove(ppe->debugfs_dir);
+ 		goto error_l2_flow_table_destroy;
+ 	}
++	ppe->l2_bridge_nb.notifier_call = airoha_ppe_l2_bridge_event;
++	err = br_fwd_policy_register(&ppe->l2_bridge_nb);
++	if (err) {
++		nf_bridge_policy_notifier_unregister(&ppe->l2_policy_nb);
++		unregister_switchdev_notifier(&ppe->l2_switchdev_atomic_nb);
++		unregister_switchdev_blocking_notifier(&ppe->l2_switchdev_nb);
++		unregister_netdevice_notifier(&ppe->l2_netdev_nb);
++		debugfs_remove(ppe->debugfs_dir);
++		goto error_l2_flow_table_destroy;
++	}
+ 	/* Register first, then scan. A racing callback may only latch true. */
+ 	if (nf_bridge_policy_hooks_present())
+ 		airoha_ppe_l2_policy_event(&ppe->l2_policy_nb, 0, NULL);
+ 	debugfs_create_bool("xr_l2_policy_latched", 0400, ppe->debugfs_dir,
+ 			    &ppe->l2_policy_latched);
++	debugfs_create_u32("xr_l2_bridge_writers", 0400, ppe->debugfs_dir,
++			   &ppe->l2_bridge_writers);
+ 	debugfs_create_u64("xr_l2_generation", 0400, ppe->debugfs_dir,
+ 			   &ppe->l2_generation);
+ 	debugfs_create_u64("xr_l2_invalidations", 0400, ppe->debugfs_dir,
+@@ -2765,6 +2800,7 @@
+ {
+ 	struct airoha_npu *npu;
+ 
++	br_fwd_policy_unregister(&eth->ppe->l2_bridge_nb);
+ 	nf_bridge_policy_notifier_unregister(&eth->ppe->l2_policy_nb);
+ 	unregister_switchdev_notifier(&eth->ppe->l2_switchdev_atomic_nb);
+ 	unregister_switchdev_blocking_notifier(&eth->ppe->l2_switchdev_nb);
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -735,6 +735,8 @@
+ 	struct list_head l2_templates;
+ 	struct notifier_block l2_netdev_nb;
+ 	struct notifier_block l2_policy_nb;
++	struct notifier_block l2_bridge_nb;
++	u32 l2_bridge_writers;
+ 	bool l2_policy_latched;
+ 	struct notifier_block l2_switchdev_nb;
+ 	struct notifier_block l2_switchdev_atomic_nb;
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -173,7 +173,28 @@
+ }
+ #endif
+ 
++/* Synchronous bridge forwarding mutation fence. Callbacks are atomic and
++ * must not acquire RTNL, bridge locks, sleep, or stop notification propagation.
++ * BEGIN has drained dependent caches before the writer may mutate; END makes
++ * the completed change visible. Nested/concurrent writers remain fenced.
++ * INIT is delivered while registration is serialized with BEGIN/END, including
++ * writers already in progress. Receivers must mirror the absolute count.
++ */
++enum br_fwd_policy_event {
++	BR_FWD_POLICY_INIT,
++	BR_FWD_POLICY_BEGIN,
++	BR_FWD_POLICY_END,
++};
++
++struct br_fwd_policy_state {
++	u32 writers;
++};
++
++struct notifier_block;
++
+ #if IS_ENABLED(CONFIG_BRIDGE)
++int br_fwd_policy_register(struct notifier_block *nb);
++void br_fwd_policy_unregister(struct notifier_block *nb);
+ bool br_fdb_forward_to_rcu(const struct net_device *br_dev,
+                           const struct net_device *port_dev,
+                           const unsigned char *addr, u16 vid);
+@@ -185,6 +206,15 @@
+ u8 br_port_get_stp_state(const struct net_device *dev);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
++static inline int br_fwd_policy_register(struct notifier_block *nb)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void br_fwd_policy_unregister(struct notifier_block *nb)
++{
++}
++
+ static inline bool br_fdb_forward_to_rcu(const struct net_device *br_dev,
+                                         const struct net_device *port_dev,
+                                         const unsigned char *addr, u16 vid)
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -342,6 +342,7 @@
+ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f,
+ 		       bool swdev_notify)
+ {
++	guard(br_fwd_change)(br->dev);
+ 	trace_fdb_delete(br, f);
+ 
+ 	if (test_bit(BR_FDB_STATIC, &f->flags))
+@@ -372,6 +373,8 @@
+ 	struct net_bridge_port *op;
+ 	u16 vid = f->key.vlan_id;
+ 
++	guard(br_fwd_change)(br->dev);
++
+ 	/* Maybe another port has same hw addr? */
+ 	list_for_each_entry(op, &br->port_list, list) {
+ 		vg = nbp_vlan_group(op);
+@@ -439,6 +442,7 @@
+ 	fdb->key.vlan_id = vid;
+ 	fdb->flags = flags;
+ 	fdb->updated = fdb->used = jiffies;
++	guard(br_fwd_change)(br->dev);
+ 	err = rhashtable_lookup_insert_fast(&br->fdb_hash_tbl, &fdb->rhnode,
+ 					    br_fdb_rht_params);
+ 	if (err) {
+@@ -1054,6 +1058,7 @@
+ 			/* fastpath: update of existing entry */
+ 			if (unlikely(source != READ_ONCE(fdb->dst) &&
+ 				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
++				guard(br_fwd_change)(br->dev);
+ 				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
+ 				WRITE_ONCE(fdb->dst, source);
+ 				fdb_modified = true;
+@@ -1234,6 +1239,7 @@
+ 			return -EINVAL;
+ 	}
+ 
++	guard(br_fwd_change)(br->dev);
+ 	fdb = br_fdb_find(br, addr, vid);
+ 	if (fdb == NULL) {
+ 		if (!(flags & NLM_F_CREATE))
+@@ -1573,6 +1579,8 @@
+ 	if (locked && (!p || !(p->flags & BR_PORT_MAB)))
+ 		return -EINVAL;
+ 
++	guard(br_fwd_change)(br->dev);
++
+ 	spin_lock_bh(&br->hash_lock);
+ 
+ 	fdb = br_fdb_find(br, addr, vid);
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -42,6 +42,7 @@
+ 	if (p->flags & BR_MRP_AWARE)
+ 		return;
+ 
++	guard(br_fwd_change)(p->br->dev);
+ 	p->state = state;
+ 	if (br_opt_get(p->br, BROPT_MST_ENABLED)) {
+ 		err = br_mst_set_state(p, 0, state, NULL);
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -19,6 +19,15 @@
+ #include <linux/if_vlan.h>
+ #include <linux/rhashtable.h>
+ #include <linux/refcount.h>
++#include <linux/cleanup.h>
++
++void br_fwd_policy_begin(void);
++void br_fwd_policy_end(void);
++/* A real bridge device makes the guard non-NULL. Its lifetime is protected by
++ * the existing caller's RTNL/RCU/bridge lock, not by this scope guard.
++ */
++DEFINE_GUARD(br_fwd_change, struct net_device *,
++	     br_fwd_policy_begin(), br_fwd_policy_end());
+ 
+ #define BR_HASH_BITS 8
+ #define BR_HASH_SIZE (1 << BR_HASH_BITS)
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@ -6,7 +6,7 @@
+ obj-$(CONFIG_BRIDGE) += bridge.o
+ 
+ bridge-y	:= br.o br_device.o br_fdb.o br_forward.o br_if.o br_input.o \
+-			br_ioctl.o br_stp.o br_stp_bpdu.o \
++			br_ioctl.o br_stp.o br_stp_bpdu.o br_fwd_policy.o \
+ 			br_stp_if.o br_stp_timer.o br_netlink.o \
+ 			br_netlink_tunnel.o br_arp_nd_proxy.o
+ 
+--- /dev/null
++++ b/net/bridge/br_fwd_policy.c
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/* Serialize dependent offload caches with bridge forwarding mutations.
++ * The lock is never held across the mutation. Callbacks only revoke/mirror
++ * state under their own cache lock; publishers never acquire this lock.
++ */
++#include <linux/export.h>
++#include <linux/if_bridge.h>
++#include <linux/notifier.h>
++#include <linux/spinlock.h>
++#include "br_private.h"
++
++static DEFINE_SPINLOCK(br_fwd_policy_lock);
++static ATOMIC_NOTIFIER_HEAD(br_fwd_policy_chain);
++static struct br_fwd_policy_state br_fwd_policy_state;
++
++int br_fwd_policy_register(struct notifier_block *nb)
++{
++	int err;
++
++	spin_lock_bh(&br_fwd_policy_lock);
++	err = atomic_notifier_chain_register(&br_fwd_policy_chain, nb);
++	if (!err)
++		nb->notifier_call(nb, BR_FWD_POLICY_INIT, &br_fwd_policy_state);
++	spin_unlock_bh(&br_fwd_policy_lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(br_fwd_policy_register);
++
++void br_fwd_policy_unregister(struct notifier_block *nb)
++{
++	/* This waits for RCU readers and must run without our spinlock held. */
++	atomic_notifier_chain_unregister(&br_fwd_policy_chain, nb);
++}
++EXPORT_SYMBOL_GPL(br_fwd_policy_unregister);
++
++void br_fwd_policy_begin(void)
++{
++	spin_lock_bh(&br_fwd_policy_lock);
++	br_fwd_policy_state.writers++;
++	atomic_notifier_call_chain(&br_fwd_policy_chain, BR_FWD_POLICY_BEGIN,
++				  &br_fwd_policy_state);
++	spin_unlock_bh(&br_fwd_policy_lock);
++}
++
++void br_fwd_policy_end(void)
++{
++	spin_lock_bh(&br_fwd_policy_lock);
++	br_fwd_policy_state.writers--;
++	atomic_notifier_call_chain(&br_fwd_policy_chain, BR_FWD_POLICY_END,
++				  &br_fwd_policy_state);
++	spin_unlock_bh(&br_fwd_policy_lock);
++}

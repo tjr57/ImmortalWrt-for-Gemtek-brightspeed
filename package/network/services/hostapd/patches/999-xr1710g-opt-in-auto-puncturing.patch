@@ -1,0 +1,233 @@
+From: XR1710G AP project
+Subject: [PATCH] hostapd: explicit opt-in automatic MTK PP command/event and validated CSA
+
+Adapt selected Allen Ye MTK08196fa6 services0092 ABI, not full vendor fork.
+Default xr_pp_mode0 preserves generic manual operation; auto1 sends0xcc and
+validates event5 nested frequency/bitmap lengths before dispatch. Match only
+the opted-in BSS/link and use normal hostapd CSA frequency/bitmap validation.
+No default firmware-auto enablement. Reject failed CSA visibly. FW/RF and
+multi-BSS/MLD interoperability remain hardware qualifications.
+
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1289,6 +1289,7 @@
+ 	u8 eht_oper_centr_freq_seg0_idx;
+ 	struct eht_phy_capabilities_info eht_phy_capab;
+ 	u16 punct_bitmap; /* a bitmap of disabled 20 MHz channels */
++	u8 xr_pp_mode; /* explicit0=legacy/manual,1=firmware-auto; default0 */
+ 	u8 punct_acs_threshold;
+ 	u8 eht_default_pe_duration;
+ 	u8 eht_bw320_offset;
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5218,6 +5218,10 @@
+ 		conf->eht_phy_capab.mu_beamformer = atoi(pos);
+ 	} else if (os_strcmp(buf, "eht_default_pe_duration") == 0) {
+ 		conf->eht_default_pe_duration = atoi(pos);
++	} else if (os_strcmp(buf, "xr_pp_mode") == 0) {
++		if (os_strcmp(pos, "0") && os_strcmp(pos, "1"))
++			return 1;
++		conf->xr_pp_mode = atoi(pos);
+ 	} else if (os_strcmp(buf, "punct_bitmap") == 0) {
+ 		if (get_u16(pos, line, &conf->punct_bitmap))
+ 			return 1;
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1904,6 +1904,7 @@
+ 	 * subchannel is punctured, otherwise active.
+ 	 */
+ 	u16 punct_bitmap;
++	u8 xr_pp_mode;
+ 
+ 
+ 	/* Unsolicited broadcast Probe Response data */
+@@ -6703,6 +6704,8 @@
+ 	 * measurement session identified by the cookie has ended.
+ 	 */
+ 	EVENT_PEER_MEASUREMENT_COMPLETE,
++	EVENT_XR_PP_BITMAP_UPDATE,
++
+ };
+ 
+ 
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -83,6 +83,7 @@
+ };
+ 
+ struct i802_bss {
++	u8 xr_pp_mode;
+ 	struct wpa_driver_nl80211_data *drv;
+ 	struct i802_bss *next;
+ 
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2827,6 +2827,7 @@
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	params.punct_bitmap = iconf->punct_bitmap;
++	params.xr_pp_mode = iconf->xr_pp_mode;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	if (cmode &&
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -5788,6 +5788,29 @@
+ }
+ 
+ 
++/* MTK0xcc: send only for an explicit auto opt-in or an auto->manual change. */
++static int nl80211_xr_pp_mode(struct i802_bss *bss, u8 mode, s8 link_id, u16 bitmap)
++{
++	struct nl_msg *msg = nl80211_bss_msg(bss, 0, NL80211_CMD_VENDOR);
++	struct nlattr *nest;
++	int ret = -ENOBUFS;
++	if (!msg)
++		return ret;
++	if (nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, 0x000ce7) ||
++	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD, 0xcc))
++		goto fail;
++	nest = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA);
++	if (!nest || nla_put_u8(msg, 1, mode) ||
++	    (link_id >= 0 && nla_put_u8(msg, 2, link_id)) ||
++	    nla_put_u16(msg, 3, bitmap))
++		goto fail;
++	nla_nest_end(msg, nest);
++	return send_and_recv_cmd(bss->drv, msg);
++fail:
++	nlmsg_free(msg);
++	return ret;
++}
++
+ static int wpa_driver_nl80211_set_ap(void *priv,
+ 				     struct wpa_driver_ap_params *params)
+ {
+@@ -6208,6 +6231,15 @@
+ 			return ret;
+ 	}
+ #endif /* CONFIG_MESH */
++
++	if (!ret && (params->xr_pp_mode || bss->xr_pp_mode)) {
++		u8 mode = params->xr_pp_mode ? 1 : params->punct_bitmap ? 2 : 0;
++		ret = nl80211_xr_pp_mode(bss, mode,
++			params->mld_ap ? params->mld_link_id : -1,
++			mode == 2 ? params->punct_bitmap : 0);
++		if (!ret)
++			bss->xr_pp_mode = params->xr_pp_mode;
++	}
+ 
+ 	return ret;
+ fail:
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3784,6 +3784,40 @@
+ #endif /* CONFIG_DRIVER_NL80211_BRCM */
+ 
+ 
++static void nl80211_xr_pp_event(struct wpa_driver_nl80211_data *drv,
++                                u32 subcmd, u8 *data, size_t len)
++{
++	struct nlattr *outer[NL80211_ATTR_MAX + 1], *pp[4];
++	struct i802_bss *bss;
++	union wpa_event_data ev;
++	unsigned freq;
++	int i;
++	if (subcmd != 5 || !data ||
++	    nla_parse(outer, NL80211_ATTR_MAX, (struct nlattr *)data, len, NULL) ||
++	    !outer[NL80211_ATTR_WIPHY_FREQ] ||
++	    nla_len(outer[NL80211_ATTR_WIPHY_FREQ]) != sizeof(u32) ||
++	    !outer[NL80211_ATTR_VENDOR_DATA] ||
++	    nla_parse_nested(pp, 3, outer[NL80211_ATTR_VENDOR_DATA], NULL) ||
++	    !pp[3] || nla_len(pp[3]) != sizeof(u16))
++		return;
++	freq = nla_get_u32(outer[NL80211_ATTR_WIPHY_FREQ]);
++	for (bss = drv->first_bss; bss; bss = bss->next) {
++		if (!bss->xr_pp_mode)
++			continue;
++		for (i = 0; i < MAX_NUM_MLD_LINKS; i++) {
++			if (bss->links[i].freq != freq ||
++			    (bss->valid_links && !(bss->valid_links & BIT(i))))
++				continue;
++			os_memset(&ev, 0, sizeof(ev));
++			ev.ch_switch.freq = freq;
++			ev.ch_switch.link_id = bss->valid_links ? i : -1;
++			ev.ch_switch.punct_bitmap = nla_get_u16(pp[3]);
++			wpa_supplicant_event(bss->ctx, EVENT_XR_PP_BITMAP_UPDATE, &ev);
++			return;
++		}
++	}
++}
++
+ static void nl80211_vendor_event(struct i802_bss *bss, struct nlattr **tb)
+ {
+ 	u32 vendor_id, subcmd, wiphy = 0;
+@@ -3831,6 +3865,9 @@
+ #endif /* ANDROID */
+ 
+ 	switch (vendor_id) {
++	case 0x000ce7:
++		nl80211_xr_pp_event(drv, subcmd, data, len);
++		break;
+ 	case OUI_QCA:
+ 		nl80211_vendor_event_qca(bss, subcmd, data, len);
+ 		break;
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2621,6 +2621,44 @@
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
++#if defined(CONFIG_IEEE80211BE) && defined(NEED_AP_MLME)
++static void hostapd_xr_pp_update(struct hostapd_data *hapd, __typeof__(((union wpa_event_data *)0)->ch_switch) *sw)
++{
++	struct hostapd_iface *iface;
++	struct hostapd_hw_modes *mode;
++	struct csa_settings settings;
++	int freq, ret;
++	unsigned i;
++	if (!hapd)
++		return;
++	iface = hapd->iface;mode = iface->current_mode;
++	if (!mode || !iface->conf->xr_pp_mode || hostapd_csa_in_progress(iface) ||
++	    !hw_get_channel_chan(mode, iface->conf->channel, &freq) || freq != sw->freq ||
++	    iface->conf->punct_bitmap == sw->punct_bitmap)
++		return;
++	os_memset(&settings, 0, sizeof(settings));
++	settings.cs_count = 5;settings.link_id = sw->link_id;
++	ret = hostapd_set_freq_params(&settings.freq_params, iface->conf->hw_mode,
++		freq, iface->conf->channel, iface->conf->enable_edmg, iface->conf->edmg_channel,
++		iface->conf->ieee80211n, iface->conf->ieee80211ac, iface->conf->ieee80211ax,
++		iface->conf->ieee80211be, iface->conf->secondary_channel,
++		hostapd_get_oper_chwidth(iface->conf), hostapd_get_oper_centr_freq_seg0_idx(iface->conf),
++		hostapd_get_oper_centr_freq_seg1_idx(iface->conf), mode->vht_capab,
++		&mode->he_capab[IEEE80211_MODE_AP], &mode->eht_capab[IEEE80211_MODE_AP], sw->punct_bitmap);
++	if (ret)
++		goto fail;
++	for (i = 0; i < iface->num_bss; i++) {
++		ret = hostapd_switch_channel(iface->bss[i], &settings);
++		if (ret)
++			goto fail;
++	}
++	return;
++fail:
++	wpa_printf(MSG_ERROR, "XR PP automatic bitmap CSA rejected: %d", ret);
++	hostapd_disable_iface(iface);
++}
++#endif
++
+ void hostapd_wpa_event(void *ctx, enum wpa_event_type event,
+ 		       union wpa_event_data *data)
+ {
+@@ -2649,6 +2687,12 @@
+ #endif /* CONFIG_NO_STDOUT_DEBUG */
+ 
+ 	switch (event) {
++#if defined(CONFIG_IEEE80211BE) && defined(NEED_AP_MLME)
++	case EVENT_XR_PP_BITMAP_UPDATE:
++		if (data)
++			hostapd_xr_pp_update(switch_link_hapd(hapd, data->ch_switch.link_id), &data->ch_switch);
++		break;
++#endif
+ 	case EVENT_MICHAEL_MIC_FAILURE:
+ 		michael_mic_failure(hapd, data->michael_mic_failure.src, 1);
+ 		break;

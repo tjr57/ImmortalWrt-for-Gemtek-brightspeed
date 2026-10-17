@@ -1,0 +1,23 @@
+{
+  "passed": true,
+  "sourceSHA256": "3b769345430966ea6704c5994a906537cb6e62a8c62634cbfeb4eb81f6dd01e1",
+  "brokerSHA256": "872d22f1b0624a43df9c72a0315bc86f3a70497d56f8d71401dbe75880d4fef0",
+  "oldCodeNegativeControl": true,
+  "nativeASanUBSanAndARM": true,
+  "kernelCacheAndNotifierAPIsModeled": true,
+  "logs": {
+    "native": "1050 checks; AP31 in-mutation publication reproduced; AP32 rejects busy/stale, joins active writers, balances nested writers",
+    "ARM": "1050 checks; AP31 in-mutation publication reproduced; AP32 rejects busy/stale, joins active writers, balances nested writers"
+  },
+  "inheritedFunctions": {
+    "airoha_ppe_l2_actions": "be1d604227cacdcb46897be65702b620b0ca5f9525a5c259ff5d53e7642bc2dc",
+    "airoha_ppe_l2_context": "2e29601b69231eba4f84aaea2ffa2399c9926b9ae89d65aba2bd37d358f3d4aa",
+    "airoha_ppe_skb_l2_key": "4e37a5fea60c393d227c82ce66dc184e673c54578c2b48d90db5c18f36c253f3",
+    "airoha_ppe_l2_rule_exact": "86059c68147b33811c2892344e0312063aed59cddf51f2359ce723eafe3d0f92",
+    "airoha_ppe_rule_has_single_redirect": "ced2804d6fc4f862bfdc7bc574c1ed3e1f21709fb58fe684a0a490e8f1413c0b",
+    "airoha_ppe_l2_port_eligible": "b7cb32d554ed2dcb07a16d02c556a6d0df120ec7eb09e3cfa4c7c936d2d4537d"
+  },
+  "fullPolicyOrHardwareQualified": false,
+  "packetPreparedBeforeMutationRejected": true,
+  "VMSourceByteIdenticalTo": "development/ap32/bridge-transaction/vm-result.json"
+}

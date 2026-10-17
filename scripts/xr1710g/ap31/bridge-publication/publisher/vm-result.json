@@ -1,0 +1,168 @@
+{
+  "passed": true,
+  "exitCode": 0,
+  "log": "development/ap31/publisher/vm-20261011-004245.log",
+  "kernelSHA256": "2248bf92e0fc481ae43650368d7dfc0469c293cb9761edc8c85564975fec1b58",
+  "moduleSHA256": "7e0e042e1c5a66bb2bc331c0be411fe01e995dbbdc2cda969cb1ff7c076273fd",
+  "sourceSHA256": "dcac37c4a615d096f37640ddde7161ae3dc5645acb9dd7d7568fa66672c40287",
+  "faults": [],
+  "bridgeProbeCount": 14,
+  "tcReadbacks": [
+    [
+      {
+        "protocol": "ip",
+        "pref": 49171,
+        "kind": "flower",
+        "chain": 0
+      },
+      {
+        "protocol": "ip",
+        "pref": 49171,
+        "kind": "flower",
+        "chain": 0,
+        "options": {
+          "handle": 3809735156,
+          "indev": "pin",
+          "keys": {
+            "dst_mac": "02:00:00:00:00:02",
+            "src_mac": "02:00:00:00:00:01",
+            "eth_type": "ipv4"
+          },
+          "skip_hw": true,
+          "not_in_hw": true,
+          "actions": [
+            {
+              "order": 1,
+              "kind": "mirred",
+              "mirred_action": "redirect",
+              "direction": "egress",
+              "to_dev": "pout",
+              "control_action": {
+                "type": "stolen"
+              },
+              "index": 1,
+              "ref": 1,
+              "bind": 1,
+              "cookie": "6313f1f44263bf20144ca12a1ae1b276"
+            }
+          ]
+        }
+      }
+    ],
+    [
+      {
+        "protocol": "802.1Q",
+        "pref": 49172,
+        "kind": "flower",
+        "chain": 0
+      },
+      {
+        "protocol": "802.1Q",
+        "pref": 49172,
+        "kind": "flower",
+        "chain": 0,
+        "options": {
+          "handle": 2656775334,
+          "indev": "pin",
+          "keys": {
+            "vlan_id": 50,
+            "vlan_ethtype": "ip",
+            "dst_mac": "02:00:00:00:00:02",
+            "src_mac": "02:00:00:00:00:01",
+            "eth_type": "ipv4"
+          },
+          "skip_hw": true,
+          "not_in_hw": true,
+          "actions": [
+            {
+              "order": 1,
+              "kind": "vlan",
+              "vlan_action": "pop",
+              "control_action": {
+                "type": "pipe"
+              },
+              "index": 1,
+              "ref": 1,
+              "bind": 1,
+              "cookie": "1e5b2ca6af63a9a4a2e50cd71b0772aa"
+            },
+            {
+              "order": 2,
+              "kind": "mirred",
+              "mirred_action": "redirect",
+              "direction": "egress",
+              "to_dev": "pout",
+              "control_action": {
+                "type": "stolen"
+              },
+              "index": 1,
+              "ref": 1,
+              "bind": 1,
+              "cookie": "1e5b2ca6af63a9a4a2e50cd71b0772aa"
+            }
+          ]
+        }
+      }
+    ],
+    [
+      {
+        "protocol": "ip",
+        "pref": 49171,
+        "kind": "flower",
+        "chain": 0
+      },
+      {
+        "protocol": "ip",
+        "pref": 49171,
+        "kind": "flower",
+        "chain": 0,
+        "options": {
+          "handle": 2165472862,
+          "indev": "pin",
+          "keys": {
+            "dst_mac": "02:00:00:00:00:02",
+            "src_mac": "02:00:00:00:00:01",
+            "eth_type": "ipv4"
+          },
+          "skip_hw": true,
+          "not_in_hw": true,
+          "actions": [
+            {
+              "order": 1,
+              "kind": "vlan",
+              "vlan_action": "push",
+              "id": 50,
+              "protocol": "802.1Q",
+              "priority": 0,
+              "control_action": {
+                "type": "pipe"
+              },
+              "index": 1,
+              "ref": 1,
+              "bind": 1,
+              "cookie": "81127e5e6c56affa7775fb1e96158181"
+            },
+            {
+              "order": 2,
+              "kind": "mirred",
+              "mirred_action": "redirect",
+              "direction": "egress",
+              "to_dev": "pout",
+              "control_action": {
+                "type": "stolen"
+              },
+              "index": 1,
+              "ref": 1,
+              "bind": 1,
+              "cookie": "81127e5e6c56affa7775fb1e96158181"
+            }
+          ]
+        }
+      }
+    ]
+  ],
+  "noExternalNICOrExistingDisk": true,
+  "APOrHostNetworkChanged": false,
+  "realBridgeAndTcActionsPassed": true,
+  "PPEHardwareOrFullPolicyHandoffQualified": false
+}

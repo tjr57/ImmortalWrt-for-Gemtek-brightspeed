@@ -1,0 +1,101 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ "$(board_name)" = 'gemtek,xr1710g' ] || exit 0
+# Saved with the network configuration on sysupgrade. Never reset an
+# operator's VLANs, addresses or wireless settings on an ordinary upgrade.
+[ "$(uci -q get xr1710g_ap.defaults.initialized)" = '1' ] && exit 0
+
+. /usr/lib/xr1710g/ap-role.sh
+xr1710g_detect_ap_role
+
+ap_bridge=''
+find_ap_bridge() {
+	local name
+	config_get name "$1" name
+	[ "$name" = 'br-lan' ] && ap_bridge="$1"
+}
+config_load network
+config_foreach find_ap_bridge device
+[ -n "$ap_bridge" ] || ap_bridge='ap_bridge'
+uci set "network.$ap_bridge=device"
+uci set "network.$ap_bridge.name=br-lan"
+uci set "network.$ap_bridge.type=bridge"
+uci -q delete "network.$ap_bridge.ports"
+for port in lan2 lan3 lan4 wan; do
+	uci add_list "network.$ap_bridge.ports=$port"
+done
+
+uci -q delete network.wan
+uci -q delete network.wan6
+uci set network.lan='interface'
+uci set network.lan.device='br-lan'
+uci set network.lan.proto='static'
+uci set network.lan.delegate='0'
+for option in ifname ipaddr netmask gateway dns ip6assign ip6hint ip6class; do
+	uci -q delete "network.lan.$option"
+done
+if [ "$ap_role" = unassigned ]; then
+	uci set network.lan.proto='dhcp'
+else
+	uci set network.lan.ipaddr="$ap_address"
+	uci set network.lan.netmask='255.255.255.0'
+	uci set network.lan.gateway='192.168.10.1'
+	uci add_list network.lan.dns='192.168.10.1'
+fi
+uci commit network || exit 1
+
+# This device does not serve DHCP, DNS or router advertisements to the LAN.
+uci -q set dhcp.lan.ignore='1'
+uci -q set dhcp.@dnsmasq[0].port='0'
+for option in dhcpv6 ra ndp; do
+	uci -q set "dhcp.lan.$option=disabled"
+done
+uci -q commit dhcp
+for service in dnsmasq odhcpd; do
+	[ ! -x "/etc/init.d/$service" ] || "/etc/init.d/$service" disable
+done
+
+# Keep firewall4 and bridge modules, but never enable flow offload or
+# NPU/PPE paths in this production image. VLAN/isolation baseline stays software.
+# Remove legacy NPU/PPE audit, guarded-diagnostic and monitoring services from
+# older overlays. The AP49 production image deliberately carries none of them.
+for path in \
+      /etc/rc.d/S09xr1710g_npu_audit /etc/rc.d/K01xr1710g_npu_audit \
+      /etc/rc.d/S9xr1710g_npu_audit /etc/rc.d/K1xr1710g_npu_audit \
+      /etc/rc.d/*xr_guarded_npu /etc/rc.d/*npu-jitter /etc/rc.d/*airoha-npu \
+      /etc/init.d/xr1710g_npu_audit /etc/init.d/xr_guarded_npu \
+      /etc/init.d/npu-jitter /etc/init.d/airoha-npu \
+      /usr/sbin/xr1710g-npu-audit /usr/lib/xr1710g/npu-audit.sh \
+      /usr/libexec/npu-jitter-daemon /usr/libexec/xr-diag-activate \
+      /usr/libexec/xr-npu-guarded-once \
+      /etc/config/npu-monitor /etc/config/airoha_npu \
+      /lib/upgrade/keep.d/luci-app-airoha-npu; do
+	rm -f "$path"
+done
+uci -q set firewall.@defaults[0].flow_offloading='0'
+uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+uci -q commit firewall
+
+uci -q set system.@system[0].hostname="$ap_hostname"
+uci -q commit system
+# A reset starts with radios off and no shipped WLAN credentials. Role
+# affects management/preset only; ordinary upgrades skip this entire hook.
+disable_factory_radio() { uci -q set "wireless.$1.disabled=1"; }
+config_load wireless
+config_foreach disable_factory_radio wifi-device
+config_foreach disable_factory_radio wifi-iface
+uci -q commit wireless
+uci set xr1710g_ap_configurator.profile.role="$ap_role"
+uci set xr1710g_ap_configurator.profile.management_ip="$ap_address"
+uci -q delete xr1710g_ap_configurator.profile.uplink_port
+[ -z "$ap_uplink" ] || uci add_list xr1710g_ap_configurator.profile.uplink_port="$ap_uplink"
+uci commit xr1710g_ap_configurator || exit 1
+uci set xr1710g_ap.defaults.role="$ap_role"
+uci set xr1710g_ap.defaults.initialized='1'
+uci commit xr1710g_ap || exit 1
+
+exit 0

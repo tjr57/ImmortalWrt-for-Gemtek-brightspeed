@@ -1,0 +1,60 @@
+# Runtime wireless keys are deliberately absent from this image.
+config ap 'profile'
+	option country 'AU'
+	option management_ip ''
+	option role 'unassigned'
+	option management_netmask '255.255.255.0'
+	option management_gateway '192.168.10.1'
+	# Change this list to the physical port(s) carrying tagged AP VLANs.
+	# Factory role sets AP1 lan2; AP2 has no physical trunk.
+
+config wifi 'users'
+	# Lower160 primary; runtime survey may select another36-64 channel.
+	option channel '36'
+	option enabled '0'
+	option ssid 'Tizer'
+	option encryption 'sae'
+	# Empty means untagged/native users and management network.
+	option vid ''
+
+config wifi 'iot'
+	option enabled '0'
+	option ssid 'Poro'
+	option encryption 'psk2'
+	# Provision the agreed IoT VLAN and private Mesh/WLAN keys at runtime.
+	option vid ''
+
+# Policy is active when the separately installed service is explicitly enabled.
+# Existing saved profiles without this section use the same safe defaults.
+config guard 'uplink_guard'
+	option enabled '1'
+	option deployed '0'
+	option interval '5'
+	option recovery_successes '3'
+	# Consecutive ICMP misses before closing an already-open users BSS.
+	option failure_threshold '3'
+
+# Both APs use this shared image. No wireless activation on factory reset.
+config wifi 'mesh'
+    option enabled '0'
+    option mesh_id 'XR1710G-Backhaul6G'
+    option encryption 'sae'
+    option channel '37'
+    option htmode 'HE160'
+
+# AP13 features are explicit runtime opt-ins; phone/firmware tests deferred.
+config wifi 'roaming'
+    option enabled '0'
+    option ieee80211k '1'
+    option ieee80211v '1'
+    option ieee80211r '1'
+    option mobility_domain '1710'
+
+config wifi 'mlo'
+    option enabled '0'
+    option bands '5g 2g'
+
+config wifi 'puncturing'
+    option mode 'manual'
+    option enabled '0'
+    option bitmap '0'

@@ -1,0 +1,22 @@
+{
+  "luci-app-xr1710g-features": {
+    "description": "XR1710G AP15 validated feature controls",
+    "read": {
+      "ubus": {
+        "luci.xr1710g_ap_features": [
+          "status",
+          "settings"
+        ]
+      }
+    },
+    "write": {
+      "ubus": {
+        "luci.xr1710g_ap_features": [
+          "configure",
+          "restore",
+          "confirm"
+        ]
+      }
+    }
+  }
+}

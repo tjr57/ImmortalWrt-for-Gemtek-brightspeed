@@ -1,0 +1,133 @@
+From: XR1710G AP project
+Subject: [PATCH] mt7996: port opt-in static puncturing to current channel API
+
+Based on MediaTek Allen Ye/Howard Hsu PP_EN_CTRL command layout:
+mtk-openwrt-feeds@08196fa6e5d338ce88aa0002f781e2d24289b1f1,
+25.12/0050 and historical0027. Retain inherited BSD-3-Clause-Clear licensing.
+Manual bitmap and per-radio lifecycle are adapted to mt76 be5ce791/backports7.2.
+Advertise PUNCT only under a read-only boot opt-in. No default command traffic.
+Do not enable firmware-auto mode until its event/STA ABI has been qualified.
+Propagate ACK errors, validate channel definitions and clear on scan/disable.
+
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1349,6 +1349,7 @@
+ 	MCU_UNI_CMD_CHANNEL_SWITCH = 0x34,
+ 	MCU_UNI_CMD_THERMAL = 0x35,
+ 	MCU_UNI_CMD_VOW = 0x37,
++	MCU_UNI_CMD_PP = 0x38,
+ 	MCU_UNI_CMD_FIXED_RATE_TABLE = 0x40,
+ 	MCU_UNI_CMD_RSSI_MONITOR = 0x41,
+ 	MCU_UNI_CMD_TESTMODE_CTRL = 0x46,
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -528,6 +528,8 @@
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_ACK_SIGNAL_SUPPORT);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MU_MIMO_AIR_SNIFFER);
++	if (mt7996_puncturing_enable)
++		wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_PUNCT);
+ 
+ 	if (mt7996_eeprom_has_background_radar(dev) &&
+ 	    (!mdev->dev->of_node ||
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -649,6 +649,11 @@
+ 	}
+ }
+ 
++/* Explicit boot opt-in until the shipped firmware/clients are qualified. */
++bool mt7996_puncturing_enable;
++module_param_named(puncturing_enable, mt7996_puncturing_enable, bool, 0400);
++MODULE_PARM_DESC(puncturing_enable, "Enable experimental MT7996 manual puncturing MCU ABI (boot-only)");
++
+ int mt7996_set_channel(struct mt76_phy *mphy)
+ {
+ 	struct mt7996_phy *phy = mphy->priv;
+@@ -658,6 +663,10 @@
+ 		mt7996_mac_update_beacons(phy);
+ 
+ 	ret = mt7996_mcu_set_chan_info(phy, UNI_CHANNEL_SWITCH);
++	if (ret)
++		goto out;
++
++	ret = mt7996_mcu_set_puncturing(phy);
+ 	if (ret)
+ 		goto out;
+ 
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -5770,3 +5770,54 @@
+ 	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(CHIP_CONFIG), &req,
+ 				 sizeof(req), true);
+ }
++
++/* Adapted from MediaTek's PP_EN_CTRL ABI (Allen Ye/Howard Hsu).
++ * Static AP bitmap only: no unsolicited firmware-auto bitmap changes, no
++ * debug/vendor tree dependency. Preserve the existing channel/DFS validation.
++ */
++int mt7996_mcu_set_puncturing(struct mt7996_phy *phy)
++{
++	struct mt76_phy *mphy = phy->mt76;
++	struct cfg80211_chan_def *chandef = &mphy->chandef;
++	u16 bitmap = mphy->offchannel ? 0 : chandef->punctured;
++	struct {
++		u8 reserved1[4];
++		__le16 tag;
++		__le16 len;
++		u8 mgmt_mode;
++		u8 band_idx;
++		u8 force_bitmap_ctrl;
++		u8 auto_mode;
++		__le16 bitmap;
++		u8 csa_enable;
++		u8 reserved2;
++	} __packed req = {
++		.tag = cpu_to_le16(0), /* UNI_CMD_PP_EN_CTRL */
++		.len = cpu_to_le16(sizeof(req) - 4),
++		.mgmt_mode = 1,
++		.band_idx = mphy->band_idx,
++		.force_bitmap_ctrl = bitmap ? 2 : 0,
++		.bitmap = cpu_to_le16(bitmap),
++	};
++	int ret;
++
++	if (!mt7996_puncturing_enable)
++		return bitmap ? -EOPNOTSUPP : 0;
++	if (bitmap && (!cfg80211_chandef_valid(chandef) ||
++		       chandef->chan->band == NL80211_BAND_2GHZ))
++		return -EINVAL;
++	/* Untouched zero-bitmap operation makes no experimental firmware calls.
++	 * Clear a previously active bitmap during off-channel scans or disable.
++	 */
++	if (!bitmap && !phy->punct_bitmap)
++		return 0;
++	/* Positive bitmaps are resent on every channel setup, including recovery:
++	 * deduplicating only on bitmap would lose state after firmware restart.
++	 * Wait for acknowledgement; do not report an ignored ABI as configured.
++	 */
++	ret = mt76_mcu_send_msg(&phy->dev->mt76, MCU_WM_UNI_CMD(PP),
++			      &req, sizeof(req), true);
++	if (!ret)
++		phy->punct_bitmap = bitmap;
++	return ret;
++}
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -447,6 +447,7 @@
+ 	bool has_aux_rx;
+ 	bool counter_reset;
+ 	bool rdd_tx_paused;
++	u16 punct_bitmap;
+ };
+ 
+ struct mt7996_dev {
+@@ -797,6 +798,8 @@
+ 			     bool changed);
+ int mt7996_set_channel(struct mt76_phy *mphy);
+ int mt7996_mcu_set_chan_info(struct mt7996_phy *phy, u16 tag);
++int mt7996_mcu_set_puncturing(struct mt7996_phy *phy);
++extern bool mt7996_puncturing_enable;
+ int mt7996_mcu_set_tx(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 		      struct ieee80211_bss_conf *link_conf);
+ int mt7996_mcu_set_fixed_rate_ctrl(struct mt7996_dev *dev,

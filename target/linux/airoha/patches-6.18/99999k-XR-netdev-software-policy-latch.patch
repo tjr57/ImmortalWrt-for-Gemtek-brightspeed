@@ -1,0 +1,307 @@
+Subject: [PATCH] XR: latch L2 PPE off before TC/tcx/XDP/device-hook policy
+
+Any user TC mutation (qdisc, class, filter, chain, shared action), tcx or XDP
+program installation, and netdev or inet ingress netfilter hook registration
+is software forwarding policy that MAC-only L2 PPE templates cannot represent.
+Deliver a sticky LATCH through the core forwarding fence before the policy
+becomes visible; registration reports earlier latches. Removing the policy
+never reauthorizes binding. L2 publication therefore cannot use TC. NPU/PPE
+opt-ins remain disabled.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -738,6 +738,7 @@
+ 	struct notifier_block l2_bridge_nb;
+ 	u32 l2_bridge_writers;
+ 	bool l2_policy_latched;
++	bool l2_netdev_policy_latched;
+ 	struct notifier_block l2_switchdev_nb;
+ 	struct notifier_block l2_switchdev_atomic_nb;
+ 	u64 l2_invalidations;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1232,6 +1232,11 @@
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 	ppe->l2_bridge_writers = state->writers;
++	/* TC/tcx/XDP/device-hook policy: sticky, never cleared here. INIT
++	 * carries latches that happened before this driver registered.
++	 */
++	if (state->latches)
++		ppe->l2_netdev_policy_latched = true;
+ 	/* INIT also invalidates any pre-registration snapshot. END advances the
+ 	 * generation so a snapshot from inside the mutation cannot be reused.
+ 	 */
+@@ -1583,7 +1588,8 @@
+ {
+  bool allowed;
+  spin_lock_bh(&ppe_lock);
+- allowed = !ppe->l2_policy_latched && !ppe->l2_bridge_writers;
++ allowed = !ppe->l2_policy_latched && !ppe->l2_netdev_policy_latched &&
++	   !ppe->l2_bridge_writers;
+  *generation = ppe->l2_generation;
+  spin_unlock_bh(&ppe_lock);
+  return allowed;
+@@ -1596,8 +1602,8 @@
+ static bool airoha_ppe_l2_ready_locked(struct airoha_ppe *ppe, u64 generation)
+ {
+ 	lockdep_assert_held(&ppe_lock);
+-	return !ppe->l2_policy_latched && !ppe->l2_bridge_writers &&
+-	       generation == ppe->l2_generation;
++	return !ppe->l2_policy_latched && !ppe->l2_netdev_policy_latched &&
++	       !ppe->l2_bridge_writers && generation == ppe->l2_generation;
+ }
+ 
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+@@ -2813,6 +2819,8 @@
+ 		airoha_ppe_l2_policy_event(&ppe->l2_policy_nb, 0, NULL);
+ 	debugfs_create_bool("xr_l2_policy_latched", 0400, ppe->debugfs_dir,
+ 			    &ppe->l2_policy_latched);
++	debugfs_create_bool("xr_l2_netdev_policy_latched", 0400, ppe->debugfs_dir,
++			    &ppe->l2_netdev_policy_latched);
+ 	debugfs_create_u32("xr_l2_bridge_writers", 0400, ppe->debugfs_dir,
+ 			   &ppe->l2_bridge_writers);
+ 	debugfs_create_u64("xr_l2_generation", 0400, ppe->debugfs_dir,
+--- a/include/linux/netdev_fwd_policy.h
++++ b/include/linux/netdev_fwd_policy.h
+@@ -15,15 +15,23 @@
+  * BEGIN/END, including writers already in progress. Receivers must mirror the
+  * absolute count. The fence is never held across the mutation, so a scope may
+  * sleep; it must only be entered from process or softirq context.
++ *
++ * LATCH is sticky until reboot: a software forwarding policy that dependent
++ * caches cannot represent (user TC configuration, tcx/XDP programs, netdev
++ * and inet ingress netfilter hooks) is about to become visible. It is
++ * delivered before that policy is published; removing the policy never
++ * clears it. INIT reports earlier latches through @latches.
+  */
+ enum netdev_fwd_policy_event {
+ 	NETDEV_FWD_POLICY_INIT,
+ 	NETDEV_FWD_POLICY_BEGIN,
+ 	NETDEV_FWD_POLICY_END,
++	NETDEV_FWD_POLICY_LATCH,
+ };
+ 
+ struct netdev_fwd_policy_state {
+ 	u32 writers;
++	u32 latches;	/* saturating; nonzero means latched */
+ };
+ 
+ struct notifier_block;
+@@ -32,6 +40,7 @@
+ void netdev_fwd_policy_unregister(struct notifier_block *nb);
+ void netdev_fwd_policy_begin(void);
+ void netdev_fwd_policy_end(void);
++void netdev_fwd_policy_latch(void);
+ 
+ DEFINE_LOCK_GUARD_0(netdev_fwd_change, netdev_fwd_policy_begin(),
+ 		    netdev_fwd_policy_end())
+--- a/kernel/bpf/tcx.c
++++ b/kernel/bpf/tcx.c
+@@ -4,6 +4,7 @@
+ #include <linux/bpf.h>
+ #include <linux/bpf_mprog.h>
+ #include <linux/netdevice.h>
++#include <linux/netdev_fwd_policy.h>
+ 
+ #include <net/tcx.h>
+ 
+@@ -16,6 +17,9 @@
+ 	struct net_device *dev;
+ 	int ret;
+ 
++	/* tcx programs are software policy for L2 PPE templates. */
++	netdev_fwd_policy_latch();
++
+ 	rtnl_lock();
+ 	dev = __dev_get_by_index(net, attr->target_ifindex);
+ 	if (!dev) {
+@@ -209,6 +213,9 @@
+ 	struct net_device *dev;
+ 	int ret = 0;
+ 
++	/* tcx programs are software policy for L2 PPE templates. */
++	netdev_fwd_policy_latch();
++
+ 	rtnl_lock();
+ 	dev = tcx->dev;
+ 	if (!dev) {
+@@ -315,6 +322,9 @@
+ 	struct tcx_link *tcx;
+ 	int ret;
+ 
++	/* tcx programs are software policy for L2 PPE templates. */
++	netdev_fwd_policy_latch();
++
+ 	rtnl_lock();
+ 	dev = __dev_get_by_index(net, attr->link_create.target_ifindex);
+ 	if (!dev) {
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -10268,6 +10268,10 @@
+ 
+ 	netdev_ops_assert_locked(dev);
+ 
++	/* Attach and link update both install here; removal passes NULL. */
++	if (prog)
++		netdev_fwd_policy_latch();
++
+ 	if (prog) {
+ 		enum bpf_xdp_mode other_mode = mode == XDP_MODE_SKB
+ 					       ? XDP_MODE_DRV : XDP_MODE_SKB;
+--- a/net/core/fwd_policy.c
++++ b/net/core/fwd_policy.c
+@@ -58,3 +58,16 @@
+ 	spin_unlock_bh(&netdev_fwd_policy_lock);
+ }
+ EXPORT_SYMBOL_GPL(netdev_fwd_policy_end);
++
++/* Process context, before the policy is published. Sticky until reboot. */
++void netdev_fwd_policy_latch(void)
++{
++	spin_lock_bh(&netdev_fwd_policy_lock);
++	if (netdev_fwd_policy_state.latches != U32_MAX)
++		netdev_fwd_policy_state.latches++;
++	atomic_notifier_call_chain(&netdev_fwd_policy_chain,
++				   NETDEV_FWD_POLICY_LATCH,
++				   &netdev_fwd_policy_state);
++	spin_unlock_bh(&netdev_fwd_policy_lock);
++}
++EXPORT_SYMBOL_GPL(netdev_fwd_policy_latch);
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -16,6 +16,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/if.h>
+ #include <linux/netdevice.h>
++#include <linux/netdev_fwd_policy.h>
+ #include <linux/netfilter_ipv6.h>
+ #include <linux/inetdevice.h>
+ #include <linux/proc_fs.h>
+@@ -474,6 +475,10 @@
+ 		 */
+ 		if (pf == NFPROTO_BRIDGE)
+ 			blocking_notifier_call_chain(&nf_bridge_policy_chain, 0, NULL);
++		/* Device hooks run before bridge forwarding (flowtables too). */
++		if (pf == NFPROTO_NETDEV ||
++		    (pf == NFPROTO_INET && reg->hooknum == NF_INET_INGRESS))
++			netdev_fwd_policy_latch();
+ 		rcu_assign_pointer(*pp, new_hooks);
+ 	}
+ 
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -24,6 +24,7 @@
+ #include <net/netlink.h>
+ #include <net/flow_offload.h>
+ #include <net/tc_wrapper.h>
++#include <linux/netdev_fwd_policy.h>
+ 
+ #ifdef CONFIG_INET
+ DEFINE_STATIC_KEY_FALSE(tcf_frag_xmit_count);
+@@ -2157,6 +2158,10 @@
+ 	    !netlink_capable(skb, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
++	/* A replaced shared action changes bound filters' software verdict. */
++	if (n->nlmsg_type != RTM_GETACTION)
++		netdev_fwd_policy_latch();
++
+ 	ret = nlmsg_parse_deprecated(n, sizeof(struct tcamsg), tca,
+ 				     TCA_ROOT_MAX, NULL, extack);
+ 	if (ret < 0)
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -42,6 +42,7 @@
+ #include <net/tc_act/tc_gate.h>
+ #include <net/flow_offload.h>
+ #include <net/tc_wrapper.h>
++#include <linux/netdev_fwd_policy.h>
+ 
+ /* The list of all installed classifier types */
+ static LIST_HEAD(tcf_proto_base);
+@@ -2278,6 +2279,11 @@
+ 	bool rtnl_held = false;
+ 	u32 flags;
+ 
++	/* Any user TC mutation is software policy that L2 PPE templates cannot
++	 * represent. rtnetlink already required CAP_NET_ADMIN. Latch first.
++	 */
++	netdev_fwd_policy_latch();
++
+ replay:
+ 	tp_state = TP_NOT_CREATED;
+ 
+@@ -2513,6 +2519,11 @@
+ 	int err;
+ 	bool rtnl_held = false;
+ 
++	/* Any user TC mutation is software policy that L2 PPE templates cannot
++	 * represent. rtnetlink already required CAP_NET_ADMIN. Latch first.
++	 */
++	netdev_fwd_policy_latch();
++
+ 	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
+ 				     rtm_tca_policy, extack);
+ 	if (err < 0)
+@@ -3147,6 +3158,12 @@
+ 	unsigned long cl;
+ 	int err;
+ 
++	/* Any user TC mutation is software policy that L2 PPE templates cannot
++	 * represent. rtnetlink already required CAP_NET_ADMIN. Latch first.
++	 */
++	if (n->nlmsg_type != RTM_GETCHAIN)
++		netdev_fwd_policy_latch();
++
+ replay:
+ 	q = NULL;
+ 	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -34,6 +34,7 @@
+ #include <net/pkt_sched.h>
+ #include <net/pkt_cls.h>
+ #include <net/tc_wrapper.h>
++#include <linux/netdev_fwd_policy.h>
+ 
+ #include <trace/events/qdisc.h>
+ 
+@@ -1569,6 +1570,12 @@
+ 	struct net_device *dev;
+ 	int err;
+ 
++	/* Any user TC mutation is software policy that L2 PPE templates cannot
++	 * represent. rtnetlink already required CAP_NET_ADMIN. Latch first.
++	 */
++	if (n->nlmsg_type == RTM_DELQDISC)
++		netdev_fwd_policy_latch();
++
+ 	err = nlmsg_parse_deprecated(n, sizeof(*tcm), tca, TCA_MAX,
+ 				     rtm_tca_policy, extack);
+ 	if (err < 0)
+@@ -1827,6 +1834,11 @@
+ 	struct tcmsg *tcm;
+ 	int err;
+ 
++	/* Any user TC mutation is software policy that L2 PPE templates cannot
++	 * represent. rtnetlink already required CAP_NET_ADMIN. Latch first.
++	 */
++	netdev_fwd_policy_latch();
++
+ 	err = nlmsg_parse_deprecated(n, sizeof(*tcm), tca, TCA_MAX,
+ 				     rtm_tca_policy, extack);
+ 	if (err < 0)
+@@ -2322,6 +2334,12 @@
+ 	struct net_device *dev;
+ 	int err;
+ 
++	/* Any user TC mutation is software policy that L2 PPE templates cannot
++	 * represent. rtnetlink already required CAP_NET_ADMIN. Latch first.
++	 */
++	if (n->nlmsg_type != RTM_GETTCLASS)
++		netdev_fwd_policy_latch();
++
+ 	err = nlmsg_parse_deprecated(n, sizeof(*tcm), tca, TCA_MAX,
+ 				     rtm_tca_policy, extack);
+ 	if (err < 0)

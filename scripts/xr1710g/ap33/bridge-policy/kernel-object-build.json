@@ -1,0 +1,63 @@
+{
+  "passed": true,
+  "jobs": 12,
+  "objects": {
+    "br_vlan": "47a4675ce46611d795aef6d63e401bd49033061855511b754c39b17aad770d01",
+    "br_vlan_options": "ed411c8346187b831d78ba9863ea0ca104ed2ec5f5c01b2e718017acf400e872",
+    "br_netlink": "b5e399ef95ac7fca9f9bfb482be012a2bfdebdeb562753fe1272258f68e6b7e4",
+    "br_sysfs_if": "19c63d5bb94daa10b0bcd5a8691a69ee0fd431348718d693b29921598d1faec5",
+    "br_mst": "0e5d1cbcf7565fc43b47dda2e42a6ab571ed8310ab6609227d3a913cc19a5eee",
+    "br_if": "0d4e961b9efb8fb239539d6c17dd50fa4413dcbb1f7698b022ac534b230572c0",
+    "airoha_ppe": "9cddaeedf3577f27b15a653dc954156b2df9c7b94369b33bd69e6900af8b60fb"
+  },
+  "sources": {
+    "net/bridge/br_vlan.c": {
+      "before": "3a762aacc27093ea736c87fce60c2113d52994e9ad7405ed159a5ed32ba00113",
+      "after": "7a5785d27fc132be43116a810d72328e0a39b2e2d95f0d902ac75f1f6938d095"
+    },
+    "net/bridge/br_vlan_options.c": {
+      "before": "4d712af82720484d8b810573e6aa2b2cffdb09f830f5229995af54bba535372b",
+      "after": "d4ecdf313f9838e8f3fb0770ed49266761396a5af091fe41a7cd5d35e9e2ce5f"
+    },
+    "net/bridge/br_netlink.c": {
+      "before": "9bcc289bb4b546cd9fca3972d2b0a5a9a21b12cf0c4d8466fe849f09c6f7d4ab",
+      "after": "28638d63879769c5f0c544be5158e681def9057376568c3de3869a3bed24fe0e"
+    },
+    "net/bridge/br_sysfs_if.c": {
+      "before": "e7082ee327fa4be9d8c521eb40775cb0a315dbdae9fc8987e5af453b57371977",
+      "after": "e53179da78e8d654f4b1a01fad852d5d7fbcb9110888a56264f9cdc080993fc4"
+    },
+    "net/bridge/br_mst.c": {
+      "before": "8bafd70062382da929ff1b5f9accf753fa93026f7c7a8f5d24bfbeeedb4f3727",
+      "after": "730b252091e663abfe327b6020e13c509adcfe10f89bd1f824e6fd04a4ac0c16"
+    },
+    "net/bridge/br_if.c": {
+      "before": "0e7a5727710bbf1251928b228f4c7723ff40eb4dc5027ffae322ece80a52d11e",
+      "after": "981004240a3cbc867e06a61845335a88095f46901f9a1d58f1c7c3837d6f95a2"
+    },
+    "drivers/net/ethernet/airoha/airoha_ppe.c": {
+      "before": "3b769345430966ea6704c5994a906537cb6e62a8c62634cbfeb4eb81f6dd01e1",
+      "after": "0ad351b9f6642bb379985f796b0fa9f8f1ecd86b0885fa0ed9152ca2edaebdaf"
+    },
+    "include/linux/if_bridge.h": {
+      "before": "7a7ffcdd224e42a52be6488924ce6fae2d6b288d5cd0c349416461b538da1836",
+      "after": "e4cfe6590424e34111a1adb7f7c28eb6a3ecc8222d508638ea5dac6880bb9bc7"
+    }
+  },
+  "productionStateUnchanged": true,
+  "heldHashes": {
+    "/home/xrdev/projects/xr1710g/openwrt/.config": "c16f991326594e6942ba7e573b12087cf3c75706a8c3b4b574261399f8241df8",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/.config": "73930c453230570d5e305e45c782e9b99299d7acf205940f206a4d97f9934a5b",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/Module.symvers": "dabfc19a49c223425af5d30ac9a70a9a1d6ce32f109fe0f3c39adfebe6542828",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/vmlinux": "27de1c9da5b5016d26be8cec6856951373a659e3f9ea9cdd459af03bde93091d",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_vlan.c": "3a762aacc27093ea736c87fce60c2113d52994e9ad7405ed159a5ed32ba00113",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_vlan_options.c": "4d712af82720484d8b810573e6aa2b2cffdb09f830f5229995af54bba535372b",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_netlink.c": "9bcc289bb4b546cd9fca3972d2b0a5a9a21b12cf0c4d8466fe849f09c6f7d4ab",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_sysfs_if.c": "e7082ee327fa4be9d8c521eb40775cb0a315dbdae9fc8987e5af453b57371977",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_mst.c": "8bafd70062382da929ff1b5f9accf753fa93026f7c7a8f5d24bfbeeedb4f3727",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/net/bridge/br_if.c": "0e7a5727710bbf1251928b228f4c7723ff40eb4dc5027ffae322ece80a52d11e",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/drivers/net/ethernet/airoha/airoha_ppe.c": "3b769345430966ea6704c5994a906537cb6e62a8c62634cbfeb4eb81f6dd01e1",
+    "/home/xrdev/projects/xr1710g/openwrt/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.54/include/linux/if_bridge.h": "7a7ffcdd224e42a52be6488924ce6fae2d6b288d5cd0c349416461b538da1836"
+  },
+  "fullImageOrHardwareQualified": false
+}

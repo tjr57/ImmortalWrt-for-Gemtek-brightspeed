@@ -1,0 +1,5 @@
+#!/bin/sh /etc/rc.common
+START=08
+STOP=01
+boot() { /usr/libexec/xr-recovery-once boot; }
+start() { return 0; }

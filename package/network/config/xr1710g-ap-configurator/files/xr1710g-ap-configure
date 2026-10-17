@@ -1,0 +1,592 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Edit only a private UCI copy until every setting has passed validation.
+set -eu
+export LC_ALL=C
+umask 077
+
+profile_package=xr1710g_ap_configurator
+config_dir=${XR1710G_CONFIG_DIR:-/etc/config}
+uci_binary=${XR1710G_UCI:-/sbin/uci}
+tmp_parent=${XR1710G_TMP_DIR:-/tmp}
+lock_parent=${XR1710G_LOCK_DIR:-/var/lock}
+work=''
+lock=''
+commit_started=0
+commit_complete=0
+prepared=0
+packages='network wireless dhcp'
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+	status=$?
+	trap - EXIT HUP INT TERM
+	if [ "$commit_started" = 1 ] && [ "$commit_complete" = 0 ]; then
+		for package in $packages; do
+			if [ -f "$work/original/$package" ]; then
+				cp "$work/original/$package" "$config_dir/.xr-ap-rollback-$$-$package" &&
+					mv "$config_dir/.xr-ap-rollback-$$-$package" "$config_dir/$package" ||
+					printf 'Rollback failed for %s; retained recovery directory: %s\n' "$package" "$work" >&2
+			fi
+		done
+		printf 'Apply failed; previous files restored where possible. Recovery copy: %s\n' "$work" >&2
+	fi
+	if [ -n "$work" ]; then
+		# All generated paths are children of the mktemp directory.
+		if [ "$prepared" = 1 ]; then
+			for package in $packages; do
+				rm -f "$config_dir/.xr-ap-new-$$-$package" "$config_dir/.xr-ap-rollback-$$-$package"
+			done
+		fi
+		rm -f "$config_dir/.xr-ap-key-$$"
+		if [ "$commit_started" = 0 ] || [ "$commit_complete" = 1 ]; then
+			rm -rf "$work"
+		fi
+	fi
+	[ -z "$lock" ] || rmdir "$lock" 2>/dev/null || true
+	exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+usage() {
+	cat <<'EOF'
+Usage: xr1710g-ap-configure validate | plan | apply | key users|iot|mesh
+  validate  Check the profile, radio bands and complete staged UCI changes.
+  plan      Print a secret-free plan. Does not modify live configuration.
+  apply     Write the validated network/wireless/dhcp files; no reload/restart.
+  key       Read one runtime WPA passphrase from stdin (hidden on a terminal).
+Set VLANs and uplink ports in /etc/config/xr1710g_ap_configurator first.
+An absent IoT VLAN disables IoT; 6 GHz mesh is disabled unless explicitly enabled.
+Production users use a closed runtime uplink gate; enable the guard explicitly.
+EOF
+}
+
+[ "$#" -ge 1 ] || { usage; exit 2; }
+action=$1
+case "$action" in
+	validate|plan|apply) [ "$#" = 1 ] || fail 'Unexpected arguments.' ;;
+	key) [ "$#" = 2 ] || fail 'Use key users, key iot or key mesh.'
+		case "$2" in users|iot|mesh) ;; *) fail 'Unknown key profile.' ;; esac ;;
+	*) usage; exit 2 ;;
+esac
+[ -d "$config_dir" ] || fail 'UCI configuration directory does not exist.'
+[ -x "$uci_binary" ] || fail 'UCI executable is unavailable.'
+
+if [ "$action" = apply ] || [ "$action" = key ]; then
+	if [ "$config_dir" = /etc/config ]; then
+		[ "$(id -u)" = 0 ] || fail 'Apply and key require root.'
+		[ "$(cat /tmp/sysinfo/board_name 2>/dev/null || true)" = 'gemtek,xr1710g' ] ||
+			fail 'This profile may only be applied to Gemtek XR1710G.'
+	fi
+	mkdir -p "$lock_parent"
+	lock="$lock_parent/xr1710g-ap-configurator.lock"
+	mkdir "$lock" 2>/dev/null || { lock=''; fail 'Another configurator is running (or its lock is stale).' ; }
+fi
+
+work=$(mktemp -d "$tmp_parent/xr1710g-ap-configurator.XXXXXX") || fail 'Cannot create a private staging directory.'
+stage_namespace="xrap$(basename "$work" | tr -cd 'A-Za-z0-9')"
+mkdir "$work/config" "$work/override" "$work/delta" "$work/original"
+for package in $packages "$profile_package"; do
+	[ -f "$config_dir/$package" ] || fail "Required configuration is missing: $package"
+	[ ! -L "$config_dir/$package" ] || fail "Configuration symlinks are unsupported: $package"
+	cp "$config_dir/$package" "$work/original/$package"
+	cp "$work/original/$package" "$work/config/${stage_namespace}_$package"
+done
+
+u() {
+	local command request mapped shown style=''
+	while [ "$#" -gt 0 ]; do
+		case "$1" in -q) shift ;; -X) style=-X; shift ;; *) break ;; esac
+	done
+	command=$1
+	shift
+	if [ "$command" = batch ]; then
+		sed "s/^\(set\|add_list\) \(network\|wireless\|dhcp\|xr1710g_ap_configurator\)\./\1 ${stage_namespace}_\2./" |
+			"$uci_binary" -q -c "$work/config" -C "$work/override" -t "$work/delta" batch
+	else
+		request=$1
+		mapped="${stage_namespace}_$request"
+		if [ "$command" = show ]; then
+			shown=$("$uci_binary" -q ${style:+$style} -c "$work/config" -C "$work/override" -t "$work/delta" "$command" "$mapped") || return 1
+			printf '%s\n' "$shown" | sed "s/^${stage_namespace}_//"
+		else
+			"$uci_binary" -q -c "$work/config" -C "$work/override" -t "$work/delta" "$command" "$mapped"
+		fi
+	fi
+}
+get() { u -q get "$1" 2>/dev/null || true; }
+del() { u -q delete "$1" >/dev/null 2>&1 || true; }
+put() {
+	# Batch stdin avoids putting runtime secrets into process arguments.
+	escaped=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
+	printf 'set %s="%s"\n' "$1" "$escaped" | u -q batch || fail "Cannot stage $1"
+	[ "$(get "$1")" = "$2" ] || fail "Staged value did not round-trip: $1"
+}
+list_put() {
+	escaped=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
+	printf 'add_list %s="%s"\n' "$1" "$escaped" | u -q batch || fail "Cannot stage $1"
+}
+sections() { u -q -X show "$1" | sed -n "s/^$1\.\([^.=]*\)=$2\$/\1/p"; }
+safe_section() { printf '%s\n' "$1" | grep -Eq '^([A-Za-z_][A-Za-z0-9_]*|@[a-z_-]+\[[0-9]+\])$'; }
+printable() {
+	case "$1" in *'
+'*) return 1 ;; esac
+	[ -n "$1" ] && ! printf '%s' "$1" | grep -q '[^ -~]'
+}
+key_valid() { printable "$1" && [ "${#1}" -ge 8 ] && [ "${#1}" -le 63 ]; }
+
+if [ "$action" = key ]; then
+	key_profile=$2
+	[ "$(get "$profile_package.$key_profile")" = wifi ] || fail 'Runtime key profile is missing.'
+	if [ -t 0 ]; then
+		printf 'Passphrase for %s: ' "$key_profile" >&2
+		# BusyBox ash restores termios after read, including interrupted reads.
+		# The firmware does not enable the standalone stty applet.
+		IFS= read -r -s runtime_key || fail 'A passphrase line is required.'
+		printf '\n' >&2
+	else
+		IFS= read -r runtime_key || fail 'A passphrase line is required on stdin.'
+	fi
+	key_valid "$runtime_key" || fail 'Passphrases must contain 8 to 63 printable ASCII characters.'
+	put "$profile_package.$key_profile.key" "$runtime_key"
+	u -q commit "$profile_package" || fail 'Cannot serialize the runtime key profile.'
+	cmp -s "$config_dir/$profile_package" "$work/original/$profile_package" || fail 'Profile changed concurrently.'
+	if [ "$config_dir" = /etc/config ]; then
+		pending=$("$uci_binary" -q changes "$profile_package" 2>/dev/null || true)
+		[ -z "$pending" ] || fail 'Uncommitted UCI profile edits exist.'
+		unset pending
+	fi
+	cp "$work/config/${stage_namespace}_$profile_package" "$config_dir/.xr-ap-key-$$"
+	chmod 0600 "$config_dir/.xr-ap-key-$$"
+	mv "$config_dir/.xr-ap-key-$$" "$config_dir/$profile_package"
+	unset runtime_key escaped
+	printf 'Runtime key saved for %s; wireless configuration was not applied.\n' "$key_profile"
+	exit 0
+fi
+
+[ "$(get "$profile_package.profile")" = ap ] || fail 'AP profile section is missing.'
+country=$(get "$profile_package.profile.country")
+management_ip=$(get "$profile_package.profile.management_ip")
+management_netmask=$(get "$profile_package.profile.management_netmask")
+management_gateway=$(get "$profile_package.profile.management_gateway")
+[ "$country" = AU ] || fail 'The XR1710G AP profile requires country AU.'
+case "$management_ip" in
+    192.168.10.3|192.168.10.4) ;;
+    *) fail 'Expected AP1 management 192.168.10.3 or AP2 management 192.168.10.4.' ;;
+esac
+[ "$management_netmask" = 255.255.255.0 ] &&
+	[ "$management_gateway" = 192.168.10.1 ] || fail 'Expected management /24 via 192.168.10.1.'
+
+# The gate section is exclusively owned by this configurator.
+existing_gate=$(get network.xr_users_gate)
+if [ -n "$existing_gate" ]; then
+	[ "$existing_gate" = interface ] && [ "$(get network.xr_users_gate.xr1710g_owner)" = users ] ||
+		fail 'network.xr_users_gate belongs to another configuration; resolve it before applying.'
+fi
+
+users_enabled=$(get "$profile_package.users.enabled")
+iot_enabled=$(get "$profile_package.iot.enabled")
+case "$users_enabled:$iot_enabled" in 0:0|0:1|1:0|1:1) ;; *) fail 'enabled must be 0 or 1.' ;; esac
+[ "$(get "$profile_package.users.encryption")" = sae ] || fail 'Users require WPA3 SAE.'
+[ "$(get "$profile_package.iot.encryption")" = psk2 ] || fail 'IoT requires WPA2 PSK.'
+users_ssid=$(get "$profile_package.users.ssid")
+users_channel=$(get "$profile_package.users.channel")
+users_channel=${users_channel:-36}
+# AU lower160 block preserves compatibility with clients that omit136.
+# DFS still applies to the bonded52-64 subchannels, even for a low primary.
+case "$users_channel" in
+    36|40|44|48|52|56|60|64) ;;
+    *) fail 'Users EHT160 requires a primary channel in the lower36-64 block.' ;;
+esac
+# Optional AP13 controls. Missing old-profile sections keep all experimental
+# features off. Only the users BSS participates; IoT/backhaul stay separate.
+bool_option() {
+	local value
+	value=$(get "$profile_package.$1")
+	value=${value:-$2}
+	case "$value" in 0|1) printf '%s' "$value" ;; *) fail "$1 must be 0 or 1." ;; esac
+}
+roaming_enabled=$(bool_option roaming.enabled 0)
+rrm_enabled=$(bool_option roaming.ieee80211k 1)
+btm_enabled=$(bool_option roaming.ieee80211v 1)
+ft_enabled=$(bool_option roaming.ieee80211r 1)
+mobility_domain=$(get "$profile_package.roaming.mobility_domain")
+mobility_domain=${mobility_domain:-1710}
+mobility_domain=$(printf '%s' "$mobility_domain" | tr 'A-F' 'a-f')
+if [ "$roaming_enabled" = 1 ]; then
+	[ "$users_enabled" = 1 ] || fail 'Roaming requires the users BSS enabled.'
+	printf '%s' "$mobility_domain" | grep -Eq '^[0-9a-fA-F]{4}$' || fail 'Mobility domain must be exactly four hexadecimal digits.'
+fi
+mlo_enabled=$(bool_option mlo.enabled 0)
+mlo_bands=$(get "$profile_package.mlo.bands")
+mlo_bands=${mlo_bands:-'5g 2g'}
+if [ "$mlo_enabled" = 1 ]; then
+	[ "$users_enabled" = 1 ] || fail 'MLO requires the users network enabled.'
+	[ "$mlo_bands" = '5g 2g' ] || fail 'AP13 users MLO supports5g+2g;6g remains dedicated mesh.'
+	# FT/MLO key-holder and link-address interoperability is an independent
+	# SDK/client qualification. Keep k/v usable with MLO, reject untested FT.
+	[ "$roaming_enabled:$ft_enabled" != 1:1 ] || fail 'AP13 MLO and11r cannot be combined before client qualification;11k/v remain available.'
+fi
+punct_enabled=$(bool_option puncturing.enabled 0)
+punct_mode=$(get "$profile_package.puncturing.mode")
+punct_mode=${punct_mode:-manual}
+case "$punct_mode" in manual|auto) ;; *) fail 'Puncturing mode must be manual or auto.' ;; esac
+
+punct_bitmap=$(get "$profile_package.puncturing.bitmap")
+punct_bitmap=${punct_bitmap:-0}
+case "$punct_bitmap" in ''|*[!0-9]*|0[0-9]*) fail 'Puncturing bitmap must be a decimal unsigned integer without leading zero.' ;; esac
+[ "${#punct_bitmap}" -le 3 ] && [ "$punct_bitmap" -le 255 ] || fail 'AP13 lower160 bitmap must fit8 bits.'
+if [ "$punct_enabled" = 1 ]; then
+	[ "$users_enabled" = 1 ] || fail 'Puncturing requires the users BSS enabled.'
+	if [ "$punct_mode" = auto ]; then
+		[ "$punct_bitmap" = 0 ] || fail 'Firmware automatic puncturing requires a zero initial bitmap.'
+	else
+	case "$punct_bitmap" in 1|2|4|8|16|32|64|128|3|12|48|192) ;; *) fail 'Puncturing bitmap is not a valid160MHz pattern.' ;; esac
+	primary_bit=$(((users_channel - 36) / 4))
+	[ "$((punct_bitmap & (1 << primary_bit)))" = 0 ] || fail 'Puncturing must not disable the primary20MHz channel.'
+	fi
+else
+	[ "$punct_bitmap" = 0 ] || fail 'A nonzero bitmap requires puncturing explicitly enabled.'
+fi
+
+iot_ssid=$(get "$profile_package.iot.ssid")
+for ssid in "$users_ssid" "$iot_ssid"; do
+	printable "$ssid" && [ "${#ssid}" -le 32 ] || fail 'SSID must contain 1 to 32 printable ASCII bytes.'
+done
+users_vid=$(get "$profile_package.users.vid")
+iot_vid=$(get "$profile_package.iot.vid")
+valid_vid() {
+	case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac
+	[ "${#1}" -le 4 ] && [ "$1" -ge 1 ] && [ "$1" -le 4094 ]
+}
+[ -z "$users_vid" ] || valid_vid "$users_vid" || fail 'Users VID must be empty/native or 1 to 4094.'
+[ -z "$iot_vid" ] || valid_vid "$iot_vid" || fail 'IoT VID must be explicitly 1 to 4094.'
+[ -n "$iot_vid" ] || iot_enabled=0
+[ -z "$iot_vid" ] || [ "$users_vid" != "$iot_vid" ] || fail 'Users and IoT VLANs must differ.'
+
+# Saved AP8 profiles may have no mesh section; keep their 6 GHz disabled.
+mesh_enabled=$(get "$profile_package.mesh.enabled")
+mesh_enabled=${mesh_enabled:-0}
+case "$mesh_enabled" in 0|1) ;; *) fail 'Mesh enabled must be 0 or 1.' ;; esac
+mesh_id=$(get "$profile_package.mesh.mesh_id")
+mesh_channel=$(get "$profile_package.mesh.channel")
+mesh_htmode=$(get "$profile_package.mesh.htmode")
+if [ "$mesh_enabled" = 1 ]; then
+    [ "$(get "$profile_package.mesh")" = wifi ] || fail 'Mesh profile must be a wifi section.'
+    [ "$(get "$profile_package.mesh.encryption")" = sae ] || fail '6 GHz mesh requires SAE.'
+    printable "$mesh_id" && [ "${#mesh_id}" -le 32 ] || fail 'Mesh ID must contain 1 to 32 printable ASCII bytes.'
+    [ "$mesh_channel" = 37 ] || fail 'The initial AU mesh profile requires PSC channel 37.'
+    case "$mesh_htmode" in HE80|HE160) ;; *) fail 'The initial mesh profile supports HE80 or HE160.' ;; esac
+fi
+existing_mesh=$(get network.xr_mesh_backhaul)
+if [ -n "$existing_mesh" ]; then
+    [ "$existing_mesh" = interface ] && [ "$(get network.xr_mesh_backhaul.xr1710g_owner)" = mesh ] ||
+        fail 'network.xr_mesh_backhaul belongs to another configuration.'
+fi
+for section in $(sections wireless wifi-iface); do
+    if [ "$(get "wireless.$section.ifname")" = mesh6g ]; then
+        [ "$section" = xr_mesh6g ] && [ "$(get "wireless.$section.xr1710g_owner")" = mesh ] ||
+            fail 'The mesh6g interface name belongs to another configuration.'
+    fi
+done
+
+users_local_vid=${users_vid:-1}
+if [ -n "$iot_vid" ] && [ "$iot_vid" = "$users_local_vid" ]; then
+	fail 'Native users use internal bridge PVID 1; IoT cannot use VID 1 in native mode.'
+fi
+
+ports='lan2 lan3 lan4 wan'
+uplinks=$(get "$profile_package.profile.uplink_port")
+seen=' '
+for port in $uplinks; do
+	case " $ports " in *" $port "*) ;; *) fail "Unknown uplink port: $port" ;; esac
+	case "$seen" in *" $port "*) fail "Duplicate uplink port: $port" ;; esac
+	seen="$seen$port "
+done
+vlan_filtering=0
+[ -z "$users_vid$iot_vid" ] || vlan_filtering=1
+[ "$vlan_filtering" = 0 ] || [ -n "$uplinks" ] || [ "$mesh_enabled" = 1 ] || fail 'VLAN mode requires a wired uplink or explicitly enabled mesh.'
+
+radio_2g=''; radio_5g=''; radio_6g=''
+for radio in $(sections wireless wifi-device); do
+	safe_section "$radio" || fail 'Unsupported radio section name.'
+	band=$(get "wireless.$radio.band")
+	case "$band" in
+		2g) [ -z "$radio_2g" ] || fail 'Multiple 2.4 GHz radios are ambiguous.'; radio_2g=$radio ;;
+		5g) [ -z "$radio_5g" ] || fail 'Multiple 5 GHz radios are ambiguous.'; radio_5g=$radio ;;
+		6g) [ -z "$radio_6g" ] || fail 'Multiple 6 GHz radios are ambiguous.'; radio_6g=$radio ;;
+	esac
+done
+[ -n "$radio_2g" ] && [ -n "$radio_5g" ] && [ -n "$radio_6g" ] || fail 'Exactly one radio for each band 2g, 5g and 6g is required.'
+
+if [ "$action" = plan ]; then
+	printf 'Management: %s/24 via %s; DHCP/DNS/RA servers disabled.\n' "$management_ip" "$management_gateway"
+	printf 'Country: %s; physical bridge ports: %s; uplinks: %s.\n' "$country" "$ports" "${uplinks:-none}"
+	printf 'Users: 5 GHz (%s), SSID %s, SAE, enabled=%s, VLAN=%s, primary=%s, width=160 MHz.\n' "$radio_5g" "$users_ssid" "$users_enabled" "${users_vid:-native}" "$users_channel"
+	printf 'IoT: 2.4 GHz (%s), SSID %s, WPA2, enabled=%s, VLAN=%s.\n' "$radio_2g" "$iot_ssid" "$iot_enabled" "${iot_vid:-unassigned}"
+	if [ "$mesh_enabled" = 1 ]; then
+        printf '6 GHz (%s): SAE mesh %s, channel %s, %s, interface mesh6g; carries the configured users/IoT VLANs.\n' "$radio_6g" "$mesh_id" "$mesh_channel" "$mesh_htmode"
+    else
+        printf '6 GHz (%s): reserved and disabled. Existing interfaces on these radios will be disabled.\n' "$radio_6g"
+    fi
+	if [ "$vlan_filtering" = 1 ] && [ -z "$users_vid" ]; then
+		printf 'Native users and management retain untagged uplinks; internal bridge PVID is 1.\n'
+	fi
+	printf 'Production users gate: xr_users_gate, proto none, auto=0; managed only by the optional uplink guard.\n'
+	printf 'Roaming users-only: enabled=%s,11k=%s,11v=%s,11r=%s; MLO=%s links=%s.\n' "$roaming_enabled" "$rrm_enabled" "$btm_enabled" "$ft_enabled" "$mlo_enabled" "$mlo_bands"
+	printf 'Puncturing5GHz: enabled=%s bitmap=%s; experimental driver boot opt-in required.\n' "$punct_enabled" "$punct_bitmap"
+	printf 'Apply writes configuration only; no service reload, radio restart or main-router changes.\n'
+fi
+
+users_key=$(get "$profile_package.users.key")
+iot_key=$(get "$profile_package.iot.key")
+mesh_key=$(get "$profile_package.mesh.key")
+if [ "$users_enabled" = 1 ]; then key_valid "$users_key" || fail 'Provide the users runtime key with: xr1710g-ap-configure key users'; fi
+if [ "$iot_enabled" = 1 ]; then key_valid "$iot_key" || fail 'Provide the IoT runtime key with: xr1710g-ap-configure key iot'; fi
+if [ "$mesh_enabled" = 1 ]; then key_valid "$mesh_key" || fail 'Provide the mesh runtime key with: xr1710g-ap-configure key mesh'; fi
+
+bridge_section=''
+for section in $(sections network device); do
+	safe_section "$section" || fail 'Unsupported network device section name.'
+	if [ "$(get "network.$section.name")" = br-lan ]; then
+		[ -z "$bridge_section" ] || fail 'Multiple br-lan definitions exist.'
+		bridge_section=$section
+	fi
+done
+bridge_section=${bridge_section:-xr_ap_bridge}
+for section in $(sections network interface); do
+	case "$section" in lan|wan|wan6|xr_iot|xr_users_gate|xr_mesh_backhaul) continue ;; esac
+	device=$(get "network.$section.device")
+	case "$device" in br-lan|br-lan.*) fail "Unmanaged interface $section uses br-lan; resolve it before applying." ;; esac
+done
+for section in $(sections network bridge-vlan); do
+	[ "$(get "network.$section.device")" != br-lan ] || del "network.$section"
+done
+put "network.$bridge_section" device
+put "network.$bridge_section.name" br-lan
+put "network.$bridge_section.type" bridge
+put "network.$bridge_section.vlan_filtering" "$vlan_filtering"
+put "network.$bridge_section.bridge_empty" 1
+[ "$mesh_enabled" = 0 ] || put "network.$bridge_section.stp" 1
+del "network.$bridge_section.ports"
+for port in $ports; do list_put "network.$bridge_section.ports" "$port"; done
+del network.wan
+del network.wan6
+
+users_device=br-lan
+if [ "$vlan_filtering" = 1 ]; then
+	users_device="br-lan.$users_local_vid"
+	put network.xr_users_vlan bridge-vlan
+	put network.xr_users_vlan.device br-lan
+	put network.xr_users_vlan.vlan "$users_local_vid"
+	put network.xr_users_vlan.local 1
+	for port in $ports; do
+		membership="$port:u*"
+		if [ -n "$users_vid" ]; then
+			case " $uplinks " in *" $port "*) membership="$port:t" ;; esac
+		fi
+		list_put network.xr_users_vlan.ports "$membership"
+	done
+    if [ "$mesh_enabled" = 1 ]; then
+        mesh_membership='mesh6g:u*'
+        [ -z "$users_vid" ] || mesh_membership='mesh6g:t'
+        list_put network.xr_users_vlan.ports "$mesh_membership"
+    fi
+	if [ -n "$iot_vid" ]; then
+		put network.xr_iot_vlan bridge-vlan
+		put network.xr_iot_vlan.device br-lan
+		put network.xr_iot_vlan.vlan "$iot_vid"
+		put network.xr_iot_vlan.local 1
+		for port in $uplinks; do list_put network.xr_iot_vlan.ports "$port:t"; done
+        [ "$mesh_enabled" = 0 ] || list_put network.xr_iot_vlan.ports mesh6g:t
+	fi
+fi
+put network.lan interface
+for option in ifname ipaddr netmask gateway dns ip6assign ip6hint ip6class; do del "network.lan.$option"; done
+put network.lan.device "$users_device"
+put network.lan.proto static
+put network.lan.ipaddr "$management_ip"
+put network.lan.netmask "$management_netmask"
+put network.lan.gateway "$management_gateway"
+list_put network.lan.dns "$management_gateway"
+put network.lan.delegate 0
+# Shared users bridge, but no addresses/routes/protocol clients on the gate.
+# auto=0 is the closed boot/upgrade default; explicit ubus up is runtime only.
+del network.xr_users_gate
+put network.xr_users_gate interface
+put network.xr_users_gate.xr1710g_owner users
+put network.xr_users_gate.proto none
+put network.xr_users_gate.device "$users_device"
+put network.xr_users_gate.auto 0
+put network.xr_users_gate.delegate 0
+
+del network.xr_iot
+put network.xr_iot interface
+put network.xr_iot.proto none
+put network.xr_iot.delegate 0
+if [ -n "$iot_vid" ]; then
+	put network.xr_iot.device "br-lan.$iot_vid"
+	put network.xr_iot.auto 1
+else
+	put network.xr_iot.auto 0
+fi
+
+# Attach mesh to the parent bridge, not only to br-lan.<users VID>.
+# netifd installs both named mesh6g memberships when the radio appears.
+del network.xr_mesh_backhaul
+put network.xr_mesh_backhaul interface
+put network.xr_mesh_backhaul.xr1710g_owner mesh
+put network.xr_mesh_backhaul.proto none
+put network.xr_mesh_backhaul.device br-lan
+put network.xr_mesh_backhaul.delegate 0
+put network.xr_mesh_backhaul.auto "$mesh_enabled"
+
+for radio in "$radio_2g" "$radio_5g" "$radio_6g"; do
+	put "wireless.$radio.country" AU
+	put "wireless.$radio.channel" auto
+	put "wireless.$radio.disabled" 1
+done
+put "wireless.$radio_2g.htmode" HE20
+# Preserve the explicit primary channel instead of returning to ACS.
+put "wireless.$radio_5g.channel" "$users_channel"
+put "wireless.$radio_5g.htmode" EHT160
+put "wireless.$radio_6g.htmode" EHT160
+[ "$users_enabled" = 0 ] || put "wireless.$radio_5g.disabled" 0
+[ "$iot_enabled" = 0 ] || put "wireless.$radio_2g.disabled" 0
+[ "$mlo_enabled" = 0 ] || {
+	put "wireless.$radio_2g.disabled" 0
+	put "wireless.$radio_2g.htmode" EHT20
+}
+# Reapplying/disabling removes a stale bitmap. Dedicated schema/generator
+# transports the numeric bitmap; do not accumulate arbitrary raw options.
+del "wireless.$radio_5g.punct_bitmap"
+del "wireless.$radio_5g.xr_pp_mode"
+if [ "$punct_enabled" = 1 ]; then
+	if [ "$punct_mode" = auto ]; then
+		put "wireless.$radio_5g.xr_pp_mode" 1
+	else
+		put "wireless.$radio_5g.punct_bitmap" "$punct_bitmap"
+	fi
+fi
+
+for section in $(sections wireless wifi-iface); do
+	for device in $(get "wireless.$section.device"); do
+		case "$device" in "$radio_2g"|"$radio_5g"|"$radio_6g") put "wireless.$section.disabled" 1 ;; esac
+	done
+done
+for section in xr_users xr_iot xr_6g_reserved; do del "wireless.$section"; put "wireless.$section" wifi-iface; put "wireless.$section.mode" ap; done
+put wireless.xr_users.device "$radio_5g"
+put wireless.xr_users.xr1710g_owner users
+put wireless.xr_users.network xr_users_gate
+put wireless.xr_users.ssid "$users_ssid"
+put wireless.xr_users.encryption sae
+put wireless.xr_users.ieee80211w 2
+put wireless.xr_users.disabled "$((1 - users_enabled))"
+[ "$users_enabled" = 0 ] || put wireless.xr_users.key "$users_key"
+if [ "$mlo_enabled" = 1 ]; then
+	del wireless.xr_users.device
+	list_put wireless.xr_users.device "$radio_5g"
+	list_put wireless.xr_users.device "$radio_2g"
+	put wireless.xr_users.mlo 1
+fi
+if [ "$roaming_enabled" = 1 ]; then
+	put wireless.xr_users.ieee80211k "$rrm_enabled"
+	put wireless.xr_users.rrm_neighbor_report "$rrm_enabled"
+	put wireless.xr_users.rrm_beacon_report "$rrm_enabled"
+	put wireless.xr_users.bss_transition "$btm_enabled"
+	put wireless.xr_users.ieee80211r "$ft_enabled"
+	if [ "$ft_enabled" = 1 ]; then
+		put wireless.xr_users.mobility_domain "$mobility_domain"
+		put wireless.xr_users.ft_over_ds 0
+		put wireless.xr_users.ft_psk_generate_local 0
+		put wireless.xr_users.pmk_r1_push 1
+		put wireless.xr_users.ft_iface "br-lan.$users_local_vid"
+		case "$management_ip" in
+			192.168.10.3) own_nas=XR1710G-AP1-users; peer_nas=XR1710G-AP2-users; peer_bssid=00:58:28:d7:49:f4 ;;
+			192.168.10.4) own_nas=XR1710G-AP2-users; peer_nas=XR1710G-AP1-users; peer_bssid=00:58:28:d7:85:0b ;;
+		esac
+		put wireless.xr_users.nas_identifier "$own_nas"
+		# Shared128-bit FT key derived from runtime secret+domain only on stdin.
+		# Explicit peer holders avoid trusting every BSS with the same password.
+		ft_key=$(printf '%s/%s/%s' 'XR1710G-FT-SAE' "$mobility_domain" "$users_key" | sha256sum | cut -c1-32)
+		list_put wireless.xr_users.r0kh "$peer_bssid,$peer_nas,$ft_key"
+		list_put wireless.xr_users.r1kh "$peer_bssid,$peer_bssid,$ft_key"
+		unset ft_key own_nas peer_nas peer_bssid
+	fi
+fi
+
+put wireless.xr_iot.device "$radio_2g"
+put wireless.xr_iot.xr1710g_owner iot
+put wireless.xr_iot.network xr_iot
+put wireless.xr_iot.ssid "$iot_ssid"
+put wireless.xr_iot.encryption psk2
+put wireless.xr_iot.ieee80211w 0
+put wireless.xr_iot.disabled "$((1 - iot_enabled))"
+[ "$iot_enabled" = 0 ] || put wireless.xr_iot.key "$iot_key"
+put wireless.xr_6g_reserved.device "$radio_6g"
+put wireless.xr_6g_reserved.ssid XR1710G-Reserved6G
+put wireless.xr_6g_reserved.encryption sae
+put wireless.xr_6g_reserved.disabled 1
+del wireless.xr_mesh6g
+put wireless.xr_mesh6g wifi-iface
+put wireless.xr_mesh6g.xr1710g_owner mesh
+put wireless.xr_mesh6g.device "$radio_6g"
+put wireless.xr_mesh6g.mode mesh
+put wireless.xr_mesh6g.ifname mesh6g
+put wireless.xr_mesh6g.network xr_mesh_backhaul
+put wireless.xr_mesh6g.encryption sae
+put wireless.xr_mesh6g.ieee80211w 2
+put wireless.xr_mesh6g.mesh_fwding 1
+put wireless.xr_mesh6g.disabled "$((1 - mesh_enabled))"
+if [ "$mesh_enabled" = 1 ]; then
+    put "wireless.$radio_6g.disabled" 0
+    put "wireless.$radio_6g.channel" "$mesh_channel"
+    put "wireless.$radio_6g.htmode" "$mesh_htmode"
+    put wireless.xr_mesh6g.mesh_id "$mesh_id"
+    put wireless.xr_mesh6g.key "$mesh_key"
+fi
+unset users_key iot_key mesh_key escaped
+
+put dhcp.lan dhcp
+put dhcp.lan.interface lan
+for section in $(sections dhcp dhcp); do
+	put "dhcp.$section.ignore" 1
+	for option in ra dhcpv6 ndp; do put "dhcp.$section.$option" disabled; done
+done
+for section in $(sections dhcp dnsmasq); do put "dhcp.$section.port" 0; done
+for section in $(sections dhcp odhcpd); do put "dhcp.$section.maindhcp" 0; done
+
+for package in $packages; do
+	u -q commit "$package" || fail "Cannot serialize $package"
+	u -q show "$package" >/dev/null || fail "Staged $package cannot be parsed"
+done
+if [ "$action" != apply ]; then
+	printf 'Validated: complete staged UCI configuration; no live files changed.\n'
+	exit 0
+fi
+
+# Reject a concurrent editor, or pending normal UCI deltas, before writing.
+for package in $packages "$profile_package"; do
+	cmp -s "$config_dir/$package" "$work/original/$package" || fail "Configuration changed concurrently: $package"
+	if [ "$config_dir" = /etc/config ]; then
+		pending=$("$uci_binary" -q changes "$package" 2>/dev/null || true)
+		[ -z "$pending" ] || fail "Uncommitted UCI edits exist: $package"
+		unset pending
+	fi
+done
+prepared=1
+for package in $packages; do
+	cp "$work/config/${stage_namespace}_$package" "$config_dir/.xr-ap-new-$$-$package" || fail "Cannot prepare $package"
+	chmod 0600 "$config_dir/.xr-ap-new-$$-$package"
+done
+commit_started=1
+for package in $packages; do
+	mv "$config_dir/.xr-ap-new-$$-$package" "$config_dir/$package" || fail "Cannot replace $package"
+done
+commit_complete=1
+printf 'Applied: management %s/24; DHCP/DNS/RA servers disabled.\n' "$management_ip"
+printf 'Configuration saved. No reload or restart was performed; inspect the plan before activating it.\n'

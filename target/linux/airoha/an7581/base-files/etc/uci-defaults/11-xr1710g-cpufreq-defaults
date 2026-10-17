@@ -2,6 +2,9 @@
 
 . /lib/functions/system.sh
 
+# The AP profile owns its initial settings and preserves later edits.
+[ ! -e /etc/xr1710g-ap-profile ] || exit 0
+
 case "$(board_name)" in
 gemtek,xr1710g|gemtek,xr1710g-ubi)
 	governor='performance'

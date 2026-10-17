@@ -1,0 +1,274 @@
+{
+  "changedPaths": [
+    "etc/apk/world",
+    "etc/banner",
+    "etc/modules.d/70-sched-core",
+    "etc/modules.d/sched-act-vlan",
+    "etc/modules.d/sched-flower",
+    "etc/openwrt_release",
+    "etc/openwrt_version",
+    "lib/apk/db/installed",
+    "lib/apk/db/scripts.tar.gz",
+    "lib/apk/packages/kmod-sched-act-vlan.list",
+    "lib/apk/packages/kmod-sched-core.list",
+    "lib/apk/packages/kmod-sched-flower.list",
+    "lib/apk/packages/tc-tiny.alternatives",
+    "lib/apk/packages/tc-tiny.list",
+    "lib/modules/6.18.54/act_gact.ko",
+    "lib/modules/6.18.54/act_mirred.ko",
+    "lib/modules/6.18.54/act_skbedit.ko",
+    "lib/modules/6.18.54/act_vlan.ko",
+    "lib/modules/6.18.54/cls_basic.ko",
+    "lib/modules/6.18.54/cls_flow.ko",
+    "lib/modules/6.18.54/cls_flower.ko",
+    "lib/modules/6.18.54/cls_fw.ko",
+    "lib/modules/6.18.54/cls_matchall.ko",
+    "lib/modules/6.18.54/cls_route.ko",
+    "lib/modules/6.18.54/cls_u32.ko",
+    "lib/modules/6.18.54/em_u32.ko",
+    "lib/modules/6.18.54/nf_reject_ipv4.ko",
+    "lib/modules/6.18.54/nf_tables.ko",
+    "lib/modules/6.18.54/sch_hfsc.ko",
+    "lib/modules/6.18.54/sch_htb.ko",
+    "lib/modules/6.18.54/sch_ingress.ko",
+    "lib/modules/6.18.54/sch_tbf.ko",
+    "sbin/tc",
+    "usr/lib/os-release",
+    "usr/libexec/tc-tiny"
+  ],
+  "added": [
+    "etc/modules.d/70-sched-core",
+    "etc/modules.d/sched-act-vlan",
+    "etc/modules.d/sched-flower",
+    "lib/apk/packages/kmod-sched-act-vlan.list",
+    "lib/apk/packages/kmod-sched-core.list",
+    "lib/apk/packages/kmod-sched-flower.list",
+    "lib/apk/packages/tc-tiny.alternatives",
+    "lib/apk/packages/tc-tiny.list",
+    "lib/modules/6.18.54/act_gact.ko",
+    "lib/modules/6.18.54/act_mirred.ko",
+    "lib/modules/6.18.54/act_skbedit.ko",
+    "lib/modules/6.18.54/act_vlan.ko",
+    "lib/modules/6.18.54/cls_basic.ko",
+    "lib/modules/6.18.54/cls_flow.ko",
+    "lib/modules/6.18.54/cls_flower.ko",
+    "lib/modules/6.18.54/cls_fw.ko",
+    "lib/modules/6.18.54/cls_matchall.ko",
+    "lib/modules/6.18.54/cls_route.ko",
+    "lib/modules/6.18.54/cls_u32.ko",
+    "lib/modules/6.18.54/em_u32.ko",
+    "lib/modules/6.18.54/sch_hfsc.ko",
+    "lib/modules/6.18.54/sch_htb.ko",
+    "lib/modules/6.18.54/sch_ingress.ko",
+    "lib/modules/6.18.54/sch_tbf.ko",
+    "sbin/tc",
+    "usr/libexec/tc-tiny"
+  ],
+  "removed": [],
+  "before": {
+    "etc/apk/world": {
+      "mode": 33188,
+      "content": "2176e3eacb11f69d677fe4456a2d910790d78b5b9fc779458e212b21134a67aa"
+    },
+    "etc/banner": {
+      "mode": 33188,
+      "content": "49371c0a01fa88944f6cfc010ef9d260e78291fa729e8760cc1c46744ca6bbd5"
+    },
+    "etc/modules.d/70-sched-core": null,
+    "etc/modules.d/sched-act-vlan": null,
+    "etc/modules.d/sched-flower": null,
+    "etc/openwrt_release": {
+      "mode": 33188,
+      "content": "45085c3e695df1467428d0c9e0b1cce80c2af49147e46de9df93f3086e3e234f"
+    },
+    "etc/openwrt_version": {
+      "mode": 33188,
+      "content": "d52351940b3eaf95fcd1709e43e40427e17480f5b724eeeac6a26334ae46493e"
+    },
+    "lib/apk/db/installed": {
+      "mode": 33188,
+      "content": "7de795da14958bd720fadf8412e64c083eae6ba8bb87abc7b13c94d895275fba"
+    },
+    "lib/apk/db/scripts.tar.gz": {
+      "mode": 33188,
+      "content": "657dcc6e814ba8c42b27ba34437a7f62454067f533644335bc2101c99dd79ed1"
+    },
+    "lib/apk/packages/kmod-sched-act-vlan.list": null,
+    "lib/apk/packages/kmod-sched-core.list": null,
+    "lib/apk/packages/kmod-sched-flower.list": null,
+    "lib/apk/packages/tc-tiny.alternatives": null,
+    "lib/apk/packages/tc-tiny.list": null,
+    "lib/modules/6.18.54/act_gact.ko": null,
+    "lib/modules/6.18.54/act_mirred.ko": null,
+    "lib/modules/6.18.54/act_skbedit.ko": null,
+    "lib/modules/6.18.54/act_vlan.ko": null,
+    "lib/modules/6.18.54/cls_basic.ko": null,
+    "lib/modules/6.18.54/cls_flow.ko": null,
+    "lib/modules/6.18.54/cls_flower.ko": null,
+    "lib/modules/6.18.54/cls_fw.ko": null,
+    "lib/modules/6.18.54/cls_matchall.ko": null,
+    "lib/modules/6.18.54/cls_route.ko": null,
+    "lib/modules/6.18.54/cls_u32.ko": null,
+    "lib/modules/6.18.54/em_u32.ko": null,
+    "lib/modules/6.18.54/nf_reject_ipv4.ko": {
+      "mode": 33188,
+      "content": "4db3d9a8b2228dc3aecf1b7f665f8df7a49c639eebdc43d925eddfe869b2dba8"
+    },
+    "lib/modules/6.18.54/nf_tables.ko": {
+      "mode": 33188,
+      "content": "89f0230fb4fd05b180a9cd875f9caac856b236ea33cef0611a92f7fab2ea8863"
+    },
+    "lib/modules/6.18.54/sch_hfsc.ko": null,
+    "lib/modules/6.18.54/sch_htb.ko": null,
+    "lib/modules/6.18.54/sch_ingress.ko": null,
+    "lib/modules/6.18.54/sch_tbf.ko": null,
+    "sbin/tc": null,
+    "usr/lib/os-release": {
+      "mode": 33188,
+      "content": "fa3098752d4e216b4e6c12e243f7103a7e4b2346e129f80377cd05e634a682c3"
+    },
+    "usr/libexec/tc-tiny": null
+  },
+  "after": {
+    "etc/apk/world": {
+      "mode": 33188,
+      "content": "c8abe6deca6051b81d0aa33b6ae134293ffcb0246d9faebff33b192589329853"
+    },
+    "etc/banner": {
+      "mode": 33188,
+      "content": "b223e07f4d67edb05ef0650fda3af00ab21ecdf7d528a3b068a61e2322931428"
+    },
+    "etc/modules.d/70-sched-core": {
+      "mode": 33188,
+      "content": "4d491f616ed54bb63cb39f28ade6d05f5ec02aeea6d704c65c82818c16f8c4a5"
+    },
+    "etc/modules.d/sched-act-vlan": {
+      "mode": 33188,
+      "content": "cb9be256c881f6d1d579e3cf8f86e573a66ee2d9bc2b9d0045305cfe9f0a11c8"
+    },
+    "etc/modules.d/sched-flower": {
+      "mode": 33188,
+      "content": "aa1165e1d1ff46a007e08847be5b76cef8d2dbaf1acaaee90139a7544eaa6364"
+    },
+    "etc/openwrt_release": {
+      "mode": 33188,
+      "content": "f7adc5d576809a0db252f7c8799fb8497c1a33136e799d78cb0ae9a28e28e455"
+    },
+    "etc/openwrt_version": {
+      "mode": 33188,
+      "content": "195c6ddbc28cfbc588c870047d712c0cf1d1d2e52f114902c2540b9136c9f74a"
+    },
+    "lib/apk/db/installed": {
+      "mode": 33188,
+      "content": "3fcfc34d91e16a7b1a2ea4ce590e29f95e90c391ddbd85b3333afdc1a5564d86"
+    },
+    "lib/apk/db/scripts.tar.gz": {
+      "mode": 33188,
+      "content": "90e559c53bf9fcbdc3d76cd004bc550556316a396d182459e6abf9db2405e79f"
+    },
+    "lib/apk/packages/kmod-sched-act-vlan.list": {
+      "mode": 33188,
+      "content": "8758c45adc9b0ff9d3553c54b5eccd5e45cbc459da833251d5bb47b21e61553a"
+    },
+    "lib/apk/packages/kmod-sched-core.list": {
+      "mode": 33188,
+      "content": "9beafa0f09228b1f9faa71fa814586bddf0ef5ffe4f058cbd75519cdfa8734a4"
+    },
+    "lib/apk/packages/kmod-sched-flower.list": {
+      "mode": 33188,
+      "content": "3dc22301ee6c4a3da325606f88d07fa64a47bf863260c457cdfe48893cf8fb3d"
+    },
+    "lib/apk/packages/tc-tiny.alternatives": {
+      "mode": 33188,
+      "content": "67c0e206e7c587f6a4bce8ac5e76407639d632bc26ec87d3a145e02fea39e9e6"
+    },
+    "lib/apk/packages/tc-tiny.list": {
+      "mode": 33188,
+      "content": "3cecd4f30a504281d3e60da6f51ad5b65baa6d3626670c64f529d6b6bd57e421"
+    },
+    "lib/modules/6.18.54/act_gact.ko": {
+      "mode": 33188,
+      "content": "f99682990d53858bc77b80c7f987898e93c17ac35d81a2e90e630c53f2fe8bda"
+    },
+    "lib/modules/6.18.54/act_mirred.ko": {
+      "mode": 33188,
+      "content": "d65c03997d3ff230c02307a07a4f167ea5c0e61189b366b12278a3d3a7504f4d"
+    },
+    "lib/modules/6.18.54/act_skbedit.ko": {
+      "mode": 33188,
+      "content": "c8e2c61500f7201ae5d62c356e24e13126197b2a0cc8f2e08655b9396a253ddc"
+    },
+    "lib/modules/6.18.54/act_vlan.ko": {
+      "mode": 33188,
+      "content": "89181c62d113e7e847258de34fa4c6605dd9d9658a7b41189b42aece244716fe"
+    },
+    "lib/modules/6.18.54/cls_basic.ko": {
+      "mode": 33188,
+      "content": "3d90bc949b067e0471e6be7189a093f510d8cbe286472d09735ac0078d701473"
+    },
+    "lib/modules/6.18.54/cls_flow.ko": {
+      "mode": 33188,
+      "content": "2bd6b08a4bc450b611eda32aeaa3220139705f7d687c86328f5eb48c33ca9c78"
+    },
+    "lib/modules/6.18.54/cls_flower.ko": {
+      "mode": 33188,
+      "content": "1c3108cffc4445da39b3e4b14afcb3a7bb4f870326e15802235abcd8d2a12e08"
+    },
+    "lib/modules/6.18.54/cls_fw.ko": {
+      "mode": 33188,
+      "content": "ea53735c589ea24a512ac71894152cc4195c128914944a49e5ace5dee91a86dc"
+    },
+    "lib/modules/6.18.54/cls_matchall.ko": {
+      "mode": 33188,
+      "content": "bc440a98ae3552f5b6a49fcbdbe8a5edee6d059ecf2acb408c03bc948ff13c2e"
+    },
+    "lib/modules/6.18.54/cls_route.ko": {
+      "mode": 33188,
+      "content": "6d9390e0c49ad6f218c9dc93510162c07530947bea70ab9358d3f86b689c86a6"
+    },
+    "lib/modules/6.18.54/cls_u32.ko": {
+      "mode": 33188,
+      "content": "cea06b748a0d94f2b6c60e1e504120e17568ebe4541cb7bc038dd54dfb9a2724"
+    },
+    "lib/modules/6.18.54/em_u32.ko": {
+      "mode": 33188,
+      "content": "357bccda9dba9b315b6efec92083a454d94e7099a29cff0ec5ac2eed7489397e"
+    },
+    "lib/modules/6.18.54/nf_reject_ipv4.ko": {
+      "mode": 33188,
+      "content": "1c1950cd55ae25db66609432bb5ec42ee23736536dddce49fb791260951f42f4"
+    },
+    "lib/modules/6.18.54/nf_tables.ko": {
+      "mode": 33188,
+      "content": "12465c7979e493cb7ab5f45aeb5ba0cf9fc2d625a9f105f99a57adbd8d7f1ba6"
+    },
+    "lib/modules/6.18.54/sch_hfsc.ko": {
+      "mode": 33188,
+      "content": "5b91e9286ea2c92ca85847be11aa451ea1e1eda2d4b6832301b0a089a1724bd6"
+    },
+    "lib/modules/6.18.54/sch_htb.ko": {
+      "mode": 33188,
+      "content": "3b9d2c61c5612a24ca5cdac14c3f127d2ee4e5f90e66f3e3a21a9c1126d6b8b2"
+    },
+    "lib/modules/6.18.54/sch_ingress.ko": {
+      "mode": 33188,
+      "content": "dd19ae7be3fc02b764241c6b7861cb93c7fc6384bcfdfa8d9960227c23b01563"
+    },
+    "lib/modules/6.18.54/sch_tbf.ko": {
+      "mode": 33188,
+      "content": "f43de94d64443ea73e6808078dee31432208eae9c15dd20cddd13431476f01e5"
+    },
+    "sbin/tc": {
+      "mode": 41471,
+      "content": "/usr/libexec/tc-tiny"
+    },
+    "usr/lib/os-release": {
+      "mode": 33188,
+      "content": "368a579c564023b73fafc0f25a5d974e126bf94efe488f06ca72ab500cd5f44f"
+    },
+    "usr/libexec/tc-tiny": {
+      "mode": 33261,
+      "content": "c1867a627e839e5571917b872e066c8a43745dac7189dea56cb7c638a09da3f4"
+    }
+  }
+}

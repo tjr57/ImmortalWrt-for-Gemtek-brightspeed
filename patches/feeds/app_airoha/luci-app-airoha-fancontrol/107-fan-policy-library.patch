@@ -1,0 +1,182 @@
+diff --git a/luci-app-airoha-fancontrol/root/usr/lib/xr1710g/fan-policy.sh b/luci-app-airoha-fancontrol/root/usr/lib/xr1710g/fan-policy.sh
+new file mode 100644
+--- /dev/null
++++ b/luci-app-airoha-fancontrol/root/usr/lib/xr1710g/fan-policy.sh
+@@ -0,0 +1,177 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0-or-later
++# Only a uniquely named NCT7802 hwmon device may receive fan writes.
++
++FAN_STATUS_FILE='/tmp/xr1710g-fan-status.json'
++FAN_LOCK_DIR='/tmp/xr1710g-fan-policy.lock'
++
++find_nct7802() {
++	local hwmon found=''
++	for hwmon in /sys/class/hwmon/hwmon*; do
++		[ -r "$hwmon/name" ] || continue
++		[ "$(cat "$hwmon/name" 2>/dev/null)" = 'nct7802' ] || continue
++		[ -z "$found" ] || return 2
++		found="$hwmon"
++	done
++	[ -n "$found" ] || return 1
++	printf '%s\n' "$found"
++}
++
++fan_report() {
++	local available="$1" applied="$2" reason="$3" json previous
++	json="{\"controller\":\"nct7802\",\"available\":$available,\"applied\":$applied,\"reason\":\"$reason\"}"
++	previous=$(cat "$FAN_STATUS_FILE" 2>/dev/null)
++	if [ "$json" != "$previous" ]; then
++		printf '%s\n' "$json" > "$FAN_STATUS_FILE.tmp" && mv "$FAN_STATUS_FILE.tmp" "$FAN_STATUS_FILE"
++		logger -t xr1710g-fan "available=$available applied=$applied reason=$reason"
++	fi
++}
++
++fan_uint() {
++	case "$1" in
++		0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
++		*) return 1 ;;
++	esac
++	[ "$1" -le "$2" ]
++}
++
++fan_validate_settings() {
++	local i temp pwm last_temp=-1 last_pwm=-1
++	FAN_MODE=$(uci -q get fan.settings.mode) || return 1
++	case "$FAN_MODE" in
++		manual)
++			FAN_MANUAL_PWM=$(uci -q get fan.settings.manual_pwm) || return 1
++			fan_uint "$FAN_MANUAL_PWM" 255 || return 1
++			;;
++		auto)
++			FAN_PRESET=$(uci -q get fan.settings.curve_preset) || return 1
++			case "$FAN_PRESET" in quiet|balanced|performance|custom) ;; *) return 1 ;; esac
++			for i in 1 2 3 4 5; do
++				temp=$(uci -q get "fan.$FAN_PRESET.point${i}_temp") || return 1
++				pwm=$(uci -q get "fan.$FAN_PRESET.point${i}_pwm") || return 1
++				fan_uint "$temp" 120 && fan_uint "$pwm" 255 || return 1
++				[ "$temp" -gt "$last_temp" ] && [ "$pwm" -ge "$last_pwm" ] || return 1
++				[ "$i" -ne 5 ] || [ "$pwm" -eq 255 ] || return 1
++				# Values have been restricted to decimal digits before eval.
++				eval "FAN_TEMP_$i=\$temp FAN_PWM_$i=\$pwm"
++				last_temp="$temp"; last_pwm="$pwm"
++			done
++			;;
++		*) return 1 ;;
++	esac
++}
++
++fan_check_device() {
++	local attribute i
++	[ -n "$FAN_HWMON" ] && [ "$(cat "$FAN_HWMON/name" 2>/dev/null)" = 'nct7802' ] || return 1
++	for attribute in pwm1 pwm1_enable; do
++		[ -r "$FAN_HWMON/$attribute" ] && [ -w "$FAN_HWMON/$attribute" ] || return 1
++	done
++	[ "$FAN_MODE" = 'auto' ] || return 0
++	for i in 1 2 3 4 5; do
++		attribute="pwm1_auto_point${i}_temp"
++		[ -r "$FAN_HWMON/$attribute" ] && [ -w "$FAN_HWMON/$attribute" ] || return 1
++		if [ "$i" -lt 5 ]; then
++			attribute="pwm1_auto_point${i}_pwm"
++			[ -r "$FAN_HWMON/$attribute" ] && [ -w "$FAN_HWMON/$attribute" ] || return 1
++		fi
++	done
++	# Point 5 is read-only in the Linux NCT7802 driver and always means 255.
++	[ "$(cat "$FAN_HWMON/pwm1_auto_point5_pwm" 2>/dev/null)" = '255' ]
++}
++
++fan_prepare() {
++	local result
++	FAN_HWMON=$(find_nct7802); result=$?
++	case "$result" in
++		1) fan_report false false controller-not-found; return 1 ;;
++		2) fan_report false false controller-ambiguous; return 1 ;;
++	esac
++	if ! fan_validate_settings; then fan_report true false invalid-configuration; return 1; fi
++	if ! fan_check_device; then fan_report true false controller-attributes-unavailable; return 1; fi
++}
++
++fan_read_snapshot() {
++	local i value
++	FAN_OLD_MODE=$(cat "$FAN_HWMON/pwm1_enable" 2>/dev/null) || return 1
++	case "$FAN_OLD_MODE" in 0|1|2|3) ;; *) return 1 ;; esac
++	FAN_OLD_PWM=$(cat "$FAN_HWMON/pwm1" 2>/dev/null) || return 1
++	fan_uint "$FAN_OLD_PWM" 255 || return 1
++	[ "$FAN_MODE" = 'auto' ] || return 0
++	for i in 1 2 3 4 5; do
++		value=$(cat "$FAN_HWMON/pwm1_auto_point${i}_temp" 2>/dev/null) || return 1
++		# The driver reports integral millidegrees; no unvalidated text reaches eval.
++		case "$value" in ''|*[!0-9-]*|*-*-*) return 1 ;; esac
++		[ "$value" -ge -128000 ] && [ "$value" -le 127000 ] 2>/dev/null || return 1
++		eval "FAN_OLD_TEMP_$i=\$value"
++		if [ "$i" -lt 5 ]; then
++			value=$(cat "$FAN_HWMON/pwm1_auto_point${i}_pwm" 2>/dev/null) || return 1
++			fan_uint "$value" 255 || return 1
++			eval "FAN_OLD_PWM_$i=\$value"
++		fi
++	done
++}
++
++fan_write() {
++	local attribute="$1" value="$2" actual
++	[ "$(cat "$FAN_HWMON/name" 2>/dev/null)" = 'nct7802' ] && [ -w "$FAN_HWMON/$attribute" ] || return 1
++	printf '%s\n' "$value" > "$FAN_HWMON/$attribute" || return 1
++	actual=$(cat "$FAN_HWMON/$attribute" 2>/dev/null) || return 1
++	[ "$actual" = "$value" ]
++}
++
++fan_restore_snapshot() {
++	local i value failed=0
++	if [ "$FAN_MODE" = 'auto' ]; then
++		for i in 1 2 3 4 5; do
++			eval "value=\$FAN_OLD_TEMP_$i"
++			fan_write "pwm1_auto_point${i}_temp" "$value" || failed=1
++			if [ "$i" -lt 5 ]; then
++				eval "value=\$FAN_OLD_PWM_$i"
++				fan_write "pwm1_auto_point${i}_pwm" "$value" || failed=1
++			fi
++		done
++	fi
++	fan_write pwm1 "$FAN_OLD_PWM" || failed=1
++	fan_write pwm1_enable "$FAN_OLD_MODE" || failed=1
++	[ "$failed" -eq 0 ]
++}
++
++fan_program() {
++	local i temp pwm
++	fan_write pwm1_enable 1 || return 1
++	if [ "$FAN_MODE" = 'manual' ]; then fan_write pwm1 "$FAN_MANUAL_PWM"; return $?; fi
++	for i in 1 2 3 4 5; do
++		eval "temp=\$FAN_TEMP_$i pwm=\$FAN_PWM_$i"
++		fan_write "pwm1_auto_point${i}_temp" "$((temp * 1000))" || return 1
++		[ "$i" -eq 5 ] || fan_write "pwm1_auto_point${i}_pwm" "$pwm" || return 1
++	done
++	fan_write pwm1_enable 2
++}
++
++apply_settings() {
++	local result
++	fan_prepare || return 1
++	# rc.common/procd serializes reloads; also serialize direct starts.
++	mkdir "$FAN_LOCK_DIR" 2>/dev/null || { logger -t xr1710g-fan 'another apply operation holds the lock'; return 1; }
++	if ! fan_read_snapshot; then
++		fan_report true false snapshot-read-failed; rmdir "$FAN_LOCK_DIR"; return 1
++	fi
++	fan_program; result=$?
++	if [ "$result" -eq 0 ]; then
++		fan_report true true "$FAN_MODE-applied"
++	elif [ "$(cat "$FAN_HWMON/name" 2>/dev/null)" != 'nct7802' ]; then
++		fan_report false false controller-disappeared
++	elif fan_restore_snapshot; then
++		fan_report true false write-failed-previous-state-restored
++	else
++		# Only the verified NCT7802 path is touched, never a guessed register/device.
++		if fan_write pwm1 255 && fan_write pwm1_enable 1; then
++			fan_report true false write-failed-failsafe-full-speed
++		else
++			fan_report true false write-failed-controller-state-unknown
++		fi
++	fi
++	rmdir "$FAN_LOCK_DIR" 2>/dev/null
++	return "$result"
++}

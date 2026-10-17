@@ -1,0 +1,45 @@
+{
+  "at": "2026-10-11T01:58:33.946948+08:00",
+  "stage": "integrated; full image qualification pending",
+  "baseline": "20261011-ap32-d331711d",
+  "version": "20261011-ap33-d331711d",
+  "patch": "target/linux/airoha/patches-6.18/99999i-XR-PPE-VLAN-port-policy-fence.patch",
+  "patchSHA256": "06eb146cdefeeb5d2ea4b61d382969cbfe7ee46a68c8fb98b97c1eccfc4b0c80",
+  "candidateSHA256": "0ad351b9f6642bb379985f796b0fa9f8f1ecd86b0885fa0ed9152ca2edaebdaf",
+  "qa": "development/ap33/bridge-policy/qa.json",
+  "ARMObjectBuild": "development/ap33/bridge-policy/kernel-object-build.json",
+  "realKernelVM": "development/ap33/bridge-policy/vm-result.json",
+  "nativeSanitizedAndARMChecksEach": {
+    "context": 66758,
+    "packet": 78682
+  },
+  "realKernelChecks": 38,
+  "realKernelEvents": 151,
+  "guardSites": 15,
+  "implemented": [
+    "VLAN membership/filter/protocol/default-PVID/state mutation fences",
+    "netlink/sysfs port policy, MST enable, bridge attach/detach mutation fences",
+    "require selected VLAN forwarding state on both ports and packet ingress",
+    "latch/revoke L2 binding before notifier teardown"
+  ],
+  "realVMContainsNoPPEHardware": true,
+  "kernelAPIsModeledInExactFunctionFixtures": true,
+  "fixtureFailedRunsRetained": [
+    "development/ap33/bridge-policy/vm-20261011-014939.json",
+    "development/ap33/bridge-policy/vm-20261011-015430.json",
+    "development/ap33/bridge-policy/vm-20261011-015529.json"
+  ],
+  "fixtureRepairs": [
+    "carry preexisting BPDU netlink companion changes and rebuild copied dependencies",
+    "enable actual switchdev support and inject both atomic and blocking notifier paths"
+  ],
+  "productionSourceIntegrated": true,
+  "flashed": false,
+  "NpuPpeDefaultOff": true,
+  "remaining": [
+    "other netdevice and TC policy transition coverage",
+    "actual publisher and coherent collector",
+    "full image/ABI validation and AP2 then AP1 keep-config upgrade",
+    "applicable hardware qualification with current recovery/ABI manifests"
+  ]
+}

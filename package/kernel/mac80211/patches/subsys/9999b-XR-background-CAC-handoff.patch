@@ -1,0 +1,31 @@
+Subject: [PATCH] cfg80211: hand off overlapping background CAC before new CAC state
+
+Adapt MediaTek SDK 25.12 patch0026, StanleyYP Wang, pinned 08196fa6.
+Backports 7.2 tracks background CAC with background_radar_wdev instead of
+the old boolean. Place the abort after a successful foreground driver call
+but BEFORE cfg80211_set_cac_state(true): abort itself clears shared channel
+CAC state in this API. Preserve background ownership on driver errors.
+No default radar enablement, channel selection, or regulatory changes.
+
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -11957,6 +11957,19 @@
+ 					 link_id);
+ 	if (err)
+ 		return err;
++
++	/* A background CAC on an overlapping channel must not complete after
++	 * foreground CAC starts. In this API its wdev records active ownership;
++	 * there is no background_cac_started flag. Abort before publishing the
++	 * new CAC state, since abort clears the overlapping channel's state.
++	 * A failed foreground start must retain the previous background CAC.
++	 */
++	if (rdev->background_radar_wdev &&
++	    rdev->background_radar_chandef.chan &&
++	    cfg80211_is_sub_chan(&chandef,
++				rdev->background_radar_chandef.chan, false))
++		cfg80211_stop_background_radar_detection(
++			rdev->background_radar_wdev);
+ 
+ 	switch (wdev->iftype) {
+ 	case NL80211_IFTYPE_AP:
